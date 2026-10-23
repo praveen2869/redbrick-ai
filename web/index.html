@@ -1,0 +1,1038 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Red Bricks Property Management — AI-Powered Rent Automation</title>
+  <meta name="description" content="AI-Powered Automated Rent Reminder Workflow connecting RentVine MCP, Quo (OpenPhone) SMS, Gmail, and Azure Scheduler.">
+
+  <!-- Google Fonts: Outfit & Plus Jakarta Sans & JetBrains Mono -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+  <link rel="stylesheet" href="css/styles.css">
+  <link rel="stylesheet" href="css/flowchart.css">
+</head>
+<body class="dark-theme">
+
+  <!-- Ambient Glow Effects -->
+  <div class="ambient-glow glow-cyan"></div>
+  <div class="ambient-glow glow-purple"></div>
+  <div class="ambient-glow glow-amber"></div>
+
+  <!-- App Wrapper -->
+  <div class="app-container">
+
+    <!-- Top Navigation Header -->
+    <header class="top-nav">
+      <div class="nav-left">
+        <div class="brand-badge">
+          <div class="brand-icon">🏢</div>
+          <div class="brand-text">
+            <span class="brand-title">RED BRICKS</span>
+            <span class="brand-subtitle">Property Management • AI Rent Reminder System</span>
+          </div>
+        </div>
+
+        <div class="integration-status-pill" id="system-status-indicator">
+          <span class="pulse-dot"></span>
+          <span class="status-label">RentVine: Live</span>
+          <span class="divider">•</span>
+          <span class="status-label">Quo SMS: Active</span>
+          <span class="divider">•</span>
+          <span class="status-label">AI Engine: Ready</span>
+        </div>
+      </div>
+
+      <div class="nav-right">
+        <button id="btn-dry-run" class="btn btn-secondary" title="Preview AI decisions without dispatching messages">
+          <span class="btn-icon">🧪</span>
+          <span>Dry Run</span>
+        </button>
+        <button id="btn-run-workflow" class="btn btn-primary" title="Execute daily rent check and draft reminders">
+          <span class="btn-icon">⚡</span>
+          <span>Run Workflow</span>
+        </button>
+        <button id="btn-view-report" class="btn btn-ghost" title="View Daily Executive Report">
+          <span class="btn-icon">📊</span>
+          <span>Daily Report</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Executive KPI Summary Cards (Auto-updated from live data) -->
+    <section class="kpi-ribbon" style="margin-top: 14px; margin-bottom: 18px;">
+      <div class="kpi-card">
+        <div class="kpi-header">
+          <span class="kpi-title">PORTFOLIO UNITS</span>
+          <span class="kpi-icon">📋</span>
+        </div>
+        <div class="kpi-value" id="val-total-units">100</div>
+        <div class="kpi-subtext">Active RentVine Leases</div>
+      </div>
+
+      <div class="kpi-card">
+        <div class="kpi-header">
+          <span class="kpi-title">RENT PAID / CLEARED</span>
+          <span class="kpi-icon">✅</span>
+        </div>
+        <div class="kpi-value highlight-emerald" id="val-count-paid">69</div>
+        <div class="kpi-subtext">Tenants up to date ($0 due)</div>
+      </div>
+
+      <div class="kpi-card">
+        <div class="kpi-header">
+          <span class="kpi-title">REMINDERS NEEDED</span>
+          <span class="kpi-icon">📩</span>
+        </div>
+        <div class="kpi-value highlight-amber" id="val-count-sent">31</div>
+        <div class="kpi-subtext">Awaiting HITL Approval</div>
+      </div>
+
+      <div class="kpi-card">
+        <div class="kpi-header">
+          <span class="kpi-title">TOTAL UNPAID TRACKED</span>
+          <span class="kpi-icon">💵</span>
+        </div>
+        <div class="kpi-value highlight-cyan" id="val-overdue-balance">$0</div>
+        <div class="kpi-subtext">Current Overdue Balance</div>
+      </div>
+
+      <div class="kpi-card">
+        <div class="kpi-header">
+          <span class="kpi-title">PROMISES ON FILE</span>
+          <span class="kpi-icon">🛡️</span>
+        </div>
+        <div class="kpi-value" id="val-count-promises">0</div>
+        <div class="kpi-subtext">Reminders paused until date</div>
+      </div>
+
+      <div class="kpi-card">
+        <div class="kpi-header">
+          <span class="kpi-title">TIME SAVED / RUN</span>
+          <span class="kpi-icon">⏱️</span>
+        </div>
+        <div class="kpi-value highlight-emerald" id="val-time-saved">22.0 hrs</div>
+        <div class="kpi-subtext">Manual calling & ledger checking</div>
+      </div>
+    </section>
+
+    <!-- Main Navigation Tabs -->
+    <nav class="sub-nav">
+      <div class="nav-tabs">
+        <button class="nav-tab active" data-tab="architecture">
+          <span class="tab-icon">⚡</span> How It Works
+        </button>
+        <button class="nav-tab" data-tab="tenants">
+          <span class="tab-icon">📋</span> Tenant Decisions
+          <span class="tab-badge" id="badge-total-tenants">100</span>
+        </button>
+        <button class="nav-tab" data-tab="rentvine-live">
+          <span class="tab-icon">🏢</span> RentVine Portfolio
+          <span class="tab-badge" style="background:#10b981;color:#fff;">LIVE</span>
+        </button>
+        <button class="nav-tab" data-tab="quo-live">
+          <span class="tab-icon">📱</span> Quo (OpenPhone) SMS
+          <span class="tab-badge" style="background:#0284c7;color:#fff;">LIVE</span>
+        </button>
+        <button class="nav-tab" data-tab="simulator">
+          <span class="tab-icon">💬</span> AI Reply Simulator
+        </button>
+        <button class="nav-tab" data-tab="runs">
+          <span class="tab-icon">📜</span> Audit History
+        </button>
+        <button class="nav-tab" data-tab="settings">
+          <span class="tab-icon">⚙️</span> Settings
+        </button>
+      </div>
+      <div class="last-sync-tag" id="last-sync-time">
+        Active Environment: Live Production
+      </div>
+    </nav>
+
+    <!-- TAB 1: SYSTEM ARCHITECTURE & INTERACTIVE FLOWCHART -->
+    <main class="tab-content active" id="tab-architecture">
+      <div class="content-header">
+        <div>
+          <h1 class="page-title">Automated Rent Reminder — System Architecture</h1>
+          <p class="page-subtitle">End-to-end workflow connecting RentVine MCP, Quo SMS, Gmail, and Business Logic</p>
+        </div>
+        <div class="flowchart-actions">
+          <div class="legend-pills">
+            <span class="legend-pill glow-pill-blue">Trigger</span>
+            <span class="legend-pill glow-pill-cyan">Agent Core</span>
+            <span class="legend-pill glow-pill-purple">Data Feeds</span>
+            <span class="legend-pill glow-pill-amber">AI Rules</span>
+            <span class="legend-pill glow-pill-emerald">Paid</span>
+            <span class="legend-pill glow-pill-orange">Promise</span>
+            <span class="legend-pill glow-pill-red">Reminder</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Flowchart Container with animated particles -->
+      <div class="flowchart-board" id="flowchart-board">
+        <div class="grid-overlay"></div>
+        <svg class="flowchart-svg" id="flowchart-svg" width="100%" height="100%"></svg>
+
+        <div class="flowchart-layout">
+          <!-- Layer 1: Trigger -->
+          <div class="flow-layer" data-layer-title="TRIGGER">
+            <div class="flow-node node-pill node-azure" id="node-azure" data-node="azure">
+              <div class="node-icon">☁️</div>
+              <div class="node-content">
+                <div class="node-title">AZURE SCHEDULER / DAILY TRIGGER</div>
+                <div class="node-desc">Runs automatically every day (08:00 UTC) or manually on demand</div>
+              </div>
+              <div class="node-badge" id="badge-azure-status">ACTIVE</div>
+            </div>
+          </div>
+
+          <div class="flow-connector-stem"></div>
+
+          <!-- Layer 2: Automation Core -->
+          <div class="flow-layer" data-layer-title="AUTOMATION CORE">
+            <div class="flow-node node-pill node-agent" id="node-agent" data-node="agent">
+              <div class="node-icon">⚙️</div>
+              <div class="node-content">
+                <div class="node-title">PYTHON WORKFLOW ORCHESTRATOR</div>
+                <div class="node-desc">Autonomous multi-channel controller • Evaluates entire portfolio in seconds</div>
+              </div>
+              <div class="node-badge" id="badge-agent-status">READY</div>
+            </div>
+          </div>
+
+          <div class="flow-connector-stem"></div>
+
+          <!-- Layer 3: Data Sources -->
+          <div class="flow-layer" data-layer-title="DATA SOURCES">
+            <div class="flow-row three-cols">
+              <!-- RentVine MCP -->
+              <div class="flow-node node-card node-rentvine" id="node-rentvine" data-node="rentvine">
+                <div class="node-card-header">
+                  <div class="node-icon-small">🏢</div>
+                  <div class="node-title">RENTVINE</div>
+                </div>
+                <div class="node-desc">Rent balances • Due dates • Payments • Lease notes</div>
+                <div class="node-meta-tag">Live REST API & MCP</div>
+              </div>
+
+              <!-- Quo (OpenPhone) -->
+              <div class="flow-node node-card node-quo" id="node-quo" data-node="quo">
+                <div class="node-card-header">
+                  <div class="node-icon-small">💬</div>
+                  <div class="node-title">QUO (OPENPHONE)</div>
+                </div>
+                <div class="node-desc">SMS threads • Tenant replies • Outbound reminders</div>
+                <div class="node-meta-tag">+1 (667) 281-3879</div>
+              </div>
+
+              <!-- Gmail -->
+              <div class="flow-node node-card node-gmail" id="node-gmail" data-node="gmail">
+                <div class="node-card-header">
+                  <div class="node-icon-small">✉️</div>
+                  <div class="node-title">GMAIL</div>
+                </div>
+                <div class="node-desc">Inbound tenant emails • Payment receipts • Disputes</div>
+                <div class="node-meta-tag">OAuth 2.0 Read-Only</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="flow-connector-stem"></div>
+
+          <!-- Layer 4: AI + Business Rules Engine -->
+          <div class="flow-layer" data-layer-title="AI + RULES ENGINE">
+            <div class="flow-node node-banner node-rules" id="node-rules" data-node="rules">
+              <div class="node-icon-small">⚡</div>
+              <div class="node-content">
+                <div class="node-title">AI NLU CLASSIFIER + BUSINESS RULES</div>
+                <div class="node-desc">Checks balance • 5-day grace period • 24h deduplication cooldown • Extracts commitment dates</div>
+              </div>
+              <div class="node-chips">
+                <span class="chip">NLP Intent Engine</span>
+                <span class="chip">Grace Period: 5 Days</span>
+                <span class="chip">Cooldown: 24 Hours</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="flow-connector-labels">
+            <span class="branch-label paid-label">Paid?</span>
+            <span class="branch-label promise-label">Promise?</span>
+            <span class="branch-label unpaid-label">Unpaid?</span>
+          </div>
+
+          <!-- Layer 5: Decision Outcomes -->
+          <div class="flow-layer" data-layer-title="DECISION OUTCOMES">
+            <div class="flow-row three-cols diamonds-row">
+              <div class="diamond-wrapper">
+                <div class="flow-node node-diamond diamond-green" id="node-outcome-paid" data-node="outcome-paid">
+                  <div class="diamond-inner">
+                    <div class="diamond-icon">✅</div>
+                    <div class="diamond-title">RENT PAID</div>
+                    <div class="diamond-desc">Balance $0 — No action needed</div>
+                    <div class="diamond-counter" id="count-diamond-paid">69 units</div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="diamond-wrapper">
+                <div class="flow-node node-diamond diamond-orange" id="node-outcome-promise" data-node="outcome-promise">
+                  <div class="diamond-inner">
+                    <div class="diamond-icon">🛡️</div>
+                    <div class="diamond-title">PAYMENT PROMISE</div>
+                    <div class="diamond-desc">Hold reminder until committed date</div>
+                    <div class="diamond-counter" id="count-diamond-promise">0 units</div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="diamond-wrapper">
+                <div class="flow-node node-diamond diamond-red" id="node-outcome-unpaid" data-node="outcome-unpaid">
+                  <div class="diamond-inner">
+                    <div class="diamond-icon">📩</div>
+                    <div class="diamond-title">UNPAID & ELIGIBLE</div>
+                    <div class="diamond-desc">Draft Quo SMS reminder for approval</div>
+                    <div class="diamond-counter" id="count-diamond-unpaid">31 units</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="flow-connector-stem"></div>
+
+          <!-- Layer 6: Results & Reporting Layer -->
+          <div class="flow-layer" data-layer-title="RESULTS & REPORTING">
+            <div class="flow-node node-banner node-results" id="node-results" data-node="results">
+              <div class="node-icon-small">📊</div>
+              <div class="node-content">
+                <div class="node-title">RESULTS & AUDIT TRAIL</div>
+                <div class="node-desc">Logs immutable SQLite decisions • RentVine note write-back • Generates daily executive summary</div>
+              </div>
+              <div class="results-indicators">
+                <div class="res-item"><span class="dot-green"></span> SQLite Audit Log</div>
+                <div class="res-item"><span class="dot-amber"></span> 3x Backoff Retry</div>
+                <div class="res-item"><span class="dot-cyan"></span> Exec Summary Report</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Live Execution Log Terminal -->
+      <section class="live-terminal-panel">
+        <div class="terminal-header">
+          <div class="terminal-dots">
+            <span class="dot red"></span>
+            <span class="dot yellow"></span>
+            <span class="dot green"></span>
+          </div>
+          <div class="terminal-title">REAL-TIME WORKFLOW EXECUTION STREAM</div>
+          <div class="terminal-badge" id="terminal-status-tag">READY</div>
+        </div>
+        <div class="terminal-body" id="workflow-console-output">
+          <div class="log-line text-muted">[SYSTEM] Red Bricks AI Automation Engine initialized.</div>
+          <div class="log-line text-info">[RENTVINE] Connected to redbricksproperties.rentvine.com — active portfolio loaded.</div>
+          <div class="log-line text-info">[QUO SMS] OpenPhone channel ready on +1 (667) 281-3879.</div>
+          <div class="log-line text-success">[READY] Ready for automation. Click "Run Workflow" to execute or "Dry Run" to simulate.</div>
+        </div>
+      </section>
+    </main>
+
+    <!-- TAB 2: TENANT DECISIONS & LEDGER -->
+    <main class="tab-content" id="tab-tenants">
+      <div class="content-header">
+        <div>
+          <h1 class="page-title">Tenant Decisions & AI Outcomes</h1>
+          <p class="page-subtitle">Real-time status of rent balances, due dates, AI outcomes, and 1-click reminder triggers.</p>
+        </div>
+        <div class="table-controls">
+          <div class="search-box">
+            <span class="search-icon">🔍</span>
+            <input type="text" id="tenant-search" placeholder="Search tenant, property, or unit...">
+          </div>
+          <select id="filter-property" class="select-dropdown">
+            <option value="ALL">All Properties (Live)</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- Filter Tabs -->
+      <div class="filter-pills">
+        <button class="filter-pill active" data-filter="ALL" id="pill-filter-all">All Tenants</button>
+        <button class="filter-pill" data-filter="SEND_REMINDER" id="pill-filter-reminded">📩 Reminders Needed</button>
+        <button class="filter-pill" data-filter="HOLD_PROMISE" id="pill-filter-promised">🛡️ Promises on File</button>
+        <button class="filter-pill" data-filter="SKIP_PAID" id="pill-filter-paid">✅ Paid / Cleared</button>
+        <button class="filter-pill" data-filter="FLAG_MANUAL_REVIEW" id="pill-filter-flagged">🔴 Flagged / Disputes</button>
+        <button class="filter-pill" data-filter="SKIP_ALREADY_REMINDED" id="pill-filter-cooldown">🚫 In Cooldown / Grace</button>
+      </div>
+
+      <!-- Tenants Table -->
+      <div class="table-container">
+        <table class="data-table" id="tenants-table">
+          <thead>
+            <tr>
+              <th>Tenant & Contact</th>
+              <th>Property & Unit</th>
+              <th>Rent Balance</th>
+              <th>Due Date</th>
+              <th>Latest Tenant Message</th>
+              <th>AI Decision Outcome</th>
+              <th>Reason & Status</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="tenants-table-body">
+            <!-- Dynamically populated via JS -->
+          </tbody>
+        </table>
+
+        <!-- Main Portfolio Pagination Footer -->
+        <div class="pagination-bar" id="tenants-pagination">
+          <div id="tenants-page-info">Showing active tenants</div>
+          <div style="display:flex;align-items:center;gap:8px;">
+            <label style="font-size:12px;color:#64748b;">Per page:</label>
+            <select id="tenants-page-size" class="select-dropdown" style="padding:4px 8px;font-size:12px;width:auto;">
+              <option value="10">10</option>
+              <option value="25" selected>25</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+              <option value="ALL">All</option>
+            </select>
+            <button id="btn-tenants-first" class="btn btn-secondary btn-sm" title="First Page">⏮</button>
+            <button id="btn-tenants-prev" class="btn btn-secondary btn-sm" title="Previous Page">◀</button>
+            <span id="tenants-page-current" style="padding:4px 10px;font-weight:700;color:#38bdf8;background:#1e293b;border-radius:6px;">1</span>
+            <button id="btn-tenants-next" class="btn btn-secondary btn-sm" title="Next Page">▶</button>
+            <button id="btn-tenants-last" class="btn btn-secondary btn-sm" title="Last Page">⏭</button>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <!-- TAB 3: SMS REMINDER CENTER (QUO / OPENPHONE) -->
+    <main class="tab-content" id="tab-quo-live">
+      <div class="content-header" style="margin-bottom:20px;">
+        <div>
+          <h1 class="page-title">Quo (OpenPhone) SMS Reminder Center</h1>
+          <p class="page-subtitle">Review AI-generated rent reminders and approve each message before dispatch — full human control.</p>
+        </div>
+        <button id="btn-refresh-quo" class="btn btn-secondary">
+          <span>🔄 Refresh SMS Feed</span>
+        </button>
+      </div>
+
+      <!-- HITL Safety Banner -->
+      <div style="background:rgba(16,185,129,0.06);border:1px solid rgba(16,185,129,0.3);border-radius:14px;padding:18px 24px;margin-bottom:24px;display:flex;align-items:center;gap:18px;">
+        <div style="font-size:32px;">🛡️</div>
+        <div style="flex:1;">
+          <div style="font-weight:700;font-size:15px;color:#10b981;margin-bottom:4px;">
+            Human-in-the-Loop Mode Active — You're in Full Control
+          </div>
+          <div style="font-size:13px;color:#94a3b8;line-height:1.6;">
+            The AI prepares personalized reminder drafts for all overdue accounts. Click 
+            <strong style="color:#10b981;">Send Reminder</strong> on any tenant to dispatch the SMS directly from your Quo business line.
+            <strong>Zero automated spam</strong> — every message is reviewed and approved by you.
+          </div>
+        </div>
+        <div id="quo-hitl-sent-count" style="text-align:center;min-width:80px;">
+          <div style="font-size:28px;font-weight:800;color:#10b981;" id="quo-sent-counter">0</div>
+          <div style="font-size:11px;color:#64748b;">SMS Sent Today</div>
+        </div>
+      </div>
+
+      <!-- Quo Details Ribbon -->
+      <div class="kpi-ribbon" style="margin-bottom: 24px;">
+        <div class="kpi-card">
+          <div class="kpi-header"><span class="kpi-title">DEDICATED QUO NUMBER</span><span class="kpi-icon">📱</span></div>
+          <div class="kpi-value" id="quo-phone-display" style="font-size:20px;letter-spacing:0.5px;">+1 (667) 281-3879</div>
+          <div class="kpi-subtext">OpenPhone ID: PNz3t43PKv</div>
+        </div>
+
+        <div class="kpi-card">
+          <div class="kpi-header"><span class="kpi-title">REMINDERS AWAITING APPROVAL</span><span class="kpi-icon">⏳</span></div>
+          <div class="kpi-value highlight-amber" id="quo-count-needed">--</div>
+          <div class="kpi-subtext">Overdue & past grace period</div>
+        </div>
+
+        <div class="kpi-card">
+          <div class="kpi-header"><span class="kpi-title">INBOUND TENANT REPLIES</span><span class="kpi-icon">💬</span></div>
+          <div class="kpi-value highlight-cyan" id="quo-count-inbound">--</div>
+          <div class="kpi-subtext">Promises & messages received</div>
+        </div>
+
+        <div class="kpi-card">
+          <div class="kpi-header"><span class="kpi-title">DISPATCH STATUS</span><span class="kpi-icon">⚡</span></div>
+          <div class="kpi-value highlight-emerald" style="font-size:18px;">LIVE CONNECTED</div>
+          <div class="kpi-subtext">Ready to dispatch via Quo</div>
+        </div>
+      </div>
+
+      <!-- Table 1: HITL Reminder Approval Queue -->
+      <div class="table-container" style="margin-bottom: 24px;">
+        <div class="table-header" style="padding:16px 20px;border-bottom:1px solid #334155;display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:12px;">
+          <div>
+            <h3 style="margin:0;font-size:16px;color:#f8fafc;">📩 Pending Reminder Approvals</h3>
+            <p style="margin:4px 0 0;font-size:12px;color:#94a3b8;">Review the AI-generated SMS draft below and click Send to transmit via Quo.</p>
+          </div>
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+            <input type="text" id="quo-search-input" placeholder="🔍 Search tenant, property, phone..." 
+              style="background:#0f172a;border:1px solid #334155;border-radius:8px;padding:7px 12px;color:#f8fafc;font-size:12px;width:240px;outline:none;" />
+            <button id="btn-quo-send-all" 
+              style="background:linear-gradient(135deg,#10b981,#059669);color:#ffffff;font-weight:700;border:none;border-radius:8px;padding:8px 16px;cursor:pointer;display:flex;align-items:center;gap:6px;font-size:12px;white-space:nowrap;box-shadow:0 2px 8px rgba(16,185,129,0.3);transition:transform 0.15s;"
+              onmouseenter="this.style.transform='scale(1.03)'" onmouseleave="this.style.transform='scale(1)'">
+              <span>⚡ Send All Reminders (HITL)</span>
+            </button>
+            <span class="badge" style="background:rgba(245,158,11,0.12);color:#f59e0b;border:1px solid rgba(245,158,11,0.4);padding:6px 10px;border-radius:12px;font-size:11px;">
+              🛡️ Approval Required
+            </span>
+          </div>
+        </div>
+        <table class="data-table" id="quo-reminders-table">
+          <thead>
+            <tr>
+              <th>Tenant</th>
+              <th>Property / Unit</th>
+              <th>Phone</th>
+              <th>Overdue Balance</th>
+              <th>Status</th>
+              <th>SMS Draft (Preview)</th>
+              <th style="text-align:center;min-width:130px;">HITL Action</th>
+            </tr>
+          </thead>
+          <tbody id="quo-reminders-tbody">
+            <tr><td colspan="7" style="text-align:center;padding:24px;color:#94a3b8;">Loading reminder queue...</td></tr>
+          </tbody>
+        </table>
+
+        <!-- Pagination Controls for Quo Reminders -->
+        <div id="quo-pagination-bar" style="display:flex;justify-content:space-between;align-items:center;padding:12px 20px;border-top:1px solid #1e293b;background:#090d16;font-size:12px;color:#94a3b8;">
+          <div id="quo-pagination-info">Showing 0 of 0</div>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <button id="quo-prev-btn" style="background:#1e293b;color:#f8fafc;border:1px solid #334155;border-radius:6px;padding:5px 12px;cursor:pointer;font-size:12px;">◀ Previous</button>
+            <span id="quo-page-num" style="color:#cbd5e1;font-weight:600;">Page 1</span>
+            <button id="quo-next-btn" style="background:#1e293b;color:#f8fafc;border:1px solid #334155;border-radius:6px;padding:5px 12px;cursor:pointer;font-size:12px;">Next ▶</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Table 2: Tenant SMS Conversation History -->
+      <div class="table-container" style="margin-bottom: 24px;">
+        <div class="table-header" style="padding:16px 20px;border-bottom:1px solid #334155;">
+          <h3 style="margin:0;font-size:16px;color:#f8fafc;">💬 Live Quo (OpenPhone) Message Threads</h3>
+          <p style="margin:4px 0 0;font-size:12px;color:#94a3b8;">Real sent and received SMS history across your tenant conversations.</p>
+        </div>
+        <table class="data-table" id="quo-messages-table">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Direction</th>
+              <th>Tenant / Sender</th>
+              <th>Message Content</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="quo-messages-tbody">
+            <tr><td colspan="5" style="text-align:center;padding:24px;color:#94a3b8;">Loading SMS message threads...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </main>
+
+    <!-- TAB 4: INTERACTIVE TENANT REPLY SIMULATOR -->
+    <main class="tab-content" id="tab-simulator">
+      <div class="content-header">
+        <div>
+          <h1 class="page-title">AI Intent Classifier — Live Demonstration Sandbox</h1>
+          <p class="page-subtitle">Test any tenant SMS reply scenario against the AI Natural Language Understanding classifier and Business Rules Engine.</p>
+        </div>
+      </div>
+
+      <div class="simulator-grid">
+        <!-- Input Form -->
+        <div class="sim-card sim-input-card">
+          <h3 class="card-title">1. Configure Incoming Tenant Reply</h3>
+          
+          <div class="form-group">
+            <label for="sim-tenant-select">Target Tenant Profile:</label>
+            <select id="sim-tenant-select" class="form-control">
+              <!-- Dynamically populated -->
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label>Communication Channel:</label>
+            <div class="radio-toggle">
+              <label class="radio-label">
+                <input type="radio" name="sim-channel" value="SMS" checked>
+                <span>💬 Quo SMS Text</span>
+              </label>
+              <label class="radio-label">
+                <input type="radio" name="sim-channel" value="EMAIL">
+                <span>✉️ Gmail Email</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="sim-message-text">Inbound Message Content:</label>
+            <textarea id="sim-message-text" rows="4" class="form-control" placeholder="Type tenant message here... e.g. 'Sorry for the delay! My direct deposit lands this Friday, I will pay the full amount by Friday morning.'"></textarea>
+          </div>
+
+          <div class="quick-presets">
+            <span class="preset-label">Quick Scenarios:</span>
+            <button class="btn-preset" data-text="Hey, sorry! I will pay by Friday morning once my paycheck deposits.">💰 Promise (Friday)</button>
+            <button class="btn-preset" data-text="I can transfer $1,400 tomorrow night through the resident portal.">📅 Promise (Tomorrow)</button>
+            <button class="btn-preset" data-text="I already paid this morning via my bank portal, check confirmation #RV-99218.">✅ Claims Paid</button>
+            <button class="btn-preset" data-text="I am withholding rent until maintenance fixes the water leak in my bathroom!">⚠️ Maintenance Dispute</button>
+            <button class="btn-preset" data-text="You charged me twice for late fee, this is wrong and I want my lawyer to review it.">⚖️ Billing Dispute</button>
+          </div>
+
+          <div class="form-actions">
+            <button id="btn-run-simulation" class="btn btn-primary btn-full">
+              <span>⚡ Run AI Classifier & Decision Engine</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Simulation Results Output -->
+        <div class="sim-card sim-output-card">
+          <h3 class="card-title">2. AI Intent & Rule Outcome Analysis</h3>
+
+          <div id="sim-results-empty" class="sim-placeholder">
+            <div class="placeholder-icon">🤖</div>
+            <p>Select a quick scenario or type a message, then click "Run AI Classifier" to test real-time intent extraction and rule response.</p>
+          </div>
+
+          <div id="sim-results-content" class="sim-results-view hidden">
+            <!-- Intent Badge -->
+            <div class="sim-metric-row">
+              <div class="sim-metric">
+                <span class="sim-label">DETECTED INTENT</span>
+                <span class="sim-badge" id="sim-result-intent">PROMISE_MADE</span>
+              </div>
+              <div class="sim-metric">
+                <span class="sim-label">AI CONFIDENCE</span>
+                <span class="sim-val" id="sim-result-confidence">94%</span>
+              </div>
+              <div class="sim-metric">
+                <span class="sim-label">EXTRACTED COMMITMENT DATE</span>
+                <span class="sim-val highlight-amber" id="sim-result-date">2026-10-23</span>
+              </div>
+            </div>
+
+            <!-- Decision Outcome Banner -->
+            <div class="sim-outcome-box" id="sim-result-outcome-box">
+              <div class="outcome-icon" id="sim-result-outcome-icon">🛡️</div>
+              <div>
+                <div class="outcome-title" id="sim-result-outcome-title">HOLD_PROMISE — Reminder Held</div>
+                <div class="outcome-desc" id="sim-result-outcome-desc">Payment promise detected. Reminder suppressed and RentVine note queued.</div>
+              </div>
+            </div>
+
+            <!-- RentVine Note Write-back Preview -->
+            <div class="note-preview-box">
+              <div class="note-header">
+                <span>📝 RENTVINE NOTE WRITE-BACK (Automated)</span>
+                <span class="note-status-badge">Recorded</span>
+              </div>
+              <div class="note-body" id="sim-result-note-text">
+                [AI PAYMENT PROMISE ON FILE: Will pay by 2026-10-23] Tenant confirmed via SMS: "Hey, sorry! I will pay by Friday morning once my paycheck deposits."
+              </div>
+            </div>
+
+            <!-- Engine Reasoning Details -->
+            <div class="reasoning-box">
+              <span class="reasoning-title">🔍 Decision Engine Reasoning:</span>
+              <p id="sim-result-reasoning" class="reasoning-text"></p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <!-- TAB 5: LIVE RENTVINE DATA -->
+    <main class="tab-content" id="tab-rentvine-live">
+      <div class="content-header" style="margin-bottom:24px;">
+        <div>
+          <h1 class="page-title">Live RentVine Portfolio Feeds</h1>
+          <p class="page-subtitle">Synchronized live data from redbricksproperties.rentvine.com — properties, tenant contacts, and active leases.</p>
+        </div>
+        <button id="btn-refresh-rentvine" class="btn btn-secondary">
+          <span>🔄 Refresh RentVine Data</span>
+        </button>
+      </div>
+
+      <div class="kpi-ribbon" style="margin-bottom: 24px;">
+        <div class="kpi-card" id="card-rv-props" style="cursor:pointer;">
+          <div class="kpi-header"><span class="kpi-title">LIVE PROPERTIES</span><span class="kpi-icon">🏢</span></div>
+          <div class="kpi-value" id="rv-count-properties">--</div>
+          <div class="kpi-subtext">Click to view properties</div>
+        </div>
+        <div class="kpi-card" id="card-rv-tenants" style="cursor:pointer;">
+          <div class="kpi-header"><span class="kpi-title">LIVE TENANT CONTACTS</span><span class="kpi-icon">👥</span></div>
+          <div class="kpi-value" id="rv-count-tenants">--</div>
+          <div class="kpi-subtext">Click to view contacts</div>
+        </div>
+        <div class="kpi-card" id="card-rv-leases" style="cursor:pointer;">
+          <div class="kpi-header"><span class="kpi-title">ACTIVE LEASES</span><span class="kpi-icon">📜</span></div>
+          <div class="kpi-value" id="rv-count-leases">--</div>
+          <div class="kpi-subtext">Click to view leases</div>
+        </div>
+      </div>
+
+      <!-- SECTION 1: PROPERTIES (PAGINATED) -->
+      <div class="table-container" style="margin-bottom: 28px;">
+        <div class="table-header" style="padding:16px 20px;border-bottom:1px solid #334155;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
+          <div style="display:flex;align-items:center;gap:12px;">
+            <h3 style="margin:0;font-size:16px;color:#f8fafc;">🏢 Live Properties</h3>
+            <span class="badge" id="rv-props-total-badge" style="background:#0284c722;color:#38bdf8;padding:3px 10px;border-radius:12px;font-size:12px;">Loading...</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px;">
+            <div class="search-box" style="margin:0;">
+              <span class="search-icon">🔍</span>
+              <input type="text" id="rv-props-search" placeholder="Search address or name..." style="width:220px;padding:6px 10px 6px 32px;font-size:12px;">
+            </div>
+            <select id="rv-props-pagesize" class="select-dropdown" style="padding:5px 10px;font-size:12px;width:auto;">
+              <option value="10">10 / page</option>
+              <option value="25" selected>25 / page</option>
+              <option value="50">50 / page</option>
+              <option value="100">100 / page</option>
+            </select>
+          </div>
+        </div>
+        <table class="data-table" id="rv-properties-table">
+          <thead>
+            <tr>
+              <th style="width:100px;">Property ID</th>
+              <th>Property Name / Address</th>
+              <th>City, State</th>
+              <th>Postal Code</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="rv-properties-tbody">
+            <tr><td colspan="5" style="text-align:center;padding:24px;color:#94a3b8;">Loading properties...</td></tr>
+          </tbody>
+        </table>
+        <div class="pagination-bar" style="display:flex;justify-content:space-between;align-items:center;padding:12px 20px;background:#0f172a;border-top:1px solid #1e293b;border-radius:0 0 12px 12px;font-size:13px;color:#94a3b8;">
+          <div id="rv-props-page-info">Showing properties</div>
+          <div style="display:flex;align-items:center;gap:6px;">
+            <button id="btn-rv-props-first" class="btn btn-secondary btn-sm" title="First Page">⏮</button>
+            <button id="btn-rv-props-prev" class="btn btn-secondary btn-sm" title="Previous Page">◀</button>
+            <span id="rv-props-page-current" style="padding:4px 10px;font-weight:700;color:#38bdf8;background:#1e293b;border-radius:6px;">1</span>
+            <button id="btn-rv-props-next" class="btn btn-secondary btn-sm" title="Next Page">▶</button>
+            <button id="btn-rv-props-last" class="btn btn-secondary btn-sm" title="Last Page">⏭</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- SECTION 2: TENANTS (PAGINATED) -->
+      <div class="table-container" style="margin-bottom: 28px;">
+        <div class="table-header" style="padding:16px 20px;border-bottom:1px solid #334155;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
+          <div style="display:flex;align-items:center;gap:12px;">
+            <h3 style="margin:0;font-size:16px;color:#f8fafc;">👥 Live Tenants & Contacts</h3>
+            <span class="badge" id="rv-tens-total-badge" style="background:#05966922;color:#34d399;padding:3px 10px;border-radius:12px;font-size:12px;">Loading...</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px;">
+            <div class="search-box" style="margin:0;">
+              <span class="search-icon">🔍</span>
+              <input type="text" id="rv-tens-search" placeholder="Search tenant name..." style="width:220px;padding:6px 10px 6px 32px;font-size:12px;">
+            </div>
+            <select id="rv-tens-pagesize" class="select-dropdown" style="padding:5px 10px;font-size:12px;width:auto;">
+              <option value="10">10 / page</option>
+              <option value="25" selected>25 / page</option>
+              <option value="50">50 / page</option>
+              <option value="100">100 / page</option>
+            </select>
+          </div>
+        </div>
+        <table class="data-table" id="rv-tenants-table">
+          <thead>
+            <tr>
+              <th style="width:100px;">Contact ID</th>
+              <th>Tenant / Contact Name</th>
+              <th>Email Address</th>
+              <th>Phone Number</th>
+            </tr>
+          </thead>
+          <tbody id="rv-tenants-tbody">
+            <tr><td colspan="4" style="text-align:center;padding:24px;color:#94a3b8;">Loading tenants...</td></tr>
+          </tbody>
+        </table>
+        <div class="pagination-bar" style="display:flex;justify-content:space-between;align-items:center;padding:12px 20px;background:#0f172a;border-top:1px solid #1e293b;border-radius:0 0 12px 12px;font-size:13px;color:#94a3b8;">
+          <div id="rv-tens-page-info">Showing contacts</div>
+          <div style="display:flex;align-items:center;gap:6px;">
+            <button id="btn-rv-tens-first" class="btn btn-secondary btn-sm" title="First Page">⏮</button>
+            <button id="btn-rv-tens-prev" class="btn btn-secondary btn-sm" title="Previous Page">◀</button>
+            <span id="rv-tens-page-current" style="padding:4px 10px;font-weight:700;color:#38bdf8;background:#1e293b;border-radius:6px;">1</span>
+            <button id="btn-rv-tens-next" class="btn btn-secondary btn-sm" title="Next Page">▶</button>
+            <button id="btn-rv-tens-last" class="btn btn-secondary btn-sm" title="Last Page">⏭</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- SECTION 3: LEASES (PAGINATED) -->
+      <div class="table-container" style="margin-bottom: 28px;">
+        <div class="table-header" style="padding:16px 20px;border-bottom:1px solid #334155;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
+          <div style="display:flex;align-items:center;gap:12px;">
+            <h3 style="margin:0;font-size:16px;color:#f8fafc;">📜 Live Leases</h3>
+            <span class="badge" id="rv-leases-total-badge" style="background:#d9770622;color:#fbbf24;padding:3px 10px;border-radius:12px;font-size:12px;">Loading...</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px;">
+            <div class="search-box" style="margin:0;">
+              <span class="search-icon">🔍</span>
+              <input type="text" id="rv-leases-search" placeholder="Search lease or property..." style="width:220px;padding:6px 10px 6px 32px;font-size:12px;">
+            </div>
+            <select id="rv-leases-pagesize" class="select-dropdown" style="padding:5px 10px;font-size:12px;width:auto;">
+              <option value="10">10 / page</option>
+              <option value="25" selected>25 / page</option>
+              <option value="50">50 / page</option>
+              <option value="100">100 / page</option>
+            </select>
+          </div>
+        </div>
+        <table class="data-table" id="rv-leases-table">
+          <thead>
+            <tr>
+              <th style="width:90px;">Lease ID</th>
+              <th>Tenants</th>
+              <th>Property / Unit</th>
+              <th>Monthly Rent</th>
+              <th>Term Dates</th>
+              <th>Lease Status</th>
+            </tr>
+          </thead>
+          <tbody id="rv-leases-tbody">
+            <tr><td colspan="6" style="text-align:center;padding:24px;color:#94a3b8;">Loading leases...</td></tr>
+          </tbody>
+        </table>
+        <div class="pagination-bar" style="display:flex;justify-content:space-between;align-items:center;padding:12px 20px;background:#0f172a;border-top:1px solid #1e293b;border-radius:0 0 12px 12px;font-size:13px;color:#94a3b8;">
+          <div id="rv-leases-page-info">Showing leases</div>
+          <div style="display:flex;align-items:center;gap:6px;">
+            <button id="btn-rv-leases-first" class="btn btn-secondary btn-sm" title="First Page">⏮</button>
+            <button id="btn-rv-leases-prev" class="btn btn-secondary btn-sm" title="Previous Page">◀</button>
+            <span id="rv-leases-page-current" style="padding:4px 10px;font-weight:700;color:#38bdf8;background:#1e293b;border-radius:6px;">1</span>
+            <button id="btn-rv-leases-next" class="btn btn-secondary btn-sm" title="Next Page">▶</button>
+            <button id="btn-rv-leases-last" class="btn btn-secondary btn-sm" title="Last Page">⏭</button>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <!-- TAB 6: AUDIT HISTORY -->
+    <main class="tab-content" id="tab-runs">
+      <div class="content-header">
+        <div>
+          <h1 class="page-title">Workflow Execution History</h1>
+          <p class="page-subtitle">Immutable audit trail of automated cycles and decisions.</p>
+        </div>
+      </div>
+      <div class="runs-list" id="runs-history-container">
+        <!-- Dynamically populated via JS -->
+      </div>
+    </main>
+
+    <!-- TAB 7: SETTINGS -->
+    <main class="tab-content" id="tab-settings">
+      <div class="content-header">
+        <div>
+          <h1 class="page-title">Integration & Automation Settings</h1>
+          <p class="page-subtitle">Configure business rule thresholds, cooldown windows, and Model Context Protocol settings.</p>
+        </div>
+      </div>
+
+      <div class="settings-grid">
+        <!-- RentVine MCP -->
+        <div class="settings-card">
+          <div class="card-badge">Live Active</div>
+          <h3>🏢 RentVine Integration</h3>
+          <p class="settings-desc">Model Context Protocol connection to RentVine property management system.</p>
+          <div class="form-group">
+            <label>Subdomain Endpoint:</label>
+            <input type="text" class="form-control" value="https://redbricksproperties.rentvine.com" readonly>
+          </div>
+          <div class="form-group">
+            <label>Authentication Protocol:</label>
+            <input type="text" class="form-control" value="REST API Key + Secret (Basic Auth)" readonly>
+          </div>
+          <div class="form-group">
+            <label>Capabilities Enabled:</label>
+            <ul class="settings-checklist">
+              <li>✓ Rent balance querying (Read-Only)</li>
+              <li>✓ Payment history & due date verification</li>
+              <li>✓ Tenant note reading & write-back</li>
+              <li>✓ Native API sync with pagination</li>
+            </ul>
+          </div>
+        </div>
+
+        <!-- Quo (OpenPhone) -->
+        <div class="settings-card">
+          <div class="card-badge">Live Active</div>
+          <h3>💬 Quo (OpenPhone) SMS Channel</h3>
+          <p class="settings-desc">AI-powered business communication line for rent reminders and tenant replies.</p>
+          <div class="form-group">
+            <label>API Endpoint:</label>
+            <input type="text" class="form-control" value="https://api.openphone.com/v1" readonly>
+          </div>
+          <div class="form-group">
+            <label>Dedicated Phone Number ID:</label>
+            <input type="text" class="form-control" value="PNz3t43PKv (+1 667 281-3879)" readonly>
+          </div>
+          <div class="form-group">
+            <label>HITL Mode:</label>
+            <input type="text" class="form-control" value="Enforced (Approval required per reminder)" readonly>
+          </div>
+        </div>
+
+        <!-- Business Rules -->
+        <div class="settings-card">
+          <div class="card-badge">Customizable</div>
+          <h3>⚡ Business Rules Engine Thresholds</h3>
+          <p class="settings-desc">Tune grace periods and cooldown windows governing automated reminders.</p>
+          <div class="form-group">
+            <label>Grace Period Window (Days after due date):</label>
+            <input type="number" id="setting-grace-days" class="form-control" value="5" min="0" max="10">
+          </div>
+          <div class="form-group">
+            <label>Deduplication Cooldown (Hours):</label>
+            <input type="number" id="setting-dedup-hours" class="form-control" value="24" min="1" max="72">
+          </div>
+          <div class="form-group">
+            <label>Payment Promise Expiry Window (Days):</label>
+            <input type="number" id="setting-promise-days" class="form-control" value="5" min="1" max="14">
+          </div>
+          <button id="btn-save-settings" class="btn btn-primary btn-full">
+            Save Thresholds
+          </button>
+        </div>
+      </div>
+    </main>
+
+  </div><!-- /app-container -->
+
+  <!-- MULTI-CHANNEL TENANT INSPECTOR DRAWER -->
+  <div class="drawer-backdrop" id="drawer-backdrop"></div>
+  <aside class="tenant-drawer" id="tenant-drawer">
+    <div class="drawer-header">
+      <div>
+        <div class="drawer-tenant-name" id="drawer-name">Select Tenant</div>
+        <div class="drawer-tenant-sub" id="drawer-property">RentVine Lease & Communication Profile</div>
+      </div>
+      <button class="drawer-close" id="drawer-close-btn">&times;</button>
+    </div>
+
+    <!-- Drawer Navigation Tabs -->
+    <div class="drawer-tabs">
+      <button class="drawer-tab active" data-drawer-tab="rentvine">RentVine MCP</button>
+      <button class="drawer-tab" data-drawer-tab="quo-sms">Quo SMS Thread</button>
+      <button class="drawer-tab" data-drawer-tab="gmail">Gmail Replies</button>
+      <button class="drawer-tab" data-drawer-tab="audit">Audit Log</button>
+    </div>
+
+    <!-- Drawer Content Views -->
+    <div class="drawer-body">
+      <!-- 1. RentVine Ledger Tab -->
+      <div class="drawer-tab-pane active" id="drawer-pane-rentvine">
+        <div class="drawer-section">
+          <div class="drawer-section-title">RentVine Financial Ledger (Read-Only)</div>
+          <div class="drawer-kpi-grid">
+            <div class="drawer-kpi-box">
+              <span class="d-kpi-label">Current Balance</span>
+              <span class="d-kpi-val highlight-amber" id="drawer-rv-balance">$0.00</span>
+            </div>
+            <div class="drawer-kpi-box">
+              <span class="d-kpi-label">Monthly Rent</span>
+              <span class="d-kpi-val" id="drawer-rv-rent">$0.00</span>
+            </div>
+            <div class="drawer-kpi-box">
+              <span class="d-kpi-label">Due Date</span>
+              <span class="d-kpi-val" id="drawer-rv-due">--</span>
+            </div>
+            <div class="drawer-kpi-box">
+              <span class="d-kpi-label">Lease Status</span>
+              <span class="d-kpi-val" id="drawer-rv-status">ACTIVE</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="drawer-section">
+          <div class="drawer-section-title">RentVine Ledger Notes</div>
+          <div class="drawer-notes-list" id="drawer-rv-notes">
+            <div class="text-muted text-sm">No recorded notes for this tenant.</div>
+          </div>
+          <div class="add-note-box" style="margin-top:12px;">
+            <input type="text" id="drawer-input-new-note" placeholder="Write new automated or manager note..." class="form-control form-control-sm">
+            <button id="drawer-btn-add-note" class="btn btn-secondary btn-sm" style="margin-top:6px;">Add Note to RentVine</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 2. Quo SMS Thread Tab -->
+      <div class="drawer-tab-pane" id="drawer-pane-quo-sms">
+        <div class="drawer-section">
+          <div class="drawer-section-title">Quo SMS Conversation (+1-800-REDBRICKS)</div>
+          <div class="sms-chat-thread" id="drawer-quo-thread">
+            <div class="text-muted text-sm">No SMS messages found.</div>
+          </div>
+          <div class="add-note-box" style="margin-top:12px;display:flex;gap:8px;">
+            <input type="text" id="drawer-manual-sms-input" placeholder="Type SMS message to tenant..." class="form-control form-control-sm" style="flex:1;">
+            <button id="drawer-btn-send-sms" class="btn btn-primary btn-sm">Send SMS</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 3. Gmail Replies Tab -->
+      <div class="drawer-tab-pane" id="drawer-pane-gmail">
+        <div class="drawer-section">
+          <div class="drawer-section-title">Tenant Email Inbox (rentals@redbrickpm.com)</div>
+          <div class="email-thread-list" id="drawer-email-thread">
+            <div class="text-muted text-sm">No emails received from this tenant.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 4. Decision Engine Audit Log Tab -->
+      <div class="drawer-tab-pane" id="drawer-pane-audit">
+        <div class="drawer-section">
+          <div class="drawer-section-title">Decision Engine Audit Trail</div>
+          <div class="audit-trail-list" id="drawer-audit-log">
+            <div class="text-muted text-sm">No recorded workflow decisions yet.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- DAILY SUMMARY REPORT MODAL -->
+  <div class="modal-overlay" id="report-modal">
+    <div class="modal-dialog modal-lg">
+      <div class="modal-header">
+        <div>
+          <h2 class="modal-title">Executive Summary — Daily Automated Rent Workflow</h2>
+          <div class="modal-subtitle" id="modal-report-meta">Automated Portfolio Health Report</div>
+        </div>
+        <div style="display:flex;gap:10px;align-items:center;">
+          <button id="btn-print-report" class="btn btn-secondary btn-sm">🖨️ Print / Save PDF</button>
+          <button class="modal-close" id="report-modal-close">&times;</button>
+        </div>
+      </div>
+      <div class="modal-body" id="report-modal-body">
+        <div class="report-loading">Loading latest run data...</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Notification Container -->
+  <div class="toast-container" id="toast-container"></div>
+
+  <!-- JavaScript Modules -->
+  <script src="js/flowchart.js"></script>
+  <script src="js/tenant-drawer.js"></script>
+  <script src="js/simulator.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>

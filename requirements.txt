@@ -1,0 +1,11 @@
+# Red Bricks Property Management - Production Dependencies
+# The core agent and web dashboard can run on standard library Python 3.11+,
+# but these optional packages enable advanced cloud integrations (FastAPI, OpenAI, Google API).
+
+requests>=2.31.0
+openai>=1.12.0
+pydantic>=2.6.0
+python-dotenv>=1.0.1
+uvicorn>=0.27.0
+fastapi>=0.110.0
+pytest>=8.0.0
