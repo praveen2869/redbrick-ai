@@ -94,7 +94,7 @@ class BusinessRulesEngine:
             return False, None, "Could not parse previous timestamp"
 
         elapsed = now - last_ts
-        hours_elapsed = elapsed.total_seconds() / 3600.0
+        hours_elapsed = abs(elapsed.total_seconds()) / 3600.0
 
         if hours_elapsed < self.dedup_window_hours:
             remaining_hours = self.dedup_window_hours - hours_elapsed

@@ -323,7 +323,8 @@ class AppController {
       }
 
       const totalBadge = document.getElementById("badge-total-tenants");
-      if (totalBadge) totalBadge.textContent = this.tenants.length;
+      const activeCount = this.tenants.filter(t => t.lease_status !== "COMPLETED").length;
+      if (totalBadge) totalBadge.textContent = activeCount || this.tenants.length;
 
       if (initial && window.flowchartCtrl && statusData.latest_run) {
         const lr = statusData.latest_run;
@@ -362,6 +363,7 @@ class AppController {
   }
 
   updateKPIs(latestRun) {
+    let totalUnits = 0;
     let totalBal = 0;
     let countPaid = 0;
     let countPromises = 0;
@@ -369,17 +371,31 @@ class AppController {
     let countFlagged = 0;
     let countCooldown = 0;
 
-    this.tenants.forEach(t => {
-      if (t.balance > 0) totalBal += t.balance;
-      const d = t.latest_decision;
-      if (d) {
-        if (d.outcome === "SKIP_PAID") countPaid++;
-        else if (d.outcome === "HOLD_PROMISE") countPromises++;
-        else if (d.outcome === "SEND_REMINDER") countSent++;
-        else if (d.outcome === "FLAG_MANUAL_REVIEW") countFlagged++;
-        else if (d.outcome === "SKIP_ALREADY_REMINDED" || d.outcome === "SKIP_GRACE_PERIOD") countCooldown++;
-      }
-    });
+    if (latestRun && typeof latestRun.total_tenants === "number" && latestRun.total_tenants > 0) {
+      // Authoritative run summary from workflow execution
+      totalUnits = latestRun.total_tenants;
+      countPaid = latestRun.count_paid || 0;
+      countPromises = latestRun.count_promised || 0;
+      countSent = latestRun.count_reminded || 0;
+      countFlagged = latestRun.count_flagged || 0;
+      countCooldown = latestRun.count_skipped || 0;
+      totalBal = latestRun.total_balance_unpaid || 0;
+    } else {
+      // Filter out completed leases to only show active units
+      const activeTenants = this.tenants.filter(t => t.lease_status !== "COMPLETED");
+      totalUnits = activeTenants.length;
+      activeTenants.forEach(t => {
+        if (t.balance > 0) totalBal += t.balance;
+        const d = t.latest_decision;
+        if (d) {
+          if (d.outcome === "SKIP_PAID") countPaid++;
+          else if (d.outcome === "HOLD_PROMISE") countPromises++;
+          else if (d.outcome === "SEND_REMINDER") countSent++;
+          else if (d.outcome === "FLAG_MANUAL_REVIEW") countFlagged++;
+          else if (d.outcome === "SKIP_ALREADY_REMINDED" || d.outcome === "SKIP_GRACE_PERIOD") countCooldown++;
+        }
+      });
+    }
 
     const valUnits = document.getElementById("val-total-units");
     const valOverdue = document.getElementById("val-overdue-balance");
@@ -388,14 +404,22 @@ class AppController {
     const valSent = document.getElementById("val-count-sent");
     const valSavings = document.getElementById("val-time-saved");
 
-    if (valUnits) valUnits.textContent = this.tenants.length;
+    if (valUnits) valUnits.textContent = totalUnits.toLocaleString();
     if (valOverdue) valOverdue.textContent = `$${Math.round(totalBal).toLocaleString()}`;
-    if (valPaid) valPaid.textContent = countPaid;
-    if (valPromises) valPromises.textContent = countPromises;
-    if (valSent) valSent.textContent = countSent;
+    if (valPaid) valPaid.textContent = countPaid.toLocaleString();
+    if (valPromises) valPromises.textContent = countPromises.toLocaleString();
+    if (valSent) valSent.textContent = countSent.toLocaleString();
 
-    const hoursSaved = (this.tenants.length * 0.22).toFixed(1);
+    const hoursSaved = (totalUnits * 0.22).toFixed(1);
     if (valSavings) valSavings.textContent = `${hoursSaved} hrs`;
+
+    // Synchronize flowchart outcome diamond counters
+    const dPaid = document.getElementById("count-diamond-paid");
+    const dPromise = document.getElementById("count-diamond-promise");
+    const dUnpaid = document.getElementById("count-diamond-unpaid");
+    if (dPaid) dPaid.textContent = `${countPaid} units`;
+    if (dPromise) dPromise.textContent = `${countPromises} units`;
+    if (dUnpaid) dUnpaid.textContent = `${countSent} units`;
 
     // Update filter pills with real dynamic counts
     const pillAll = document.getElementById("pill-filter-all");
@@ -405,7 +429,7 @@ class AppController {
     const pillFlagged = document.getElementById("pill-filter-flagged");
     const pillCooldown = document.getElementById("pill-filter-cooldown");
 
-    if (pillAll) pillAll.textContent = `All Tenants (${this.tenants.length})`;
+    if (pillAll) pillAll.textContent = `All Active (${totalUnits})`;
     if (pillReminded) pillReminded.textContent = `📩 Reminders Needed (${countSent})`;
     if (pillPromised) pillPromised.textContent = `🛡️ Promises on File (${countPromises})`;
     if (pillPaid) pillPaid.textContent = `✅ Paid / Cleared (${countPaid})`;
@@ -1141,7 +1165,7 @@ class AppController {
     const btn = isDryRun ? this.btnDryRun : this.btnRun;
     const originalText = btn.innerHTML;
     btn.disabled = true;
-    btn.innerHTML = `<span>⏳ Processing...</span>`;
+    btn.innerHTML = `<span>⏳ Processing Workflow & Syncing...</span>`;
 
     try {
       const res = await fetch("/api/run-workflow", {
@@ -1152,11 +1176,17 @@ class AppController {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
 
-      // Animate execution beam through flowchart
+      // 1. Immediately apply the final authoritative results to all KPI cards and flowchart
+      if (data.summary) {
+        this.updateKPIs(data.summary);
+      }
+
+      // 2. Animate execution beam through flowchart with final data
       if (window.flowchartCtrl) {
         await window.flowchartCtrl.animateExecution(isDryRun, data.summary);
       }
 
+      // 3. Refresh tenant table, runs log, and external overviews
       await this.refreshData(false);
       this.loadRentVineOverview();
       this.loadQuoData();

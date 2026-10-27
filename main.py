@@ -17,27 +17,12 @@ logger = logging.getLogger("RedBricksMain")
 
 
 def sync_live_data():
-    """Removes all seed/demo tenants and syncs the full live portfolio from RentVine."""
-    import sqlite3
-    conn = sqlite3.connect(settings.DATABASE_PATH)
-    c = conn.cursor()
-    # Purge seed tenants (IDs starting with T-) so only real RV- tenants remain
-    for tbl, col in [
-        ("tenants", "id"),
-        ("rentvine_records", "tenant_id"),
-        ("workflow_decisions", "tenant_id"),
-        ("communication_messages", "tenant_id"),
-        ("rentvine_notes", "tenant_id"),
-    ]:
-        c.execute(f"DELETE FROM {tbl} WHERE {col} LIKE 'T-%'")
-    conn.commit()
-    conn.close()
-
-    # Sync live data from RentVine
+    """Removes demo tenants and synchronizes active RentVine portfolio via sync_manager."""
+    from src.sync_manager import sync_manager
     client = RentVineMCPClient()
     if not client.mock_mode:
-        print("[SYNC] Connecting to RentVine and syncing live portfolio...")
-        synced = client.sync_portfolio_from_rentvine(limit=1000)
+        print("[SYNC] Connecting to RentVine and syncing live portfolio (parallel)...")
+        synced = sync_manager.sync_live_portfolio(limit=1000)
         print(f"[SYNC] Done — synced {synced} live RentVine leases into local database.")
     else:
         print("[WARN] RentVine is in mock mode — no live data to sync. Check .env credentials.")

@@ -20,6 +20,8 @@ from src.models import IntentType, ClassificationResult, Channel, CommunicationM
 logger = logging.getLogger("AIClassifier")
 
 class AIIntentClassifier:
+    _llm_disabled: bool = False
+
     def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
         self.groq_key = settings.GROQ_API_KEY
         self.openai_key = api_key or settings.OPENAI_API_KEY
@@ -62,13 +64,17 @@ class AIIntentClassifier:
         latest_msg = sorted(inbound_messages, key=lambda x: x.timestamp, reverse=True)[0]
         text = latest_msg.content.strip()
 
-        # Try LLM (Groq or OpenAI) if API key is present
-        if self.api_key:
+        # Try LLM (Groq or OpenAI) if API key is present and not marked disabled
+        if self.api_key and not AIIntentClassifier._llm_disabled:
             try:
                 return self._classify_with_llm(text, latest_msg.channel, now)
             except Exception as e:
                 provider_name = "Groq" if self.is_groq else "OpenAI"
-                logger.warning(f"{provider_name} API call failed: {e}. Falling back to internal NLP engine.")
+                if "403" in str(e) or "401" in str(e) or "Forbidden" in str(e) or "Unauthorized" in str(e):
+                    AIIntentClassifier._llm_disabled = True
+                    logger.warning(f"{provider_name} API returned auth error ({e}). Disabling LLM calls and using internal NLP engine.")
+                else:
+                    logger.warning(f"{provider_name} API call failed: {e}. Falling back to internal NLP engine.")
 
         # Fallback to internal heuristic semantic classifier
         return self._classify_with_heuristics(text, latest_msg.channel, now)

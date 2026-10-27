@@ -23,6 +23,7 @@ from src.clients.gmail_client import GmailClient
 from src.engine.rules import BusinessRulesEngine
 from src.engine.ai_classifier import AIIntentClassifier
 from src.engine.retry_manager import RetryManager
+from src.sync_manager import sync_manager
 
 logger = logging.getLogger("WorkflowOrchestrator")
 
@@ -60,16 +61,25 @@ class WorkflowOrchestrator:
         # Process any pending retries from prior runs first
         self.retry_mgr.process_pending_retries()
 
-        # Step 1: Automatically sync if local database has no tenant records
-        tenants: List[Tenant] = db.get_all_tenants()
+        # Step 1: Wait for any ongoing background sync to complete
+        sync_manager.wait_for_sync(timeout=60.0)
+
+        # Pull active lease tenants
+        tenants: List[Tenant] = db.get_active_tenants()
+
+        # If no active tenants exist and live mode is active, trigger sync
         if not self.rentvine.mock_mode and not tenants:
             try:
-                synced = self.rentvine.sync_portfolio_from_rentvine(limit=200)
+                synced = sync_manager.sync_live_portfolio(limit=1000)
                 if synced > 0:
                     logger.info(f"Populated local SQLite database with {synced} real RentVine active records.")
-                    tenants = db.get_all_tenants()
+                    tenants = db.get_active_tenants()
             except Exception as e:
                 logger.warning(f"RentVine portfolio sync skipped: {e}")
+
+        # Fallback to get_all_tenants if database has demo/seed data without active RV records
+        if not tenants:
+            tenants = db.get_all_tenants()
 
         # Step 2: Data Collection - pull tenants and records
         decisions: List[WorkflowDecision] = []
@@ -206,8 +216,8 @@ class WorkflowOrchestrator:
             return decision
 
         # Step 2b: Pull Communication Data (Quo SMS & Gmail)
-        sms_history = self.quo.get_conversation_history(tenant.id, tenant.phone, days=7)
-        email_history = self.gmail.get_recent_email_replies(tenant.id, tenant.email, hours=48)
+        sms_history = self.quo.get_conversation_history(tenant.id, tenant.phone, days=7, reference_time=current_time)
+        email_history = self.gmail.get_recent_email_replies(tenant.id, tenant.email, hours=48, reference_time=current_time)
         combined_messages = sms_history + email_history
 
         # Step 3: Run AI NLU Intent Classifier on communications

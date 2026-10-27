@@ -24,11 +24,12 @@ class GmailClient:
         self.mock_mode = settings.GMAIL_MOCK_MODE if mock_mode is None else mock_mode
         self.client_id = settings.GMAIL_CLIENT_ID
 
-    def get_recent_email_replies(self, tenant_id: str, email_address: str, hours: int = 48) -> List[CommunicationMessage]:
+    def get_recent_email_replies(self, tenant_id: str, email_address: str, hours: int = 48, reference_time: Optional[datetime] = None) -> List[CommunicationMessage]:
         """
         Retrieves recent email messages from this tenant in the last `hours` hours.
         """
-        cutoff = datetime.utcnow() - timedelta(hours=hours)
+        now = reference_time or datetime.utcnow()
+        cutoff = now - timedelta(hours=hours)
         cutoff_iso = cutoff.isoformat()
 
         all_messages = db.get_messages_for_tenant(tenant_id)

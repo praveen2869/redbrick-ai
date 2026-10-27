@@ -15,7 +15,7 @@ def populate_sample_data(reset: bool = False):
     """Inserts a comprehensive portfolio of tenants and communication logs."""
     if reset:
         db.reset_database()
-    now = datetime.utcnow()
+    now = datetime(2026, 10, 15, 12, 0, 0)
     current_month_str = now.strftime("%Y-%m")
 
     # Sample tenants
