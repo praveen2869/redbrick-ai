@@ -29,6 +29,7 @@ from src.engine.ai_classifier import AIIntentClassifier
 from src.workflow import WorkflowOrchestrator
 from src.reporting import ReportGenerator
 from src.seed_data import populate_sample_data
+from src.sync_manager import sync_manager
 
 logger = logging.getLogger("RedBrickServer")
 
@@ -77,7 +78,7 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
         if path == "/api/status":
             return self._handle_get_status()
         elif path == "/api/tenants":
-            return self._handle_get_tenants()
+            return self._handle_get_tenants(query)
         elif path.startswith("/api/tenant/"):
             tenant_id = path.replace("/api/tenant/", "").strip()
             return self._handle_get_tenant_detail(tenant_id)
@@ -139,6 +140,12 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
             "version": "1.0",
             "environment": settings.ENVIRONMENT,
             "status": "OPERATIONAL",
+            "sync": {
+                "is_syncing": sync_manager.is_syncing,
+                "status": sync_manager.sync_status,
+                "last_synced": sync_manager.last_sync_time,
+                "active_count": sync_manager.active_count
+            },
             "scheduler": {
                 "provider": "Azure Scheduler",
                 "cron": "0 8 * * *",
@@ -173,12 +180,40 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
         }
         self._send_json(data)
 
-    def _handle_get_tenants(self):
-        """Returns all tenants joined with their current RentVine balance and latest decision."""
-        tenants = db.get_all_tenants()
-        decisions = db.get_latest_decisions(limit=2000)
+    def _handle_get_tenants(self, query: Optional[Dict[str, list]] = None):
+        """Returns tenants joined with their current RentVine balance, lease status, and latest decision."""
+        active_only = False
+        if query and query.get("active_only", ["false"])[0].lower() in ("true", "1"):
+            active_only = True
 
-        # Map decisions by tenant_id (most recent first)
+        with db.get_connection() as conn:
+            cursor = conn.cursor()
+            if active_only:
+                cursor.execute("""
+                    SELECT 
+                        t.id, t.first_name, t.last_name, t.phone, t.email,
+                        t.property_name, t.unit_number, t.is_excluded, t.exclusion_reason,
+                        r.balance, r.monthly_rent, r.due_date, r.last_payment_date,
+                        r.last_payment_amount, r.portal_link, r.lease_status
+                    FROM tenants t
+                    JOIN rentvine_records r ON t.id = r.tenant_id
+                    WHERE r.lease_status = 'ACTIVE'
+                    ORDER BY t.property_name, t.unit_number
+                """)
+            else:
+                cursor.execute("""
+                    SELECT 
+                        t.id, t.first_name, t.last_name, t.phone, t.email,
+                        t.property_name, t.unit_number, t.is_excluded, t.exclusion_reason,
+                        r.balance, r.monthly_rent, r.due_date, r.last_payment_date,
+                        r.last_payment_amount, r.portal_link, r.lease_status
+                    FROM tenants t
+                    LEFT JOIN rentvine_records r ON t.id = r.tenant_id
+                    ORDER BY t.property_name, t.unit_number
+                """)
+            tenant_rows = cursor.fetchall()
+
+        decisions = db.get_latest_decisions(limit=2000)
         latest_decision_by_tenant = {}
         for d in decisions:
             if d.tenant_id not in latest_decision_by_tenant:
@@ -191,36 +226,29 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                 }
 
         results = []
-        for t in tenants:
-            rv = db.get_rentvine_record(t.id)
-            messages = db.get_messages_for_tenant(t.id)
-            latest_msg = messages[-1] if messages else None
-
+        for r in tenant_rows:
+            tid = r["id"]
             results.append({
-                "id": t.id,
-                "first_name": t.first_name,
-                "last_name": t.last_name,
-                "full_name": t.full_name,
-                "phone": t.phone,
-                "email": t.email,
-                "property_name": t.property_name,
-                "unit_number": t.unit_number,
-                "is_excluded": t.is_excluded,
-                "exclusion_reason": t.exclusion_reason,
-                "balance": rv.balance if rv else 0.0,
-                "monthly_rent": rv.monthly_rent if rv else 0.0,
-                "due_date": rv.due_date if rv else None,
-                "last_payment_date": rv.last_payment_date if rv else None,
-                "last_payment_amount": rv.last_payment_amount if rv else 0.0,
-                "latest_decision": latest_decision_by_tenant.get(t.id),
-                "latest_message": {
-                    "channel": latest_msg.channel.value,
-                    "direction": latest_msg.direction.value,
-                    "content": latest_msg.content,
-                    "timestamp": latest_msg.timestamp
-                } if latest_msg else None,
-                "message_count": len(messages),
-                "notes_count": len(rv.notes) if rv and rv.notes else 0
+                "id": tid,
+                "first_name": r["first_name"],
+                "last_name": r["last_name"],
+                "full_name": f"{r['first_name']} {r['last_name']}".strip(),
+                "phone": r["phone"],
+                "email": r["email"],
+                "property_name": r["property_name"],
+                "unit_number": r["unit_number"],
+                "is_excluded": bool(r["is_excluded"]),
+                "exclusion_reason": r["exclusion_reason"],
+                "balance": float(r["balance"] or 0.0),
+                "monthly_rent": float(r["monthly_rent"] or 0.0),
+                "due_date": r["due_date"],
+                "last_payment_date": r["last_payment_date"],
+                "last_payment_amount": float(r["last_payment_amount"] or 0.0),
+                "lease_status": r["lease_status"] or "ACTIVE",
+                "latest_decision": latest_decision_by_tenant.get(tid),
+                "latest_message": None,
+                "message_count": 0,
+                "notes_count": 0
             })
 
         self._send_json({"tenants": results, "total": len(results)})

@@ -73,13 +73,14 @@ class QuoSMSClient:
             "status": "REMINDER_NEEDED_SUPPRESSED"
         }
 
-    def get_conversation_history(self, tenant_id: str, phone_number: str, days: int = 7) -> List[CommunicationMessage]:
+    def get_conversation_history(self, tenant_id: str, phone_number: str, days: int = 7, reference_time: Optional[datetime] = None) -> List[CommunicationMessage]:
         """
         Retrieves the last `days` days of SMS conversation with this tenant.
         """
         messages = db.get_messages_for_tenant(tenant_id)
         # Filter to SMS and within time window
-        cutoff = datetime.utcnow() - timedelta(days=days)
+        now = reference_time or datetime.utcnow()
+        cutoff = now - timedelta(days=days)
         cutoff_iso = cutoff.isoformat()
 
         sms_history = [

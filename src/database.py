@@ -233,10 +233,63 @@ class Database:
                 ) for r in rows
             ]
 
-    def get_all_tenants(self) -> List[Tenant]:
+    def upsert_tenants_and_records_batch(self, tenants: List[Tenant], records: List[RentVineRecord]):
+        """Batch upserts tenants and records within a single transaction for high performance."""
+        now_str = datetime.utcnow().isoformat()
+        with self.get_connection() as conn:
+            conn.executemany("""
+            INSERT INTO tenants (id, first_name, last_name, phone, email, property_name, unit_number, is_excluded, exclusion_reason, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                first_name=excluded.first_name,
+                last_name=excluded.last_name,
+                phone=excluded.phone,
+                email=excluded.email,
+                property_name=excluded.property_name,
+                unit_number=excluded.unit_number,
+                is_excluded=excluded.is_excluded,
+                exclusion_reason=excluded.exclusion_reason
+            """, [
+                (
+                    t.id, t.first_name, t.last_name, t.phone,
+                    t.email, t.property_name, t.unit_number,
+                    1 if t.is_excluded else 0, t.exclusion_reason, t.created_at
+                ) for t in tenants
+            ])
+
+            conn.executemany("""
+            INSERT INTO rentvine_records (tenant_id, balance, monthly_rent, due_date, last_payment_date, last_payment_amount, portal_link, lease_status, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(tenant_id) DO UPDATE SET
+                balance=excluded.balance,
+                monthly_rent=excluded.monthly_rent,
+                due_date=excluded.due_date,
+                last_payment_date=excluded.last_payment_date,
+                last_payment_amount=excluded.last_payment_amount,
+                portal_link=excluded.portal_link,
+                lease_status=excluded.lease_status,
+                updated_at=excluded.updated_at
+            """, [
+                (
+                    r.tenant_id, r.balance, r.monthly_rent,
+                    r.due_date, r.last_payment_date, r.last_payment_amount,
+                    r.portal_link, r.lease_status, now_str
+                ) for r in records
+            ])
+            conn.commit()
+
+    def get_all_tenants(self, active_only: bool = False) -> List[Tenant]:
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM tenants ORDER BY property_name, unit_number")
+            if active_only:
+                cursor.execute("""
+                    SELECT t.* FROM tenants t
+                    LEFT JOIN rentvine_records r ON t.id = r.tenant_id
+                    WHERE (r.lease_status IS NULL OR r.lease_status = 'ACTIVE')
+                    ORDER BY t.property_name, t.unit_number
+                """)
+            else:
+                cursor.execute("SELECT * FROM tenants ORDER BY property_name, unit_number")
             rows = cursor.fetchall()
             return [
                 Tenant(
@@ -252,6 +305,10 @@ class Database:
                     created_at=r["created_at"]
                 ) for r in rows
             ]
+
+    def get_active_tenants(self) -> List[Tenant]:
+        """Returns only tenants with active leases (excludes completed/historical leases)."""
+        return self.get_all_tenants(active_only=True)
 
     def get_rentvine_record(self, tenant_id: str) -> Optional[RentVineRecord]:
         with self.get_connection() as conn:
@@ -391,6 +448,29 @@ class Database:
                     sms_message_id=msg_row["id"],
                     note_written=False,
                     run_id="actual_dispatch"
+                )
+            # Fallback: check workflow_decisions with sms_sent=1
+            cursor.execute("""
+            SELECT * FROM workflow_decisions
+            WHERE tenant_id = ? AND sms_sent = 1
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """, (tenant_id,))
+            dec_row = cursor.fetchone()
+            if dec_row:
+                return WorkflowDecision(
+                    tenant_id=tenant_id,
+                    tenant_name=dec_row["tenant_name"],
+                    property_unit=dec_row["property_unit"],
+                    balance=dec_row["balance"],
+                    outcome=DecisionOutcome(dec_row["outcome"]),
+                    reason=dec_row["reason"],
+                    details=json.loads(dec_row["details_json"]) if dec_row["details_json"] else {},
+                    timestamp=dec_row["timestamp"],
+                    sms_sent=bool(dec_row["sms_sent"]),
+                    sms_message_id=dec_row["sms_message_id"],
+                    note_written=bool(dec_row["note_written"]),
+                    run_id=dec_row["run_id"]
                 )
 
             return None
