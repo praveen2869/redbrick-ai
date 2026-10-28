@@ -28,6 +28,7 @@ class AppController {
     this.refreshData(true);
     this.loadRentVineOverview();
     this.loadQuoData();
+    this.loadRentVineReport();
   }
 
   initElements() {
@@ -61,6 +62,9 @@ class AppController {
         const activeContent = document.getElementById(`tab-${target}`);
         if (activeContent) activeContent.classList.add("active");
 
+        if (target === "rentvine-report") {
+          this.loadRentVineReport();
+        }
         if (target === "rentvine-live") {
           this.loadRentVineOverview();
         }
@@ -69,6 +73,18 @@ class AppController {
         }
       });
     });
+
+    const btnSyncRpt72 = document.getElementById("btn-sync-report-72");
+    if (btnSyncRpt72) {
+      btnSyncRpt72.addEventListener("click", async () => {
+        btnSyncRpt72.disabled = true;
+        btnSyncRpt72.innerHTML = `<span>⏳ Syncing Report #72...</span>`;
+        await this.loadRentVineReport(true);
+        await this.refreshData(true);
+        btnSyncRpt72.disabled = false;
+        btnSyncRpt72.innerHTML = `<span>🔄 Sync & Validate Now</span>`;
+      });
+    }
 
     const btnRefreshRv = document.getElementById("btn-refresh-rentvine");
     if (btnRefreshRv) {
@@ -571,6 +587,100 @@ class AppController {
     return `<span class="badge" style="background:#1e293b;color:#94a3b8;">Pending</span>`;
   }
 
+  /* ─── AUTHORITATIVE RENTVINE REPORT #72 (SOURCE OF TRUTH) ─── */
+
+  async loadRentVineReport(forceSync = false) {
+    const tbody = document.getElementById("report-72-tbody");
+    if (tbody) {
+      tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;padding:24px;color:#94a3b8;"><span class="spinner-sm"></span> Fetching live data from RentVine Report #72...</td></tr>`;
+    }
+
+    try {
+      const resp = await fetch("/api/rentvine-report?report_id=72");
+      const result = await resp.json();
+      if (!result.success || !result.report) {
+        throw new Error(result.error || "Failed to load report data");
+      }
+
+      const report = result.report;
+      const records = report.records || [];
+      const totals = report.totals || {};
+
+      // Update KPI totals
+      const elCount = document.getElementById("rpt72-count");
+      if (elCount) elCount.textContent = report.record_count || records.length;
+
+      const elPastDueTotal = document.getElementById("rpt72-past-due-total");
+      if (elPastDueTotal) elPastDueTotal.textContent = `$${(totals.past_due_total || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
+
+      const elPastDueRent = document.getElementById("rpt72-past-due-rent");
+      if (elPastDueRent) elPastDueRent.textContent = `$${(totals.past_due_rent || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
+
+      const elTotalBalance = document.getElementById("rpt72-total-balance");
+      if (elTotalBalance) elTotalBalance.textContent = `$${(totals.total_balance_due || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
+
+      const elSyncStatus = document.getElementById("rpt72-sync-status");
+      if (elSyncStatus) {
+        elSyncStatus.innerHTML = `✓ ${records.length} Authoritative Records Verified (${new Date().toLocaleTimeString()})`;
+      }
+
+      if (!tbody) return;
+      if (records.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;padding:24px;color:#94a3b8;">No overdue records in Report #72.</td></tr>`;
+        return;
+      }
+
+      tbody.innerHTML = records.map((r, idx) => {
+        const isEligible = r.is_eligible;
+        const eligBadge = isEligible
+          ? `<span class="badge" style="background:#10b98122;color:#10b981;border:1px solid #10b98155;padding:3px 8px;border-radius:12px;font-size:11px;font-weight:600;">Eligible for Reminder</span>`
+          : `<span class="badge" style="background:#64748b22;color:#94a3b8;border:1px solid #64748b55;padding:3px 8px;border-radius:12px;font-size:11px;">Paid ($0.00 Balance)</span>`;
+
+        const phoneDisplay = r.phone ? `<a href="tel:${r.phone}" style="color:#38bdf8;text-decoration:none;">${r.phone}</a>` : `<span style="color:#64748b;">No Phone</span>`;
+        const emailDisplay = r.email ? `<span style="font-size:11px;color:#94a3b8;display:block;">${r.email}</span>` : "";
+
+        return `
+          <tr style="${isEligible ? 'background:rgba(245,158,11,0.03);' : ''}">
+            <td style="color:#64748b;font-size:12px;">${idx + 1}</td>
+            <td><span style="font-family:'JetBrains Mono',monospace;color:#38bdf8;font-size:12px;">#${r.lease_id}</span></td>
+            <td>
+              <div style="font-weight:600;color:#f8fafc;">${r.tenant_name}</div>
+              <div style="font-size:12px;">${phoneDisplay}</div>
+              ${emailDisplay}
+            </td>
+            <td>
+              <div style="font-weight:500;color:#cbd5e1;font-size:12px;">${r.property_name || 'N/A'}</div>
+              <div style="font-size:11px;color:#94a3b8;">${r.unit_name || r.unit_address || ''}</div>
+            </td>
+            <td style="font-family:'JetBrains Mono',monospace;font-size:13px;color:#cbd5e1;">$${r.monthly_rent.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</td>
+            <td style="font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:700;color:${r.past_due_rent > 0 ? '#f43f5e' : '#94a3b8'};">
+              $${r.past_due_rent.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}
+            </td>
+            <td style="font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:700;color:${r.past_due_total > 0 ? '#f59e0b' : '#94a3b8'};">
+              $${r.past_due_total.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}
+            </td>
+            <td style="font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:700;color:#f8fafc;">
+              $${r.total_balance.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}
+            </td>
+            <td>
+              <span class="badge" style="background:#0284c722;color:#38bdf8;padding:2px 8px;border-radius:10px;font-size:11px;">${r.lease_status}</span>
+            </td>
+            <td>
+              ${eligBadge}
+              <div style="font-size:10px;color:#64748b;margin-top:2px;">${r.eligibility_reason}</div>
+            </td>
+          </tr>
+        `;
+      }).join("");
+
+    } catch (err) {
+      console.error("Error loading RentVine report #72:", err);
+      if (tbody) {
+        tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;padding:24px;color:#f43f5e;">Error loading Report #72: ${err.message}</td></tr>`;
+      }
+    }
+  }
+
   /* ─── LIVE RENTVINE PAGINATED DATA LOADER ─── */
 
   async loadRentVineOverview() {
@@ -898,6 +1008,11 @@ class AppController {
             </span>
           </td>
           <td>
+            <div style="margin-bottom:6px;">
+              <span class="badge" style="background:rgba(2,132,199,0.18);color:#38bdf8;border:1px solid rgba(56,189,248,0.4);font-size:11px;padding:3px 8px;border-radius:6px;font-weight:700;">
+                From: ${r.sender_phone || '(980) 300-7559'} (${r.sender_inbox || 'Tenants & Vendors'})
+              </span>
+            </div>
             <div style="background:#0f172a;border:1px solid #1e293b;border-radius:8px;padding:8px 12px;font-size:12px;color:#cbd5e1;line-height:1.4;max-width:440px;">
               💬 <em>${r.sms_preview}</em>
             </div>
@@ -910,14 +1025,51 @@ class AppController {
     }).join("");
   }
 
-  async loadQuoData() {
+  async selectQuoLine(lineKey) {
+    this._selectedQuoLine = lineKey;
+    const btnTenants = document.getElementById("quo-line-btn-tenants");
+    const btnLandlords = document.getElementById("quo-line-btn-landlords");
+    const btnPrimary = document.getElementById("quo-line-btn-primary");
+    const activeBadge = document.getElementById("quo-active-line-badge");
+    const kpiTitle = document.getElementById("quo-line-kpi-title");
+    const phoneDisplay = document.getElementById("quo-phone-display");
+    const phoneSubtext = document.getElementById("quo-phone-subtext");
+
+    const activeStyle = "background:linear-gradient(135deg,#0284c7,#0369a1);color:#fff;border:1px solid #38bdf8;box-shadow:0 2px 8px rgba(2,132,199,0.35);";
+    const inactiveStyle = "background:#0f172a;color:#cbd5e1;border:1px solid #334155;box-shadow:none;";
+
+    if (btnTenants) btnTenants.style.cssText = `border-radius:20px;padding:6px 14px;font-size:12px;cursor:pointer;display:flex;align-items:center;gap:6px;${lineKey === 'tenants' ? activeStyle + 'font-weight:700;' : inactiveStyle + 'font-weight:600;'}`;
+    if (btnLandlords) btnLandlords.style.cssText = `border-radius:20px;padding:6px 14px;font-size:12px;cursor:pointer;display:flex;align-items:center;gap:6px;${lineKey === 'landlords' ? activeStyle + 'font-weight:700;' : inactiveStyle + 'font-weight:600;'}`;
+    if (btnPrimary) btnPrimary.style.cssText = `border-radius:20px;padding:6px 14px;font-size:12px;cursor:pointer;display:flex;align-items:center;gap:6px;${lineKey === 'primary' ? activeStyle + 'font-weight:700;' : inactiveStyle + 'font-weight:600;'}`;
+
+    if (lineKey === "tenants") {
+      if (activeBadge) activeBadge.innerHTML = `Active Sender Line: <strong>(980) 300-7559</strong> (Tenants & Vendors)`;
+      if (kpiTitle) kpiTitle.textContent = "TENANTS & VENDORS SENDER";
+      if (phoneDisplay) phoneDisplay.textContent = "(980) 300-7559";
+      if (phoneSubtext) phoneSubtext.textContent = "OpenPhone ID: PNnMjdTFVO • Rent Reminders & Follow-ups";
+    } else if (lineKey === "landlords") {
+      if (activeBadge) activeBadge.innerHTML = `Viewing Inbox: <strong>(980) 300-1196</strong> (Landlords)`;
+      if (kpiTitle) kpiTitle.textContent = "LANDLORDS LINE";
+      if (phoneDisplay) phoneDisplay.textContent = "(980) 300-1196";
+      if (phoneSubtext) phoneSubtext.textContent = "OpenPhone ID: PNTDARdwBh • Landlord Communications";
+    } else {
+      if (activeBadge) activeBadge.innerHTML = `Viewing Inbox: <strong>(667) 281-3879</strong> (Primary — Isolated)`;
+      if (kpiTitle) kpiTitle.textContent = "PRIMARY LINE (ISOLATED)";
+      if (phoneDisplay) phoneDisplay.textContent = "(667) 281-3879";
+      if (phoneSubtext) phoneSubtext.textContent = "OpenPhone ID: PNz3t43PKv • General Inbox (Not used for reminders)";
+    }
+
+    await this.loadQuoData(lineKey);
+  }
+
+  async loadQuoData(lineKey = this._selectedQuoLine || "tenants") {
     const btn = document.getElementById("btn-refresh-quo");
     if (btn) btn.innerHTML = `<span>⏳ Loading...</span>`;
 
     try {
       this._initQuoControls();
 
-      const res = await fetch("/api/quo-live");
+      const res = await fetch(`/api/quo-live?line=${encodeURIComponent(lineKey)}`);
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Failed to load Quo data");
 
@@ -935,10 +1087,21 @@ class AppController {
 
       // Update phone display with live OpenPhone data
       const phoneDisplay = document.getElementById("quo-phone-display");
-      if (phoneDisplay && data.channel) {
-        const convCount = data.channel.openphone_conversations || 0;
-        phoneDisplay.innerHTML = `${data.channel.phone_number || '+1 (667) 281-3879'}
-          ${convCount > 0 ? `<span style="font-size:12px;color:#10b981;display:block;margin-top:4px;">📡 ${convCount} live conversations fetched</span>` : ''}`;
+      const kpiTitle = document.getElementById("quo-line-kpi-title");
+      const phoneSubtext = document.getElementById("quo-phone-subtext");
+      if (data.channel) {
+        if (kpiTitle) {
+          kpiTitle.textContent = lineKey === 'landlords' ? 'LANDLORDS LINE' : (lineKey === 'primary' ? 'PRIMARY LINE (ISOLATED)' : 'TENANTS & VENDORS SENDER');
+        }
+        if (phoneDisplay) {
+          const convCount = data.channel.openphone_conversations || 0;
+          const displayNum = data.channel.phone_number || (lineKey === 'landlords' ? '(980) 300-1196' : (lineKey === 'primary' ? '(667) 281-3879' : '(980) 300-7559'));
+          phoneDisplay.innerHTML = `${displayNum}
+            ${convCount > 0 ? `<span style="font-size:12px;color:#10b981;display:block;margin-top:4px;">📡 ${convCount} live conversations fetched</span>` : ''}`;
+        }
+        if (phoneSubtext && data.channel.phone_number_id) {
+          phoneSubtext.textContent = `OpenPhone ID: ${data.channel.phone_number_id} • ${data.channel.purpose || ''}`;
+        }
       }
 
       // Render HITL reminders table
@@ -955,10 +1118,10 @@ class AppController {
             const isInbound = m.direction === "INBOUND";
             const isSent = m.status && m.status.includes("SENT");
             const dirBadge = isInbound
-              ? `<span class="badge" style="background:#065f46;color:#6ee7b7;padding:3px 8px;border-radius:12px;font-size:11px;">📥 INBOUND (Tenant)</span>`
+              ? `<span class="badge" style="background:#065f46;color:#6ee7b7;padding:3px 8px;border-radius:12px;font-size:11px;">📥 INBOUND (${m.inbox || 'Tenant'})</span>`
               : isSent
-                ? `<span class="badge" style="background:#1e3a5f;color:#38bdf8;padding:3px 8px;border-radius:12px;font-size:11px;">📤 SENT (HITL Approved)</span>`
-                : `<span class="badge" style="background:#1e293b;color:#94a3b8;padding:3px 8px;border-radius:12px;font-size:11px;">📋 LOGGED (Suppressed)</span>`;
+                ? `<span class="badge" style="background:#1e3a5f;color:#38bdf8;padding:3px 8px;border-radius:12px;font-size:11px;">📤 SENT (From ${m.sender || '(980) 300-7559'})</span>`
+                : `<span class="badge" style="background:#1e293b;color:#94a3b8;padding:3px 8px;border-radius:12px;font-size:11px;">📋 LOGGED (${m.sender || 'Suppressed'})</span>`;
             const dateStr = m.timestamp ? new Date(m.timestamp).toLocaleString() : '-';
             return `
               <tr>
@@ -1007,7 +1170,7 @@ class AppController {
       sendBtn.style.color = "#94a3b8";
     }
     if (statusSpan) {
-      statusSpan.textContent = "📡 Dispatching via Quo...";
+      statusSpan.textContent = "📡 Dispatching via Quo (Tenants line (980) 300-7559)...";
       statusSpan.style.background = "rgba(56,189,248,0.1)";
       statusSpan.style.color = "#38bdf8";
     }
@@ -1020,6 +1183,8 @@ class AppController {
           tenant_id: tenantId, 
           phone: item.phone, 
           text: item.sms_preview, 
+          recipient_type: "tenant",
+          sender_phone_id: item.sender_phone_id || "PNnMjdTFVO",
           hitl_approved: true 
         })
       });

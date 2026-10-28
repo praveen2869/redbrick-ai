@@ -47,7 +47,8 @@ class WorkflowOrchestrator:
         self,
         is_dry_run: bool = False,
         reference_time: Optional[datetime] = None,
-        force_failure_tenant_id: Optional[str] = None
+        force_failure_tenant_id: Optional[str] = None,
+        use_report_source_of_truth: Optional[bool] = None
     ) -> DailyRunSummary:
         """
         Executes the daily automated rent reminder workflow across the entire tenant portfolio.
@@ -63,6 +64,29 @@ class WorkflowOrchestrator:
 
         # Step 1: Wait for any ongoing background sync to complete
         sync_manager.wait_for_sync(timeout=60.0)
+
+        # Authoritative Source of Truth: RentVine Report #72 (Rent Rem Praveen)
+        # In live mode or when explicitly requested, Report #72 is the strict source of truth
+        should_use_report = (not self.rentvine.mock_mode) if use_report_source_of_truth is None else use_report_source_of_truth
+        report_data = None
+        report_lookup: Dict[str, Dict[str, Any]] = {}
+
+        if should_use_report:
+            try:
+                report_data = self.rentvine.fetch_lease_balance_report(report_id=72)
+                # Sync report to DB to guarantee perfect alignment
+                self.rentvine.sync_report_to_database(report_id=72)
+                for rec in report_data.get("records", []):
+                    clean_p = "".join([c for c in (rec.get("phone") or "") if c.isdigit()])
+                    if clean_p:
+                        report_lookup[clean_p[-10:]] = rec
+                    if rec.get("lease_id"):
+                        report_lookup[str(rec.get("lease_id"))] = rec
+                    if rec.get("tenant_name"):
+                        report_lookup[rec.get("tenant_name").strip().lower()] = rec
+                logger.info(f"Loaded Report #72 with {len(report_data.get('records', []))} authoritative overdue records.")
+            except Exception as e:
+                logger.warning(f"Could not fetch Report #72 as source of truth: {e}")
 
         # Pull active lease tenants
         tenants: List[Tenant] = db.get_active_tenants()
@@ -99,7 +123,8 @@ class WorkflowOrchestrator:
                     run_id=run_id,
                     is_dry_run=is_dry_run,
                     current_time=current_time,
-                    force_failure=(tenant.id == force_failure_tenant_id)
+                    force_failure=(tenant.id == force_failure_tenant_id),
+                    report_lookup=report_lookup
                 )
                 decisions.append(decision)
 
@@ -157,15 +182,63 @@ class WorkflowOrchestrator:
         run_id: str,
         is_dry_run: bool,
         current_time: datetime,
-        force_failure: bool = False
+        force_failure: bool = False,
+        report_lookup: Optional[Dict[str, Dict[str, Any]]] = None
     ) -> WorkflowDecision:
         """
         Evaluates a single tenant against deterministic rules and AI NLU signals.
+        Validates directly against RentVine Report #72 as the single source of truth.
         """
         # Step 2a: Pull RentVine data via MCP
         rv_record = self.rentvine.get_tenant_record(tenant.id)
         balance = rv_record.balance if rv_record else 0.0
         prop_unit = f"{tenant.property_name} {tenant.unit_number}"
+
+        # ─── Report #72 Source of Truth Validation ───
+        if report_lookup:
+            report_rec = None
+            clean_phone = "".join([c for c in (tenant.phone or "") if c.isdigit()])
+            if clean_phone and clean_phone[-10:] in report_lookup:
+                report_rec = report_lookup[clean_phone[-10:]]
+            elif tenant.id.startswith("rv_lease_") and tenant.id.replace("rv_lease_", "") in report_lookup:
+                report_rec = report_lookup[tenant.id.replace("rv_lease_", "")]
+            elif tenant.full_name.strip().lower() in report_lookup:
+                report_rec = report_lookup[tenant.full_name.strip().lower()]
+
+            if not report_rec:
+                # Strictly excluded: Tenant is not listed in Report #72
+                decision = WorkflowDecision(
+                    tenant_id=tenant.id,
+                    tenant_name=tenant.full_name,
+                    property_unit=prop_unit,
+                    balance=0.0,
+                    outcome=DecisionOutcome.SKIP_PAID,
+                    reason="Tenant not in RentVine Report #72 (Rent Rem Praveen) — balance paid/cleared or lease inactive",
+                    details={"step": "report_72_validation", "status": "Excluded by Report 72"},
+                    run_id=run_id
+                )
+                db.save_decision(decision)
+                return decision
+
+            # Validate criteria from Report #72
+            past_due_rent = report_rec.get("past_due_rent", 0.0)
+            past_due_total = report_rec.get("past_due_total", 0.0)
+            total_balance = report_rec.get("total_balance", balance)
+            balance = total_balance
+
+            if past_due_total <= 0:
+                decision = WorkflowDecision(
+                    tenant_id=tenant.id,
+                    tenant_name=tenant.full_name,
+                    property_unit=prop_unit,
+                    balance=balance,
+                    outcome=DecisionOutcome.SKIP_PAID,
+                    reason="Report #72: Total past due is $0.00 — tenant has no overdue balance",
+                    details={"step": "report_72_criteria", "past_due_total": past_due_total},
+                    run_id=run_id
+                )
+                db.save_decision(decision)
+                return decision
 
         # Rule 1: Paid Check
         is_paid, paid_reason = self.rules.check_paid_status(rv_record)
@@ -339,16 +412,16 @@ class WorkflowOrchestrator:
             db.save_decision(decision)
             return decision
 
-        # Guard: If balance is below minimum threshold ($20.00), do not dispatch rent reminder
-        if balance < 20.0:
+        # Guard: If balance is zero or negative, do not dispatch rent reminder
+        if balance <= 0.0:
             decision = WorkflowDecision(
                 tenant_id=tenant.id,
                 tenant_name=tenant.full_name,
                 property_unit=prop_unit,
                 balance=balance,
                 outcome=DecisionOutcome.SKIP_PAID,
-                reason=f"Balance ${balance:,.2f} is below minimum overdue threshold ($20.00) — suppressed to prevent misleading reminder",
-                details={"step": "minimum_threshold_guard"},
+                reason="Balance is $0.00 — tenant has no outstanding balance",
+                details={"step": "zero_balance_guard"},
                 run_id=run_id
             )
             db.save_decision(decision)
@@ -374,6 +447,7 @@ class WorkflowOrchestrator:
                     tenant_id=tenant.id,
                     to_number=tenant.phone,
                     text=sms_text,
+                    recipient_type="tenant",
                     force_failure=force_failure
                 )
                 # Cooldown feature is ONLY active once the reminder has actually been sent to carrier
@@ -386,6 +460,7 @@ class WorkflowOrchestrator:
                     # Log confirmation note to RentVine only when actually dispatched
                     rv_note_text = (
                         f"[AUTOMATED RENT REMINDER SENT] Quo SMS delivered to {tenant.phone} "
+                        f"from {settings.QUO_PHONE_TENANTS_FORMATTED} (Tenants & Vendors) "
                         f"for ${balance:,.2f} due on {rv_record.due_date if rv_record else 'N/A'}."
                     )
                     self.rentvine.write_tenant_note(tenant.id, rv_note_text, author="AI Rent Reminder Agent")
@@ -395,7 +470,7 @@ class WorkflowOrchestrator:
                 # Add to retry queue for automatic retry
                 db.add_retry_queue_item(
                     tenant_id=tenant.id,
-                    payload={"to_number": tenant.phone, "text": sms_text},
+                    payload={"to_number": tenant.phone, "text": sms_text, "recipient_type": "tenant"},
                     error=str(e)
                 )
                 logger.error(f"Failed to dispatch SMS to {tenant.phone}: {e}. Queued for retry.")
@@ -410,6 +485,9 @@ class WorkflowOrchestrator:
             details={
                 "sms_text": sms_text,
                 "phone": tenant.phone,
+                "sender_phone": settings.QUO_PHONE_TENANTS_FORMATTED,
+                "sender_inbox": "Tenants & Vendors",
+                "sender_phone_id": settings.QUO_PHONE_TENANTS_ID,
                 "is_dry_run": is_dry_run,
                 "force_failed": force_failure,
                 "reminder_status": "REMINDER_NEEDED (SEND_SKIPPED)"

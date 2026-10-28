@@ -95,7 +95,9 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
         elif path == "/api/rentvine-tenants":
             return self._handle_get_rentvine_tenants(query)
         elif path == "/api/quo-live":
-            return self._handle_get_quo_live()
+            return self._handle_get_quo_live(query)
+        elif path == "/api/rentvine-report":
+            return self._handle_get_rentvine_report(query)
 
         # Serve static web frontend
         self._serve_static_file(path)
@@ -175,6 +177,13 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                     "has_openai_key": bool(settings.OPENAI_API_KEY),
                     "active_engine": "OpenAI " + settings.AI_MODEL if settings.OPENAI_API_KEY else "Built-in Semantic NLU Engine"
                 }
+            },
+            "report_source_of_truth": {
+                "report_id": "72",
+                "report_name": "Rent Rem Praveen",
+                "title": "Lease Balances",
+                "url": "https://redbricksproperties.rentvine.com/reports/lease-balances?reportID=72",
+                "status": "AUTHORITATIVE_SOURCE_OF_TRUTH"
             },
             "latest_run": latest_run
         }
@@ -370,6 +379,12 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
             "quo_api_url": settings.QUO_API_URL,
             "quo_mock_mode": settings.QUO_MOCK_MODE,
             "quo_has_key": not settings.QUO_MOCK_MODE,
+            "quo_phone_tenants_id": settings.QUO_PHONE_TENANTS_ID,
+            "quo_phone_tenants_number": settings.QUO_PHONE_TENANTS_FORMATTED,
+            "quo_phone_landlords_id": settings.QUO_PHONE_LANDLORDS_ID,
+            "quo_phone_landlords_number": settings.QUO_PHONE_LANDLORDS_FORMATTED,
+            "quo_phone_primary_id": settings.QUO_PHONE_PRIMARY_ID,
+            "quo_phone_primary_number": settings.QUO_PHONE_PRIMARY_FORMATTED,
             "ai_model": settings.AI_MODEL,
             "has_openai_key": bool(settings.OPENAI_API_KEY)
         }
@@ -390,9 +405,37 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
         })
 
     def _test_quo_connection(self) -> Dict[str, Any]:
-        """Pings Quo API's /phone-numbers endpoint to verify the key."""
+        """Pings Quo API's /phone-numbers endpoint to verify the key and reports configured sender lines."""
+        configured_lines = {
+            "tenants": {
+                "id": settings.QUO_PHONE_TENANTS_ID,
+                "number": settings.QUO_PHONE_TENANTS_FORMATTED,
+                "e164": settings.QUO_PHONE_TENANTS_E164,
+                "inbox": "Tenants & Vendors",
+                "purpose": "Tenant rent reminders & payment follow-ups"
+            },
+            "landlords": {
+                "id": settings.QUO_PHONE_LANDLORDS_ID,
+                "number": settings.QUO_PHONE_LANDLORDS_FORMATTED,
+                "e164": settings.QUO_PHONE_LANDLORDS_E164,
+                "inbox": "Landlords",
+                "purpose": "Landlord communications & updates"
+            },
+            "primary": {
+                "id": settings.QUO_PHONE_PRIMARY_ID,
+                "number": settings.QUO_PHONE_PRIMARY_FORMATTED,
+                "e164": settings.QUO_PHONE_PRIMARY_E164,
+                "inbox": "Primary",
+                "purpose": "General inbox (isolated from rent reminders)"
+            }
+        }
         if settings.QUO_MOCK_MODE:
-            return {"status": "simulation", "mode": "mock", "endpoint": settings.QUO_API_URL}
+            return {
+                "status": "simulation",
+                "mode": "mock",
+                "endpoint": settings.QUO_API_URL,
+                "configured_lines": configured_lines
+            }
         import urllib.request as _ur, urllib.error as _ue
         auth_header = settings.QUO_API_KEY if settings.QUO_API_KEY.startswith("Bearer ") else f"Bearer {settings.QUO_API_KEY}"
         try:
@@ -410,6 +453,7 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                 return {
                     "status": "connected",
                     "endpoint": settings.QUO_API_URL,
+                    "configured_lines": configured_lines,
                     "phone_numbers": [
                         {"id": p.get("id"), "number": p.get("phoneNumber"), "name": p.get("name")}
                         for p in (phones if isinstance(phones, list) else [])
@@ -417,7 +461,7 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                 }
         except _ue.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
-            return {"status": "error", "http_code": e.code, "detail": body}
+            return {"status": "error", "http_code": e.code, "detail": body, "configured_lines": configured_lines}
         except Exception as e:
             return {"status": "error", "detail": str(e)}
 
@@ -614,26 +658,60 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._send_json({"mode": "live", "error": str(e)}, 500)
 
-    def _handle_get_quo_live(self):
+    def _handle_get_rentvine_report(self, query: Optional[Dict[str, list]] = None):
+        """Returns the authoritative Lease Balances Report #72 data directly from RentVine."""
+        report_id = 72
+        if query and "report_id" in query:
+            try:
+                report_id = int(query["report_id"][0])
+            except Exception:
+                pass
+
+        rv_client = RentVineMCPClient()
+        try:
+            data = rv_client.fetch_lease_balance_report(report_id=report_id)
+            self._send_json({"success": True, "report": data})
+        except Exception as e:
+            logger.error(f"Error fetching RentVine report #{report_id}: {e}")
+            self._send_json({"success": False, "error": str(e)}, 500)
+
+    def _handle_get_quo_live(self, query: Optional[Dict[str, list]] = None):
         """
         Live Quo (OpenPhone) feed handler.
-        - Fetches real conversations + messages from OpenPhone REST API
-        - Builds reminders queue from real workflow decisions (NO dummy data)
+        - Supports line selection via ?line=tenants (default), ?line=landlords, ?line=primary
+        - Fetches real conversations + messages from OpenPhone REST API for the selected line
+        - Builds reminders queue from real workflow decisions strictly mapped to Tenants & Vendors (980) 300-7559
         - Merges HITL-approved sends from local DB
         """
+        selected_line = "tenants"
+        if query and "line" in query and query["line"]:
+            param = str(query["line"][0]).lower().strip()
+            if param in ("landlord", "landlords", "owner"):
+                selected_line = "landlords"
+            elif param in ("primary", "general"):
+                selected_line = "primary"
+            else:
+                selected_line = "tenants"
+
         now_ts = datetime.utcnow().timestamp()
-        if "quo_live" in _API_CACHE:
-            cached_time, cached_val = _API_CACHE["quo_live"]
+        cache_key = f"quo_live_{selected_line}"
+        if cache_key in _API_CACHE:
+            cached_time, cached_val = _API_CACHE[cache_key]
             if now_ts - cached_time < 20:
                 return self._send_json(cached_val)
 
-        phone_id = settings.QUO_DEFAULT_PHONE_NUMBER_ID
-        phone_number = "+1 (667) 281-3879"
+        # Resolve phone line identity based on selection
+        phone_id, phone_e164, phone_number, inbox_name = settings.get_quo_sender(selected_line)
+        line_purpose = (
+            "Tenant rent reminders & payment follow-ups" if selected_line == "tenants"
+            else ("Landlord communications & updates" if selected_line == "landlords"
+                  else "General inbox (isolated)")
+        )
 
         all_tenants = db.get_all_tenants()
         tenant_map = {t.id: t for t in all_tenants}
 
-        # ─── 1. Fetch real OpenPhone conversations + messages ───
+        # ─── 1. Fetch real OpenPhone conversations + messages for this line ───
         openphone_conversations = []
         openphone_messages = []
         quo_probe = self._test_quo_connection()
@@ -647,7 +725,7 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                 "User-Agent": "RedBricks-Dashboard/1.0"
             }
 
-            # Fetch conversations for our phone number
+            # Fetch conversations for the selected phone number ID
             try:
                 req = _ur.Request(
                     f"{settings.QUO_API_URL}/conversations?phoneNumberId={phone_id}&maxResults=50",
@@ -656,9 +734,9 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                 with _ur.urlopen(req, timeout=10) as resp:
                     conv_data = json.loads(resp.read().decode("utf-8"))
                     openphone_conversations = conv_data.get("data", []) or []
-                    logger.info(f"[Quo] Fetched {len(openphone_conversations)} live conversations")
+                    logger.info(f"[Quo - {inbox_name}] Fetched {len(openphone_conversations)} live conversations for {phone_number}")
             except Exception as e:
-                logger.warning(f"[Quo] Failed to fetch conversations: {e}")
+                logger.warning(f"[Quo - {inbox_name}] Failed to fetch conversations for {phone_id}: {e}")
 
             # For recent conversations, fetch messages (scans up to 15 to include recent threads like Kukunoor)
             for conv in openphone_conversations[:15]:
@@ -708,7 +786,9 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                                 "phone": phone_str,
                                 "tenant_id": "",
                                 "property_unit": prop_unit,
-                                "source": "openphone_live"
+                                "source": "openphone_live",
+                                "line": selected_line,
+                                "inbox": inbox_name
                             })
                 except _ue.HTTPError as he:
                     logger.warning(f"[Quo] HTTP {he.code} fetching messages for {phone_str}: {he}")
@@ -719,6 +799,7 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                     logger.warning(f"[Quo] Failed to fetch messages for {phone_str}: {e}")
 
         # ─── 2. Build reminders queue from REAL workflow decisions only ───
+        # Note: Rent reminders are strictly associated with Tenants & Vendors line ((980) 300-7559)
         latest_decisions = db.get_latest_decisions(limit=2000)
         reminders_needed = []
         seen_tenants = set()
@@ -745,11 +826,11 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
             if not t:
                 continue  # skip orphaned decision records
 
-            # Safety check: ensure current balance is genuine overdue rent (>= $20.00)
+            # Safety check: ensure current balance is outstanding (> $0.00)
             rv = db.get_rentvine_record(d.tenant_id)
             effective_balance = float(rv.balance) if rv else float(d.balance or 0)
-            if effective_balance < 20.0:
-                continue  # Never display or queue misleading reminders for $0 or minor fees
+            if effective_balance <= 0.0:
+                continue  # Never display or queue reminders for $0 balance
 
             # Only include tenants with a real phone number
             if not t.phone or t.phone.startswith("+1-415-555"):
@@ -784,6 +865,10 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                 "balance": float(d.balance or 0),
                 "status": "AWAITING_HITL_APPROVAL",
                 "sms_preview": sms_text,
+                "sender_phone": settings.QUO_PHONE_TENANTS_FORMATTED,
+                "sender_inbox": "Tenants & Vendors",
+                "sender_phone_id": settings.QUO_PHONE_TENANTS_ID,
+                "recipient_type": "tenant",
                 "reason": d.reason,
                 "timestamp": d.timestamp
             })
@@ -829,19 +914,52 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
         inbound_count = len([m for m in deduped if m.get("direction") == "INBOUND"])
         hitl_sent = len([m for m in local_sms if "HITL_APPROVED" in (m.get("status") or "") or "SENT_HITL" in (m.get("status") or "")])
 
+        available_lines = [
+            {
+                "key": "tenants",
+                "name": "Tenants & Vendors",
+                "number": settings.QUO_PHONE_TENANTS_FORMATTED,
+                "id": settings.QUO_PHONE_TENANTS_ID,
+                "purpose": "Tenant rent reminders & payment follow-ups",
+                "is_active_for_rent_reminders": True,
+                "is_current": selected_line == "tenants"
+            },
+            {
+                "key": "landlords",
+                "name": "Landlords",
+                "number": settings.QUO_PHONE_LANDLORDS_FORMATTED,
+                "id": settings.QUO_PHONE_LANDLORDS_ID,
+                "purpose": "Landlord communications & updates",
+                "is_active_for_rent_reminders": False,
+                "is_current": selected_line == "landlords"
+            },
+            {
+                "key": "primary",
+                "name": "Primary",
+                "number": settings.QUO_PHONE_PRIMARY_FORMATTED,
+                "id": settings.QUO_PHONE_PRIMARY_ID,
+                "purpose": "General inbox (isolated from rent reminders)",
+                "is_active_for_rent_reminders": False,
+                "is_current": selected_line == "primary"
+            }
+        ]
 
         resp_data = {
             "mode": "hitl_testing",
             "hitl_status": "LOCKED — Explicit HITL approval required per reminder",
+            "selected_line": selected_line,
             "channel": {
-                "name": "Quo (OpenPhone) SMS",
+                "name": f"Quo (OpenPhone) SMS — {inbox_name}",
+                "inbox_name": inbox_name,
                 "phone_number": phone_number,
                 "phone_number_id": phone_id,
+                "purpose": line_purpose,
                 "api_endpoint": settings.QUO_API_URL,
                 "live_status": quo_probe.get("status", "simulation"),
                 "openphone_conversations": len(openphone_conversations),
                 "openphone_messages_fetched": len(openphone_messages)
             },
+            "available_lines": available_lines,
             "counts": {
                 "reminders_needed": len(reminders_needed),
                 "sms_messages": len(deduped),
@@ -852,7 +970,7 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
             "messages": deduped,
             "probe": quo_probe
         }
-        _API_CACHE["quo_live"] = (now_ts, resp_data)
+        _API_CACHE[cache_key] = (now_ts, resp_data)
         self._send_json(resp_data)
 
 
@@ -977,6 +1095,7 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
     def _handle_post_send_sms(self, body: Dict[str, Any]):
         tenant_id = body.get("tenant_id")
         text = body.get("text")
+        recipient_type = body.get("recipient_type", "tenant")
         if not tenant_id or not text:
             return self._send_json({"error": "tenant_id and text required"}, 400)
 
@@ -987,19 +1106,22 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
         t = matched[0]
 
         client = QuoSMSClient()
-        res = client.send_sms(tenant_id, t.phone, text)
+        res = client.send_sms(tenant_id, t.phone, text, recipient_type=recipient_type)
         self._send_json(res)
 
     def _handle_post_send_reminder(self, body: Dict[str, Any]):
         """
         HITL-approved SMS reminder dispatch.
         Only called when a property manager explicitly clicks 'Send Reminder' in the dashboard.
-        Dispatches to Quo (OpenPhone) API when live credentials are configured,
-        or records with HITL_APPROVED status in mock mode.
+        Dispatches to Quo (OpenPhone) API using the appropriate sender line:
+          - Tenants: (980) 300-7559 [PNnMjdTFVO] (Tenants & Vendors)
+          - Landlords: (980) 300-1196 [PNTDARdwBh] (Landlords)
         """
         tenant_id = body.get("tenant_id")
         phone = body.get("phone")
         text = body.get("text")
+        recipient_type = body.get("recipient_type", "tenant")
+        sender_phone_override = body.get("sender_phone_id")
         hitl_approved = bool(body.get("hitl_approved", False))
 
         if not tenant_id or not phone or not text:
@@ -1007,6 +1129,17 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
 
         if not hitl_approved:
             return self._send_json({"error": "HITL approval flag must be set to dispatch reminder"}, 403)
+
+        # Resolve sender phone number and inbox based on recipient type
+        if sender_phone_override:
+            if sender_phone_override == settings.QUO_PHONE_LANDLORDS_ID:
+                sender_id, sender_e164, sender_fmt, inbox_name = settings.get_quo_sender("landlord")
+            elif sender_phone_override == settings.QUO_PHONE_PRIMARY_ID:
+                sender_id, sender_e164, sender_fmt, inbox_name = settings.get_quo_sender("primary")
+            else:
+                sender_id, sender_e164, sender_fmt, inbox_name = settings.get_quo_sender("tenant")
+        else:
+            sender_id, sender_e164, sender_fmt, inbox_name = settings.get_quo_sender(recipient_type)
 
         try:
             msg_id = f"hitl_{int(__import__('datetime').datetime.utcnow().timestamp() * 1000)}"
@@ -1018,7 +1151,7 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                 auth = settings.QUO_API_KEY if settings.QUO_API_KEY.startswith("Bearer ") else f"Bearer {settings.QUO_API_KEY}"
                 payload = json.dumps({
                     "content": text,
-                    "from": settings.QUO_DEFAULT_PHONE_NUMBER_ID,
+                    "from": sender_id,
                     "to": [phone]
                 }).encode("utf-8")
                 req = _ur.Request(
@@ -1043,7 +1176,7 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                     tenant_id=tenant_id,
                     channel=Channel.SMS,
                     direction=MessageDirection.OUTBOUND,
-                    sender=settings.QUO_DEFAULT_PHONE_NUMBER_ID,
+                    sender=sender_fmt,
                     recipient=phone,
                     content=text,
                     timestamp=now_iso,
@@ -1051,13 +1184,17 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                     metadata={
                         "source": "Quo REST API",
                         "provider": "OpenPhone",
+                        "inbox": inbox_name,
+                        "sender_number": sender_fmt,
+                        "sender_phone_id": sender_id,
+                        "recipient_type": recipient_type,
                         "hitl_approved": True,
                         "sms_dispatched": True,
                         "ext_message_id": ext_id
                     }
                 )
                 _db.save_message(outbound)
-                logger.info(f"[HITL APPROVED] SMS sent to {phone} for tenant {tenant_id} via Quo. ext_id={ext_id}")
+                logger.info(f"[HITL APPROVED] SMS sent to {phone} from {sender_fmt} ({inbox_name}) for {tenant_id}. ext_id={ext_id}")
 
                 # Record successful reminder send so 24h cooldown activates now that it's sent
                 from src.models import WorkflowDecision, DecisionOutcome
@@ -1067,8 +1204,8 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                     property_unit="",
                     balance=0.0,
                     outcome=DecisionOutcome.SEND_REMINDER,
-                    reason=f"HITL Reminder SMS approved and sent to {phone}",
-                    details={"text": text, "phone": phone, "hitl_approved": True},
+                    reason=f"HITL Reminder SMS approved and sent to {phone} from {sender_fmt} ({inbox_name})",
+                    details={"text": text, "phone": phone, "sender_phone": sender_fmt, "inbox": inbox_name, "hitl_approved": True},
                     timestamp=now_iso,
                     sms_sent=True,
                     sms_message_id=ext_id,
@@ -1082,6 +1219,9 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                     "message_id": ext_id,
                     "timestamp": now_iso,
                     "recipient": phone,
+                    "sender": sender_fmt,
+                    "sender_phone_id": sender_id,
+                    "inbox": inbox_name,
                     "status": "SENT_HITL_APPROVED",
                     "ext_api_response": api_resp
                 })
@@ -1094,7 +1234,7 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                     tenant_id=tenant_id,
                     channel=Channel.SMS,
                     direction=MessageDirection.OUTBOUND,
-                    sender="+1 (667) 281-3879",
+                    sender=sender_fmt,
                     recipient=phone,
                     content=text,
                     timestamp=now_iso,
@@ -1102,14 +1242,18 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                     metadata={
                         "source": "Quo REST API",
                         "provider": "OpenPhone",
+                        "inbox": inbox_name,
+                        "sender_number": sender_fmt,
+                        "sender_phone_id": sender_id,
+                        "recipient_type": recipient_type,
                         "hitl_approved": True,
                         "sms_dispatched": False,
                         "mock_mode": True,
-                        "note": "HITL approved — SMS would be sent if QUO_MOCK_MODE=false"
+                        "note": f"HITL approved — SMS would be sent from {sender_fmt} ({inbox_name}) if QUO_MOCK_MODE=false"
                     }
                 )
                 _db.save_message(outbound)
-                logger.info(f"[HITL APPROVED - MOCK] SMS logged (not dispatched) for {phone} ({tenant_id})")
+                logger.info(f"[HITL APPROVED - MOCK] SMS logged for {phone} from {sender_fmt} ({inbox_name})")
 
                 # Record decision so cooldown activates for this tenant after manager triggers send
                 from src.models import WorkflowDecision, DecisionOutcome
@@ -1119,8 +1263,8 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                     property_unit="",
                     balance=0.0,
                     outcome=DecisionOutcome.SEND_REMINDER,
-                    reason=f"HITL Reminder approved and recorded for {phone}",
-                    details={"text": text, "phone": phone, "hitl_approved": True, "mock_mode": True},
+                    reason=f"HITL Reminder approved and recorded for {phone} from {sender_fmt} ({inbox_name})",
+                    details={"text": text, "phone": phone, "sender_phone": sender_fmt, "inbox": inbox_name, "hitl_approved": True, "mock_mode": True},
                     timestamp=now_iso,
                     sms_sent=True,
                     sms_message_id=msg_id,
@@ -1134,8 +1278,11 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                     "message_id": msg_id,
                     "timestamp": now_iso,
                     "recipient": phone,
+                    "sender": sender_fmt,
+                    "sender_phone_id": sender_id,
+                    "inbox": inbox_name,
                     "status": "HITL_APPROVED_LOGGED (MOCK)",
-                    "note": "HITL approval recorded. Cooldown activated."
+                    "note": f"Recorded with sender {sender_fmt} ({inbox_name})"
                 })
         except _ue.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")

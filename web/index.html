@@ -128,6 +128,10 @@
           <span class="tab-icon">📋</span> Tenant Decisions
           <span class="tab-badge" id="badge-total-tenants">100</span>
         </button>
+        <button class="nav-tab" data-tab="rentvine-report">
+          <span class="tab-icon">🎯</span> Report #72 (Source of Truth)
+          <span class="tab-badge" style="background:#f59e0b;color:#000;font-weight:700;">17 OVERDUE</span>
+        </button>
         <button class="nav-tab" data-tab="rentvine-live">
           <span class="tab-icon">🏢</span> RentVine Portfolio
           <span class="tab-badge" style="background:#10b981;color:#fff;">LIVE</span>
@@ -225,7 +229,7 @@
                   <div class="node-title">QUO (OPENPHONE)</div>
                 </div>
                 <div class="node-desc">SMS threads • Tenant replies • Outbound reminders</div>
-                <div class="node-meta-tag">+1 (667) 281-3879</div>
+                <div class="node-meta-tag">(980) 300-7559 • Tenants & Vendors</div>
               </div>
 
               <!-- Gmail -->
@@ -336,7 +340,7 @@
         <div class="terminal-body" id="workflow-console-output">
           <div class="log-line text-muted">[SYSTEM] Red Bricks AI Automation Engine initialized.</div>
           <div class="log-line text-info">[RENTVINE] Connected to redbricksproperties.rentvine.com — active portfolio loaded.</div>
-          <div class="log-line text-info">[QUO SMS] OpenPhone channel ready on +1 (667) 281-3879.</div>
+          <div class="log-line text-info">[QUO SMS] Tenants & Vendors channel ready on (980) 300-7559.</div>
           <div class="log-line text-success">[READY] Ready for automation. Click "Run Workflow" to execute or "Dry Run" to simulate.</div>
         </div>
       </section>
@@ -412,6 +416,122 @@
       </div>
     </main>
 
+    <!-- TAB: RENTVINE REPORT #72 (AUTHORITATIVE SOURCE OF TRUTH) -->
+    <main class="tab-content" id="tab-rentvine-report">
+      <div class="content-header" style="margin-bottom:20px;">
+        <div>
+          <div style="display:flex;align-items:center;gap:12px;margin-bottom:6px;">
+            <h1 class="page-title" style="margin:0;">RentVine Report #72: Lease Balances</h1>
+            <span class="badge" style="background:#f59e0b22;color:#f59e0b;border:1px solid #f59e0b55;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:700;">
+              AUTHORITATIVE SOURCE OF TRUTH
+            </span>
+          </div>
+          <p class="page-subtitle">
+            Saved Report: <strong>"Rent Rem Praveen"</strong> (Report ID: 72, Type: 28) • Only active tenants in this report are eligible for rent reminder notifications.
+          </p>
+        </div>
+        <div style="display:flex;gap:10px;">
+          <a href="https://redbricksproperties.rentvine.com/reports/lease-balances?reportID=72" target="_blank" class="btn btn-secondary" style="text-decoration:none;display:flex;align-items:center;gap:6px;">
+            <span>🔗 Open in RentVine</span>
+          </a>
+          <button id="btn-sync-report-72" class="btn btn-primary" style="display:flex;align-items:center;gap:6px;">
+            <span>🔄 Sync & Validate Now</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Criteria & Applied Filters Banner -->
+      <div style="background:rgba(30,41,59,0.7);border:1px solid #334155;border-radius:14px;padding:20px 24px;margin-bottom:24px;">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px;">
+          <div style="display:flex;align-items:center;gap:10px;">
+            <span style="font-size:20px;">🎯</span>
+            <span style="font-weight:700;font-size:15px;color:#f8fafc;">Applied Criteria & Filter Rules in Report #72</span>
+          </div>
+          <span style="font-size:12px;color:#94a3b8;">Strictly applied before drafting or dispatching reminders</span>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(220px, 1fr));gap:14px;" id="report-72-filters-container">
+          <div style="background:#0f172a;border:1px solid #1e293b;border-radius:10px;padding:12px 16px;">
+            <div style="font-size:11px;color:#64748b;text-transform:uppercase;font-weight:600;">1. Lease Status</div>
+            <div style="font-size:13px;font-weight:600;color:#38bdf8;margin-top:4px;">Not In: Pending, Closed, Closed - Moved Out</div>
+            <div style="font-size:11px;color:#94a3b8;margin-top:2px;">Strictly excludes inactive or pending leases</div>
+          </div>
+          <div style="background:#0f172a;border:1px solid #1e293b;border-radius:10px;padding:12px 16px;">
+            <div style="font-size:11px;color:#64748b;text-transform:uppercase;font-weight:600;">2. Unit Status</div>
+            <div style="font-size:13px;font-weight:600;color:#38bdf8;margin-top:4px;">Equals: Any</div>
+            <div style="font-size:11px;color:#94a3b8;margin-top:2px;">Includes all occupied units</div>
+          </div>
+          <div style="background:#0f172a;border:1px solid #1e293b;border-radius:10px;padding:12px 16px;">
+            <div style="font-size:11px;color:#64748b;text-transform:uppercase;font-weight:600;">3. As of Date</div>
+            <div style="font-size:13px;font-weight:600;color:#38bdf8;margin-top:4px;">Is Today (Current)</div>
+            <div style="font-size:11px;color:#94a3b8;margin-top:2px;">Real-time ledger state evaluation</div>
+          </div>
+          <div style="background:#0f172a;border:1px solid #1e293b;border-radius:10px;padding:12px 16px;">
+            <div style="font-size:11px;color:#64748b;text-transform:uppercase;font-weight:600;">4. Delinquency Threshold</div>
+            <div style="font-size:13px;font-weight:600;color:#f59e0b;margin-top:4px;">Total Past Due != $0.00</div>
+            <div style="font-size:11px;color:#94a3b8;margin-top:2px;">Zero-balance accounts excluded</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Report Totals Ribbon -->
+      <div class="kpi-ribbon" style="margin-bottom:24px;">
+        <div class="kpi-card">
+          <div class="kpi-header"><span class="kpi-title">REPORT RECORD COUNT</span><span class="kpi-icon">📋</span></div>
+          <div class="kpi-value highlight-cyan" id="rpt72-count">17</div>
+          <div class="kpi-subtext">Delinquent accounts in RentVine</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-header"><span class="kpi-title">TOTAL PAST DUE AMOUNT</span><span class="kpi-icon">💵</span></div>
+          <div class="kpi-value highlight-amber" id="rpt72-past-due-total">$30,023.22</div>
+          <div class="kpi-subtext">Combined ledger delinquency</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-header"><span class="kpi-title">PAST DUE RENT AMOUNT</span><span class="kpi-icon">🏠</span></div>
+          <div class="kpi-value highlight-emerald" id="rpt72-past-due-rent">$27,293.24</div>
+          <div class="kpi-subtext">Pure unpaid monthly rent</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-header"><span class="kpi-title">TOTAL BALANCE DUE</span><span class="kpi-icon">💳</span></div>
+          <div class="kpi-value" id="rpt72-total-balance">$30,115.26</div>
+          <div class="kpi-subtext">Rent + fees + utilities</div>
+        </div>
+      </div>
+
+      <!-- Table of All 17 Tenants from Report #72 -->
+      <div class="table-container" style="margin-bottom:28px;">
+        <div class="table-header" style="padding:16px 20px;border-bottom:1px solid #334155;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
+          <div>
+            <h3 style="margin:0;font-size:16px;color:#f8fafc;">📋 Active Overdue Tenants (Extracted from Report #72)</h3>
+            <p style="margin:4px 0 0;font-size:12px;color:#94a3b8;">
+              Live data extracted directly from RentVine. Shows exact contact info, property/unit, rent balances, and reminder eligibility.
+            </p>
+          </div>
+          <div style="font-size:12px;color:#38bdf8;font-weight:600;" id="rpt72-sync-status">
+            ✓ 17 Authoritative Records Loaded
+          </div>
+        </div>
+        <table class="data-table" id="report-72-table">
+          <thead>
+            <tr>
+              <th style="width:50px;">#</th>
+              <th>Lease ID</th>
+              <th>Tenant Name & Contact</th>
+              <th>Property / Unit</th>
+              <th>Monthly Rent</th>
+              <th>Past Due Rent</th>
+              <th>Total Past Due</th>
+              <th>Total Due</th>
+              <th>Lease Status</th>
+              <th>Reminder Eligibility</th>
+            </tr>
+          </thead>
+          <tbody id="report-72-tbody">
+            <tr><td colspan="10" style="text-align:center;padding:24px;color:#94a3b8;">Loading Report #72 data...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </main>
+
     <!-- TAB 3: SMS REMINDER CENTER (QUO / OPENPHONE) -->
     <main class="tab-content" id="tab-quo-live">
       <div class="content-header" style="margin-bottom:20px;">
@@ -443,12 +563,38 @@
         </div>
       </div>
 
+      <!-- Quo Inboxes Switcher Bar -->
+      <div style="background:#1e293b;border:1px solid #334155;border-radius:14px;padding:12px 18px;margin-bottom:20px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;">
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+          <span style="font-weight:700;font-size:12px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.5px;">Quo Inboxes:</span>
+          <div id="quo-inbox-pills" style="display:flex;gap:8px;flex-wrap:wrap;">
+            <button id="quo-line-btn-tenants" onclick="window.appCtrl.selectQuoLine('tenants')" 
+              style="background:linear-gradient(135deg,#0284c7,#0369a1);color:#fff;border:1px solid #38bdf8;border-radius:20px;padding:6px 14px;font-size:12px;font-weight:700;cursor:pointer;display:flex;align-items:center;gap:6px;box-shadow:0 2px 8px rgba(2,132,199,0.35);">
+              🏢 Tenants & Vendors <span style="background:rgba(255,255,255,0.22);padding:2px 7px;border-radius:10px;font-size:11px;">(980) 300-7559</span>
+              <span style="background:#10b981;color:#0f172a;padding:2px 6px;border-radius:8px;font-size:10px;font-weight:800;">RENT REMINDERS</span>
+            </button>
+            <button id="quo-line-btn-landlords" onclick="window.appCtrl.selectQuoLine('landlords')" 
+              style="background:#0f172a;color:#cbd5e1;border:1px solid #334155;border-radius:20px;padding:6px 14px;font-size:12px;font-weight:600;cursor:pointer;display:flex;align-items:center;gap:6px;">
+              🏠 Landlords <span style="background:rgba(255,255,255,0.08);padding:2px 7px;border-radius:10px;font-size:11px;">(980) 300-1196</span>
+            </button>
+            <button id="quo-line-btn-primary" onclick="window.appCtrl.selectQuoLine('primary')" 
+              style="background:#0f172a;color:#94a3b8;border:1px solid #334155;border-radius:20px;padding:6px 14px;font-size:12px;font-weight:600;cursor:pointer;display:flex;align-items:center;gap:6px;">
+              📞 Primary <span style="background:rgba(255,255,255,0.08);padding:2px 7px;border-radius:10px;font-size:11px;">(667) 281-3879</span>
+              <span style="color:#eab308;font-size:10px;">(Isolated)</span>
+            </button>
+          </div>
+        </div>
+        <div id="quo-active-line-badge" style="font-size:12px;color:#38bdf8;background:rgba(56,189,248,0.1);padding:4px 10px;border-radius:8px;border:1px solid rgba(56,189,248,0.3);">
+          Active Sender Line: <strong>(980) 300-7559</strong> (Tenants & Vendors)
+        </div>
+      </div>
+
       <!-- Quo Details Ribbon -->
       <div class="kpi-ribbon" style="margin-bottom: 24px;">
         <div class="kpi-card">
-          <div class="kpi-header"><span class="kpi-title">DEDICATED QUO NUMBER</span><span class="kpi-icon">📱</span></div>
-          <div class="kpi-value" id="quo-phone-display" style="font-size:20px;letter-spacing:0.5px;">+1 (667) 281-3879</div>
-          <div class="kpi-subtext">OpenPhone ID: PNz3t43PKv</div>
+          <div class="kpi-header"><span class="kpi-title" id="quo-line-kpi-title">TENANTS & VENDORS SENDER</span><span class="kpi-icon">📱</span></div>
+          <div class="kpi-value highlight-cyan" id="quo-phone-display" style="font-size:20px;letter-spacing:0.5px;">(980) 300-7559</div>
+          <div class="kpi-subtext" id="quo-phone-subtext">OpenPhone ID: PNnMjdTFVO • Rent Reminders & Follow-ups</div>
         </div>
 
         <div class="kpi-card">
@@ -871,16 +1017,24 @@
 
         <!-- Quo (OpenPhone) -->
         <div class="settings-card">
-          <div class="card-badge">Live Active</div>
-          <h3>💬 Quo (OpenPhone) SMS Channel</h3>
-          <p class="settings-desc">AI-powered business communication line for rent reminders and tenant replies.</p>
+          <div class="card-badge">Live Multi-Line</div>
+          <h3>💬 Quo (OpenPhone) SMS Channels</h3>
+          <p class="settings-desc">Dedicated business numbers routed by recipient type according to Quo messaging app configuration.</p>
           <div class="form-group">
             <label>API Endpoint:</label>
             <input type="text" class="form-control" value="https://api.openphone.com/v1" readonly>
           </div>
           <div class="form-group">
-            <label>Dedicated Phone Number ID:</label>
-            <input type="text" class="form-control" value="PNz3t43PKv (+1 667 281-3879)" readonly>
+            <label>1. Tenant Rent Reminders & Follow-ups (Tenants & Vendors inbox):</label>
+            <input type="text" class="form-control" value="(980) 300-7559 — OpenPhone ID: PNnMjdTFVO" readonly style="color:#38bdf8;font-weight:700;">
+          </div>
+          <div class="form-group">
+            <label>2. Landlord Communications & Updates (Landlords inbox):</label>
+            <input type="text" class="form-control" value="(980) 300-1196 — OpenPhone ID: PNTDARdwBh" readonly style="color:#10b981;font-weight:700;">
+          </div>
+          <div class="form-group">
+            <label>3. Primary Number (General inbox — isolated):</label>
+            <input type="text" class="form-control" value="(667) 281-3879 — OpenPhone ID: PNz3t43PKv (Isolated)" readonly style="color:#94a3b8;">
           </div>
           <div class="form-group">
             <label>HITL Mode:</label>
