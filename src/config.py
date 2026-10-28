@@ -101,13 +101,47 @@ class Settings:
     # ── Quo (OpenPhone) ───────────────────────────────────────────────────
     QUO_API_URL: str = os.getenv("QUO_API_URL", "https://api.openphone.com/v1")
     QUO_API_KEY: str = os.getenv("QUO_API_KEY", "quo_live_secret_redbrick_9942")
-    QUO_DEFAULT_PHONE_NUMBER_ID: str = os.getenv("QUO_DEFAULT_PHONE_NUMBER_ID", "PN_REDBRICKS_MGMT_01")
+    QUO_DEFAULT_PHONE_NUMBER_ID: str = os.getenv("QUO_DEFAULT_PHONE_NUMBER_ID", "PNnMjdTFVO")
+    
+    # 1. Tenants & Vendors inbox: (980) 300-7559 (Used for rent reminders & follow-ups)
+    QUO_PHONE_TENANTS_ID: str = os.getenv("QUO_PHONE_NUMBER_TENANTS", "PNnMjdTFVO")
+    QUO_PHONE_TENANTS_FORMATTED: str = "(980) 300-7559"
+    QUO_PHONE_TENANTS_E164: str = "+19803007559"
+
+    # 2. Landlords inbox: (980) 300-1196 (Used for landlord communications & updates)
+    QUO_PHONE_LANDLORDS_ID: str = os.getenv("QUO_PHONE_NUMBER_LANDLORDS", "PNTDARdwBh")
+    QUO_PHONE_LANDLORDS_FORMATTED: str = "(980) 300-1196"
+    QUO_PHONE_LANDLORDS_E164: str = "+19803001196"
+
+    # 3. Primary inbox: (667) 281-3879 (General inbox - isolated from tenant/landlord communications)
+    QUO_PHONE_PRIMARY_ID: str = os.getenv("QUO_PHONE_NUMBER_PRIMARY", "PNz3t43PKv")
+    QUO_PHONE_PRIMARY_FORMATTED: str = "(667) 281-3879"
+    QUO_PHONE_PRIMARY_E164: str = "+16672813879"
+
     # Auto mock-mode: False when a real API key is present
     QUO_MOCK_MODE: bool = _mock_mode(
         "QUO_MOCK_MODE",
         "QUO_API_KEY",
         default="quo_live_secret_redbrick_9942"
     )
+
+    def get_quo_sender(self, recipient_type: str = "tenant") -> tuple:
+        """
+        Returns (phone_id, e164_number, formatted_number, inbox_name) based on recipient type.
+          - 'tenant'   -> ('PNnMjdTFVO', '+19803007559', '(980) 300-7559', 'Tenants & Vendors')
+          - 'landlord' -> ('PNTDARdwBh', '+19803001196', '(980) 300-1196', 'Landlords')
+          - 'primary'  -> ('PNz3t43PKv', '+16672813879', '(667) 281-3879', 'Primary')
+        Primary number is isolated and never used for tenant rent reminders or landlord communications.
+        """
+        rtype = (recipient_type or "tenant").lower().strip()
+        if rtype in ("tenant", "tenants", "vendor", "vendors", "rent_reminder"):
+            return (self.QUO_PHONE_TENANTS_ID, self.QUO_PHONE_TENANTS_E164, self.QUO_PHONE_TENANTS_FORMATTED, "Tenants & Vendors")
+        elif rtype in ("landlord", "landlords", "owner", "owners"):
+            return (self.QUO_PHONE_LANDLORDS_ID, self.QUO_PHONE_LANDLORDS_E164, self.QUO_PHONE_LANDLORDS_FORMATTED, "Landlords")
+        elif rtype == "primary":
+            return (self.QUO_PHONE_PRIMARY_ID, self.QUO_PHONE_PRIMARY_E164, self.QUO_PHONE_PRIMARY_FORMATTED, "Primary")
+        # Strict default: Tenants & Vendors line
+        return (self.QUO_PHONE_TENANTS_ID, self.QUO_PHONE_TENANTS_E164, self.QUO_PHONE_TENANTS_FORMATTED, "Tenants & Vendors")
 
     # ── Gmail ─────────────────────────────────────────────────────────────
     GMAIL_CLIENT_ID: str = os.getenv("GMAIL_CLIENT_ID", "redbrick-gmail-client-id.apps.googleusercontent.com")

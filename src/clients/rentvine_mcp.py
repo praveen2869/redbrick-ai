@@ -185,7 +185,7 @@ class RentVineMCPClient:
                 real_phone = cached_contact[0]
                 real_email = cached_contact[1] or f"{first_name.lower()}@rentvine.demo"
             else:
-                real_phone = "+1 (667) 281-3879"
+                real_phone = ""
                 real_email = f"{first_name.lower()}@rentvine.demo"
 
             tenant = Tenant(
@@ -279,10 +279,6 @@ class RentVineMCPClient:
 
             # If total payments meet or exceed total charges, balance is fully cleared
             if total_payments >= total_charges:
-                unpaid = 0.0
-
-            # Guard against misleading micro-balances (e.g. residual < $20.00 like mailing fees)
-            if unpaid < 20.0:
                 unpaid = 0.0
 
             resolved_due = earliest_rent_due if unpaid > 0 and earliest_rent_due else current_month_due
@@ -450,3 +446,195 @@ class RentVineMCPClient:
             if rec:
                 records[t.id] = rec
         return records
+
+    def fetch_lease_balance_report(self, report_id: int = 72) -> Dict[str, Any]:
+        """
+        Fetches the saved Lease Balances report directly from RentVine REST API
+        using endpoint /api/manager/reports/lease-balance?reportID={report_id}.
+        This report is the single source of truth for overdue tenants and active filters.
+        """
+        raw_data = None
+        if not self.mock_mode and self._api_base:
+            try:
+                raw_data = self._rest_get(f"reports/lease-balance?reportID={report_id}")
+                logger.info(f"Successfully fetched live RentVine reportID={report_id}: {raw_data.get('title')}")
+            except Exception as e:
+                logger.warning(f"Live RentVine report fetch failed for reportID={report_id} ({e}). Checking local cache.")
+
+        if not raw_data:
+            # Fallback to cached scratch/report_72.json if available
+            import os
+            cache_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "scratch", f"report_{report_id}.json")
+            if os.path.exists(cache_path):
+                try:
+                    with open(cache_path, "r", encoding="utf-8") as f:
+                        raw_data = json.load(f)
+                    logger.info(f"Loaded RentVine reportID={report_id} from cached file {cache_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to read cached report {cache_path}: {e}")
+
+        if not raw_data:
+            raise RuntimeError(f"RentVine reportID={report_id} could not be retrieved from API or local cache.")
+
+        # Parse applied filters
+        filters_applied = []
+        for flt in raw_data.get("displayFilters", []):
+            filters_applied.append({
+                "name": flt.get("name"),
+                "label": flt.get("label"),
+                "comparator": flt.get("comparator"),
+                "details": flt.get("details", "").strip(),
+                "values": flt.get("value")
+            })
+
+        # Parse totals
+        totals = raw_data.get("totals", {}).get("data", {})
+
+        # Parse tenant rows
+        rows = []
+        for r in raw_data.get("rows", []):
+            d = r.get("data", {})
+            lease_id = str(d.get("leaseID", "")).strip()
+            tenant_name = d.get("primaryTenantName") or "Unknown Tenant"
+            phone = d.get("primaryTenantPhone") or ""
+            email = d.get("primaryTenantEmail") or ""
+            prop_name = d.get("propertyName") or ""
+            unit_name = d.get("unitName") or ""
+            unit_addr = d.get("unitAddress") or ""
+            lease_status = d.get("leaseStatusName") or "Active"
+
+            rent_amt = float(d.get("rentAmount") or 0.0)
+            past_due_rent = float(d.get("pastDueRentAmount") or 0.0)
+            past_due_total = float(d.get("pastDueTotalAmount") or 0.0)
+            total_balance = float(d.get("totalBalanceDueAmount") or 0.0)
+
+            # Determine reminder eligibility:
+            # - Must be Active lease
+            # - Has overdue balance (past_due_total > 0 or total_balance > 0, even $1.00)
+            is_eligible = (past_due_total > 0) or (total_balance > 0)
+            if not is_eligible:
+                eligibility_reason = "Paid / Settled: $0.00 balance"
+            else:
+                eligibility_reason = f"Eligible: Total balance ${total_balance:,.2f} | Total past due ${past_due_total:,.2f}"
+
+            rows.append({
+                "lease_id": lease_id,
+                "tenant_name": tenant_name,
+                "first_name": d.get("primaryTenantFirstName") or tenant_name.split()[0],
+                "last_name": d.get("primaryTenantLastName") or (tenant_name.split()[-1] if len(tenant_name.split()) > 1 else ""),
+                "phone": phone,
+                "email": email,
+                "property_name": prop_name,
+                "unit_name": unit_name,
+                "unit_address": unit_addr,
+                "property_address": d.get("propertyAddress") or "",
+                "lease_status": lease_status,
+                "monthly_rent": rent_amt,
+                "past_due_rent": past_due_rent,
+                "past_due_total": past_due_total,
+                "total_balance": total_balance,
+                "start_date": d.get("startDate"),
+                "end_date": d.get("endDate"),
+                "portal_link": f"https://redbricksproperties.rentvine.com/portal/pay",
+                "is_eligible": is_eligible,
+                "eligibility_reason": eligibility_reason
+            })
+
+        return {
+            "report_id": raw_data.get("savedReportID", str(report_id)),
+            "report_name": raw_data.get("savedReport", {}).get("name", "Rent Rem Praveen"),
+            "title": raw_data.get("title", "Lease Balances"),
+            "report_url": f"https://redbricksproperties.rentvine.com/reports/lease-balances?reportID={report_id}",
+            "record_count": len(rows),
+            "filters": filters_applied,
+            "totals": {
+                "total_balance_due": float(totals.get("totalBalanceDueAmount") or 0.0),
+                "past_due_rent": float(totals.get("pastDueRentAmount") or 0.0),
+                "past_due_total": float(totals.get("pastDueTotalAmount") or 0.0),
+                "rent_amount": float(totals.get("rentAmount") or 0.0),
+                "security_deposit_balance": float(totals.get("securityDepositBalance") or 0.0)
+            },
+            "records": rows,
+            "fetched_at": datetime.utcnow().isoformat()
+        }
+
+    def sync_report_to_database(self, report_id: int = 72) -> Dict[str, Any]:
+        """
+        Synchronizes the authoritative Report #72 into the local SQLite database.
+        - Updates or creates tenant records with their exact contact details and unit.
+        - Sets exact past due balances on rentvine_records.
+        - Sets all other non-report tenants to balance = 0.00 so only Report #72 overdue tenants remain active.
+        """
+        report_data = self.fetch_lease_balance_report(report_id)
+        records = report_data.get("records", [])
+
+        synced_count = 0
+        report_tenant_ids = set()
+
+        for rec in records:
+            lease_id = rec["lease_id"]
+            phone = rec["phone"]
+            name = rec["tenant_name"]
+            first_name = rec["first_name"]
+            last_name = rec["last_name"]
+            email = rec["email"]
+            prop_name = rec["property_name"]
+            unit_name = rec["unit_name"] or rec["unit_address"]
+
+            # Check if tenant exists by phone or lease_id
+            existing_tenant = None
+            if phone:
+                existing_tenant = db.get_tenant_by_phone(phone)
+
+            tenant_id = existing_tenant.id if existing_tenant else f"rv_lease_{lease_id}"
+            report_tenant_ids.add(tenant_id)
+
+            t_obj = Tenant(
+                id=tenant_id,
+                first_name=first_name,
+                last_name=last_name,
+                phone=phone,
+                email=email,
+                property_name=prop_name,
+                unit_number=unit_name,
+                is_excluded=False,
+                exclusion_reason=None
+            )
+            db.upsert_tenant(t_obj)
+
+            # Upsert RentVine record
+            rv_rec = RentVineRecord(
+                tenant_id=tenant_id,
+                balance=rec["total_balance"],
+                monthly_rent=rec["monthly_rent"],
+                due_date="2026-10-01",
+                last_payment_date=None,
+                last_payment_amount=0.0,
+                portal_link=rec["portal_link"],
+                lease_status="ACTIVE"
+            )
+            db.upsert_rentvine_record(rv_rec)
+            synced_count += 1
+
+        # Clear balances of any tenants not in Report #72
+        all_tenants = db.get_all_tenants()
+        cleared_count = 0
+        for t in all_tenants:
+            if t.id not in report_tenant_ids:
+                existing_rv = db.get_rentvine_record(t.id)
+                if existing_rv and existing_rv.balance > 0:
+                    existing_rv.balance = 0.0
+                    db.upsert_rentvine_record(existing_rv)
+                    cleared_count += 1
+
+        logger.info(
+            f"[Report 72 Sync] Synced {synced_count} authoritative overdue tenants from Report #{report_id}. "
+            f"Cleared {cleared_count} non-report tenants to $0.00."
+        )
+
+        return {
+            "report_id": report_id,
+            "synced_tenants": synced_count,
+            "cleared_tenants": cleared_count,
+            "totals": report_data.get("totals", {})
+        }

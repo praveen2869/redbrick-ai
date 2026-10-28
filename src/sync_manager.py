@@ -136,7 +136,7 @@ class PortfolioSyncManager:
                     real_phone = cached_contact[0]
                     real_email = cached_contact[1] or f"{first_name.lower()}@rentvine.demo"
                 else:
-                    real_phone = "+1 (667) 281-3879"
+                    real_phone = ""
                     real_email = f"{first_name.lower()}@rentvine.demo"
 
                 tenant = Tenant(

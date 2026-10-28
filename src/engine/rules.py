@@ -30,18 +30,13 @@ class BusinessRulesEngine:
     def check_paid_status(self, record: Optional[RentVineRecord]) -> Tuple[bool, str]:
         """
         Rule 1: If balance <= $0.00, rent is paid.
-        Enforces a minimum delinquency threshold ($20.00) so minor administrative or
-        portal convenience fees ($2.00, $14.51 mailing fees, etc.) are never treated
-        as overdue rent delinquency requiring debt collection reminders.
+        Any positive outstanding balance (even $1.00) is considered unpaid and eligible for reminder.
         """
         if not record:
             return False, "No RentVine record found"
 
         if record.balance <= 0.0:
             return True, f"Rent balance is $0.00 (Last payment: ${record.last_payment_amount:,.2f} on {record.last_payment_date})"
-
-        if record.balance < 20.0:
-            return True, f"Balance of ${record.balance:,.2f} is below minimum overdue threshold ($20.00); administrative fee only — rent considered settled"
 
         return False, f"Outstanding balance: ${record.balance:,.2f}"
 

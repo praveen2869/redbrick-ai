@@ -310,6 +310,51 @@ class Database:
         """Returns only tenants with active leases (excludes completed/historical leases)."""
         return self.get_all_tenants(active_only=True)
 
+    def get_tenant_by_id(self, tenant_id: str) -> Optional[Tenant]:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM tenants WHERE id = ?", (tenant_id,))
+            r = cursor.fetchone()
+            if not r:
+                return None
+            return Tenant(
+                id=r["id"],
+                first_name=r["first_name"],
+                last_name=r["last_name"],
+                phone=r["phone"],
+                email=r["email"],
+                property_name=r["property_name"],
+                unit_number=r["unit_number"],
+                is_excluded=bool(r["is_excluded"]),
+                exclusion_reason=r["exclusion_reason"],
+                created_at=r["created_at"]
+            )
+
+    def get_tenant_by_phone(self, phone: str) -> Optional[Tenant]:
+        if not phone:
+            return None
+        # Normalize digits
+        clean = "".join([c for c in phone if c.isdigit()])
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM tenants")
+            for r in cursor.fetchall():
+                t_phone = "".join([c for c in (r["phone"] or "") if c.isdigit()])
+                if t_phone and (clean.endswith(t_phone[-10:]) or t_phone.endswith(clean[-10:])):
+                    return Tenant(
+                        id=r["id"],
+                        first_name=r["first_name"],
+                        last_name=r["last_name"],
+                        phone=r["phone"],
+                        email=r["email"],
+                        property_name=r["property_name"],
+                        unit_number=r["unit_number"],
+                        is_excluded=bool(r["is_excluded"]),
+                        exclusion_reason=r["exclusion_reason"],
+                        created_at=r["created_at"]
+                    )
+        return None
+
     def get_rentvine_record(self, tenant_id: str) -> Optional[RentVineRecord]:
         with self.get_connection() as conn:
             cursor = conn.cursor()
