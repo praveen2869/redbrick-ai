@@ -664,11 +664,44 @@
         </div>
       </div>
 
-      <!-- Table 2: Tenant SMS Conversation History -->
+      <!-- Table 2: Promises on Hold (Payment Promised — Reminder Suppressed) -->
+      <div class="table-container" id="quo-promises-container" style="margin-bottom: 24px;display:none;">
+        <div class="table-header" style="padding:16px 20px;border-bottom:1px solid #334155;display:flex;justify-content:space-between;align-items:center;">
+          <div>
+            <h3 style="margin:0;font-size:16px;color:#f8fafc;">🤝 On Hold — Payment Promised</h3>
+            <p style="margin:4px 0 0;font-size:12px;color:#94a3b8;">Tenants with an active payment commitment. Reminders suppressed until promised date passes.</p>
+          </div>
+          <span class="badge" style="background:rgba(245,158,11,0.12);color:#f59e0b;border:1px solid rgba(245,158,11,0.4);padding:6px 10px;border-radius:12px;font-size:11px;">
+            🕐 Auto-resuming after promise date
+          </span>
+        </div>
+        <table class="data-table" id="quo-promises-table">
+          <thead>
+            <tr>
+              <th>Tenant</th>
+              <th>Property / Unit</th>
+              <th>Phone</th>
+              <th>Overdue Balance</th>
+              <th>Promise Date</th>
+              <th>Next Eligible Reminder</th>
+              <th>Hold Reason</th>
+            </tr>
+          </thead>
+          <tbody id="quo-promises-tbody">
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Table 3: Tenant SMS Conversation History -->
       <div class="table-container" style="margin-bottom: 24px;">
-        <div class="table-header" style="padding:16px 20px;border-bottom:1px solid #334155;">
-          <h3 style="margin:0;font-size:16px;color:#f8fafc;">💬 Live Quo (OpenPhone) Message Threads</h3>
-          <p style="margin:4px 0 0;font-size:12px;color:#94a3b8;">Real sent and received SMS history across your tenant conversations.</p>
+        <div class="table-header" style="padding:16px 20px;border-bottom:1px solid #334155;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+          <div>
+            <h3 style="margin:0;font-size:16px;color:#f8fafc;">💬 Live Quo (OpenPhone) Message Threads</h3>
+            <p style="margin:4px 0 0;font-size:12px;color:#94a3b8;">Filtered to overdue tenants only — unrelated conversations are excluded.</p>
+          </div>
+          <div id="quo-overdue-filter-badge" style="display:none;font-size:11px;color:#10b981;background:rgba(16,185,129,0.1);padding:4px 10px;border-radius:8px;border:1px solid rgba(16,185,129,0.3);">
+            🎯 Filtered to overdue tenants only
+          </div>
         </div>
         <table class="data-table" id="quo-messages-table">
           <thead>

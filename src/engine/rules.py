@@ -49,27 +49,97 @@ class BusinessRulesEngine:
             return True, reason
         return False, None
 
-    def check_grace_period(self, record: Optional[RentVineRecord], current_date: Optional[datetime] = None) -> Tuple[bool, str]:
+    def check_grace_period(
+        self, record: Optional[RentVineRecord], current_date: Optional[datetime] = None
+    ) -> Tuple[bool, str]:
         """
-        Rule 3: Check if the tenant is still within the monthly grace period.
-        E.g., Due on Oct 1 + 3 days grace period = reminders only sent from Oct 4 onward.
+        Rule 3: Evaluate grace period for rent dues.
+
+        Logic:
+          1. 1st–4th of each month: Do not send reminders for rent due in the current month (Grace period).
+          2. Starting on the 5th: Begin sending reminders for current-month rent dues to eligible unpaid tenants.
+          3. Overdue rent from previous months: Grace period has expired; eligible for overdue reminders
+             subject to payment status, promises, and deduplication rules.
+          4. Future rent: Not yet due; reminders are suppressed.
         """
-        if not record or not record.due_date:
-            return False, "No due date on record"
+        if not record:
+            return False, "No RentVine record on file"
 
         now = current_date or datetime.utcnow()
-        try:
-            due_dt = datetime.strptime(record.due_date, "%Y-%m-%d")
-        except Exception:
-            return False, "Invalid due date format"
+        now_date = now.date()
 
-        grace_cutoff = due_dt + timedelta(days=self.grace_period_days)
+        # Parse due date with multi-format resilience
+        due_str = (record.due_date or "").strip()
+        due_dt = None
+        if due_str:
+            clean_str = due_str.split("T")[0].split(" ")[0].strip()
+            for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%Y/%m/%d"):
+                try:
+                    due_dt = datetime.strptime(clean_str, fmt)
+                    break
+                except (ValueError, TypeError):
+                    continue
 
-        if now.date() <= grace_cutoff.date():
-            days_left = (grace_cutoff.date() - now.date()).days
-            return True, f"Within grace period until {grace_cutoff.strftime('%Y-%m-%d')} ({days_left} days remaining)"
+        if not due_dt:
+            # Default to the 1st of the current month if unstated or standard monthly lease
+            due_dt = datetime(now_date.year, now_date.month, 1)
 
-        return False, f"Grace period expired on {grace_cutoff.strftime('%Y-%m-%d')}"
+        due_date = due_dt.date()
+
+        # ── Case A: Future rent dues (reminders suppressed) ──
+        if (due_date.year, due_date.month) > (now_date.year, now_date.month):
+            return (
+                True,
+                f"Rent is for a future month ({due_date.strftime('%B %Y')}, due on {due_date.strftime('%Y-%m-%d')}) — reminders suppressed."
+            )
+
+        if (due_date.year, due_date.month) == (now_date.year, now_date.month) and due_date.day > now_date.day:
+            days_until_due = (due_date - now_date).days
+            return (
+                True,
+                f"Rent is not yet due (due on {due_date.strftime('%Y-%m-%d')}, {days_until_due} day(s) away) — reminders suppressed."
+            )
+
+        # ── Case B: Current-month rent dues ──
+        if (due_date.year, due_date.month) == (now_date.year, now_date.month):
+            # Standard monthly rent (due on the 1st or within days 1-4)
+            if due_date.day <= 4:
+                # 1st–4th of the month serves as the monthly grace period
+                if now_date.day <= 4:
+                    days_left = 5 - now_date.day
+                    return (
+                        True,
+                        f"Within current-month grace period (Days 1–4 of {now_date.strftime('%B %Y')}). "
+                        f"Reminders begin on the 5th ({days_left} day(s) until dispatch begins)."
+                    )
+                else:
+                    return (
+                        False,
+                        f"Current-month grace period expired on {now_date.strftime('%B')} 4th. "
+                        f"Overdue reminder eligible starting on the 5th."
+                    )
+            else:
+                # Mid-month cycle rent (e.g., due on the 15th): 4-day grace window starting on due date
+                grace_cutoff = due_date + timedelta(days=3)
+                if now_date <= grace_cutoff:
+                    days_left = (grace_cutoff - now_date).days + 1
+                    return (
+                        True,
+                        f"Within cycle grace period until {grace_cutoff.strftime('%Y-%m-%d')} ({days_left} day(s) remaining)."
+                    )
+                else:
+                    return (
+                        False,
+                        f"Cycle grace period expired on {grace_cutoff.strftime('%Y-%m-%d')}."
+                    )
+
+        # ── Case C: Overdue rent from PREVIOUS months ──
+        # Past-month balances are already overdue and NOT suppressed by the current month's grace period
+        return (
+            False,
+            f"Overdue rent from previous month ({due_date.strftime('%B %Y')}, due on {due_date.strftime('%Y-%m-%d')}) — "
+            f"not subject to current-month grace period; eligible for overdue reminder."
+        )
 
     def check_recent_reminder_deduplication(
         self, tenant_id: str, current_time: Optional[datetime] = None

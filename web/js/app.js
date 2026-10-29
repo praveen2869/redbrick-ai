@@ -1013,8 +1013,11 @@ class AppController {
                 From: ${r.sender_phone || '(980) 300-7559'} (${r.sender_inbox || 'Tenants & Vendors'})
               </span>
             </div>
-            <div style="background:#0f172a;border:1px solid #1e293b;border-radius:8px;padding:8px 12px;font-size:12px;color:#cbd5e1;line-height:1.4;max-width:440px;">
-              💬 <em>${r.sms_preview}</em>
+            <div class="sms-draft-box" style="background:#090d16;border:1px solid #1e293b;border-left:3px solid #0284c7;border-radius:8px;padding:12px 14px;font-size:12.5px;color:#f1f5f9;line-height:1.6;max-width:480px;white-space:pre-wrap;word-break:break-word;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,sans-serif;box-shadow:inset 0 1px 3px rgba(0,0,0,0.4);">
+              <div style="font-size:10px;font-weight:800;letter-spacing:0.6px;color:#38bdf8;margin-bottom:8px;text-transform:uppercase;display:flex;align-items:center;gap:6px;">
+                <span>💬 SMS DRAFT MESSAGE</span>
+              </div>
+              <div class="sms-text-content" style="white-space:pre-wrap;word-break:break-word;">${r.sms_preview}</div>
             </div>
           </td>
           <td style="text-align:center;">
@@ -1074,6 +1077,7 @@ class AppController {
       if (!res.ok) throw new Error(data.error || "Failed to load Quo data");
 
       this._quoReminders = data.reminders_needed || [];
+      this._quoPromises = data.promises_on_hold || [];
 
       // Update KPI counters
       const countNeeded = document.getElementById("quo-count-needed");
@@ -1083,6 +1087,23 @@ class AppController {
       if (countInbound && data.counts) countInbound.textContent = `${data.counts.inbound_replies} replies`;
       if (sentCounter && data.counts && data.counts.hitl_approved_sent > 0) {
         sentCounter.textContent = data.counts.hitl_approved_sent + this._quoSentCount;
+      }
+
+      // Update top-level KPI "Promises on File" if present
+      const valPromises = document.getElementById("val-count-promises");
+      if (valPromises && data.counts && typeof data.counts.promises_on_hold === "number") {
+        valPromises.textContent = data.counts.promises_on_hold;
+      }
+
+      // Show/hide the overdue-filter badge on the message history section
+      const filterBadge = document.getElementById("quo-overdue-filter-badge");
+      if (filterBadge && data.overdue_filter) {
+        if (data.overdue_filter.filtering_active && data.overdue_filter.overdue_tenant_count > 0) {
+          filterBadge.style.display = "block";
+          filterBadge.innerHTML = `🎯 Filtered: showing ${data.overdue_filter.conversations_matched} conversations for ${data.overdue_filter.overdue_tenant_count} overdue tenants only`;
+        } else {
+          filterBadge.style.display = "none";
+        }
       }
 
       // Update phone display with live OpenPhone data
@@ -1097,7 +1118,7 @@ class AppController {
           const convCount = data.channel.openphone_conversations || 0;
           const displayNum = data.channel.phone_number || (lineKey === 'landlords' ? '(980) 300-1196' : (lineKey === 'primary' ? '(667) 281-3879' : '(980) 300-7559'));
           phoneDisplay.innerHTML = `${displayNum}
-            ${convCount > 0 ? `<span style="font-size:12px;color:#10b981;display:block;margin-top:4px;">📡 ${convCount} live conversations fetched</span>` : ''}`;
+            ${convCount > 0 ? `<span style="font-size:12px;color:#10b981;display:block;margin-top:4px;">📡 ${convCount} conversations (overdue tenants only)</span>` : ''}`;
         }
         if (phoneSubtext && data.channel.phone_number_id) {
           phoneSubtext.textContent = `OpenPhone ID: ${data.channel.phone_number_id} • ${data.channel.purpose || ''}`;
@@ -1107,7 +1128,38 @@ class AppController {
       // Render HITL reminders table
       this.renderQuoReminders();
 
+      // ─── Render Promises on Hold table ───
+      const promisesContainer = document.getElementById("quo-promises-container");
+      const tbodyPromises = document.getElementById("quo-promises-tbody");
+      if (promisesContainer && tbodyPromises) {
+        if (this._quoPromises.length === 0) {
+          promisesContainer.style.display = "none";
+        } else {
+          promisesContainer.style.display = "block";
+          tbodyPromises.innerHTML = this._quoPromises.map(p => {
+            const promiseLabel = p.promise_date
+              ? `<span style="color:#f59e0b;font-weight:700;">${p.promise_date}</span>`
+              : `<span style="color:#64748b;">Not specified</span>`;
+            const nextLabel = p.next_eligible_reminder_date
+              ? `<span style="color:#38bdf8;">${p.next_eligible_reminder_date}</span>`
+              : `<span style="color:#64748b;">After promise date</span>`;
+            return `
+              <tr style="background:rgba(245,158,11,0.04);border-left:3px solid #f59e0b;">
+                <td><strong>${p.tenant_name}</strong><br><small style="color:#64748b;">${p.tenant_id}</small></td>
+                <td>${p.property_unit}</td>
+                <td><code>${p.phone}</code></td>
+                <td><strong style="color:#f87171;">$${Number(p.balance).toLocaleString('en-US', {minimumFractionDigits:2})}</strong></td>
+                <td>${promiseLabel}</td>
+                <td>${nextLabel}</td>
+                <td style="max-width:260px;font-size:12px;color:#94a3b8;line-height:1.5;">${p.hold_reason || '—'}</td>
+              </tr>
+            `;
+          }).join("");
+        }
+      }
+
       // ─── Quo SMS Message History ───
+
       const tbodyMsgs = document.getElementById("quo-messages-tbody");
       if (tbodyMsgs) {
         const msgs = data.sms_messages || data.messages || [];
@@ -1132,7 +1184,7 @@ class AppController {
                   <small style="color:#64748b;">${m.property_unit || m.tenant_id || ''}</small>
                 </td>
                 <td>
-                  <div style="font-size:13px;color:#f1f5f9;line-height:1.4;background:${isInbound ? 'rgba(56,189,248,0.06)' : (isSent ? 'rgba(16,185,129,0.05)' : 'transparent')};padding:${(isInbound || isSent) ? '8px 12px' : '0'};border-radius:6px;border-left:${isInbound ? '3px solid #38bdf8' : (isSent ? '3px solid #10b981' : 'none')};">
+                  <div style="font-size:13px;color:#f1f5f9;line-height:1.55;white-space:pre-wrap;word-break:break-word;background:${isInbound ? 'rgba(56,189,248,0.06)' : (isSent ? 'rgba(16,185,129,0.05)' : 'transparent')};padding:${(isInbound || isSent) ? '8px 12px' : '0'};border-radius:6px;border-left:${isInbound ? '3px solid #38bdf8' : (isSent ? '3px solid #10b981' : 'none')};">
                     ${m.content}
                   </div>
                 </td>

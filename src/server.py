@@ -173,9 +173,17 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                     "mode": "Simulation / Live-Ready" if settings.GMAIL_MOCK_MODE else "Live Gmail OAuth"
                 },
                 "ai_engine": {
+                    "provider": settings.AI_PROVIDER,
                     "model": settings.AI_MODEL,
+                    "has_claude_key": bool(os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY") or settings.ANTHROPIC_API_KEY),
                     "has_openai_key": bool(settings.OPENAI_API_KEY),
-                    "active_engine": "OpenAI " + settings.AI_MODEL if settings.OPENAI_API_KEY else "Built-in Semantic NLU Engine"
+                    "has_groq_key": bool(settings.GROQ_API_KEY),
+                    "active_engine": (
+                        f"Claude Sonnet ({settings.AI_MODEL})" if (os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY") or settings.ANTHROPIC_API_KEY)
+                        else (f"Groq ({settings.AI_MODEL})" if settings.GROQ_API_KEY
+                        else (f"OpenAI ({settings.AI_MODEL})" if settings.OPENAI_API_KEY
+                        else "Built-in Semantic NLU Engine"))
+                    )
                 }
             },
             "report_source_of_truth": {
@@ -679,8 +687,10 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
         """
         Live Quo (OpenPhone) feed handler.
         - Supports line selection via ?line=tenants (default), ?line=landlords, ?line=primary
-        - Fetches real conversations + messages from OpenPhone REST API for the selected line
+        - Fetches real conversations + messages from OpenPhone REST API ONLY for tenants
+          identified as overdue/unpaid in RentVine Report #72.
         - Builds reminders queue from real workflow decisions strictly mapped to Tenants & Vendors (980) 300-7559
+        - Adds HOLD_PROMISE tenants to the log with promise status and next eligible reminder date
         - Merges HITL-approved sends from local DB
         """
         selected_line = "tenants"
@@ -711,7 +721,57 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
         all_tenants = db.get_all_tenants()
         tenant_map = {t.id: t for t in all_tenants}
 
-        # ─── 1. Fetch real OpenPhone conversations + messages for this line ───
+        # ─── 0. Build overdue-tenant phone whitelist from Report #72 ───
+        # This is the authoritative filter: only fetch Quo conversations for these tenants.
+        overdue_phones: set = set()          # set of cleaned 10-digit phone strings
+        overdue_tenant_ids: set = set()      # set of tenant IDs in overdue report
+        report_phone_to_tenant: Dict[str, object] = {}  # phone → Tenant object
+
+        if not settings.RENTVINE_MOCK_MODE and settings.RENTVINE_API_KEY:
+            try:
+                rv_client = RentVineMCPClient()
+                report_data = rv_client.fetch_lease_balance_report(report_id=72)
+                for rec in report_data.get("records", []):
+                    # Only include tenants with a real outstanding balance
+                    if float(rec.get("past_due_total", 0) or 0) <= 0:
+                        continue
+                    raw_phone = rec.get("phone") or ""
+                    clean_p = "".join([c for c in raw_phone if c.isdigit()])
+                    if clean_p:
+                        p10 = clean_p[-10:]
+                        overdue_phones.add(p10)
+                        # Match to a local tenant object
+                        for t in all_tenants:
+                            t_clean = "".join([c for c in (t.phone or "") if c.isdigit()])
+                            if t_clean and t_clean[-10:] == p10:
+                                overdue_tenant_ids.add(t.id)
+                                report_phone_to_tenant[p10] = t
+                                break
+                logger.info(
+                    f"[Quo - Overdue Filter] {len(overdue_phones)} overdue tenant phones from Report #72. "
+                    f"Quo conversations will be restricted to these contacts."
+                )
+            except Exception as e:
+                logger.warning(f"[Quo - Overdue Filter] Could not fetch Report #72 for phone whitelist: {e}. Falling back to all tenants.")
+                # Fallback: build from local DB tenants with positive balances
+                for t in all_tenants:
+                    rv = db.get_rentvine_record(t.id)
+                    if rv and float(rv.balance or 0) > 0:
+                        clean_p = "".join([c for c in (t.phone or "") if c.isdigit()])
+                        if clean_p:
+                            overdue_phones.add(clean_p[-10:])
+                            overdue_tenant_ids.add(t.id)
+        else:
+            # Mock/dev mode: use local DB balance as fallback
+            for t in all_tenants:
+                rv = db.get_rentvine_record(t.id)
+                if rv and float(rv.balance or 0) > 0:
+                    clean_p = "".join([c for c in (t.phone or "") if c.isdigit()])
+                    if clean_p:
+                        overdue_phones.add(clean_p[-10:])
+                        overdue_tenant_ids.add(t.id)
+
+        # ─── 1. Fetch real OpenPhone conversations + messages ONLY for overdue tenants ───
         openphone_conversations = []
         openphone_messages = []
         quo_probe = self._test_quo_connection()
@@ -733,12 +793,34 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                 )
                 with _ur.urlopen(req, timeout=10) as resp:
                     conv_data = json.loads(resp.read().decode("utf-8"))
-                    openphone_conversations = conv_data.get("data", []) or []
-                    logger.info(f"[Quo - {inbox_name}] Fetched {len(openphone_conversations)} live conversations for {phone_number}")
+                    all_convs = conv_data.get("data", []) or []
+
+                    # ── Filter: only keep conversations whose participant phone is in the overdue whitelist ──
+                    if overdue_phones:
+                        filtered_convs = []
+                        for conv in all_convs:
+                            participants = conv.get("participants", [])
+                            if not participants:
+                                continue
+                            p0 = participants[0]
+                            phone_str = p0.get("phoneNumber", "") if isinstance(p0, dict) else str(p0)
+                            clean_p = "".join([c for c in phone_str if c.isdigit()])
+                            if clean_p and clean_p[-10:] in overdue_phones:
+                                filtered_convs.append(conv)
+                        openphone_conversations = filtered_convs
+                        logger.info(
+                            f"[Quo - {inbox_name}] Fetched {len(all_convs)} conversations; "
+                            f"{len(openphone_conversations)} matched overdue tenants from Report #72."
+                        )
+                    else:
+                        # No whitelist available — fall back to showing up to 15 conversations
+                        openphone_conversations = all_convs[:15]
+                        logger.info(f"[Quo - {inbox_name}] No overdue whitelist; showing {len(openphone_conversations)} conversations.")
+
             except Exception as e:
                 logger.warning(f"[Quo - {inbox_name}] Failed to fetch conversations for {phone_id}: {e}")
 
-            # For recent conversations, fetch messages (scans up to 15 to include recent threads like Kukunoor)
+            # For filtered overdue conversations, fetch messages
             for conv in openphone_conversations[:15]:
                 conv_id = conv.get("id")
                 if not conv_id:
@@ -752,6 +834,16 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                 if not phone_str:
                     continue
 
+                # Resolve tenant info from our whitelist mapping
+                clean_p = "".join([c for c in phone_str if c.isdigit()])
+                matched_tenant = report_phone_to_tenant.get(clean_p[-10:] if clean_p else "")
+                if matched_tenant:
+                    resolved_name = matched_tenant.full_name
+                    prop_unit = f"{matched_tenant.property_name} {matched_tenant.unit_number}".strip()
+                else:
+                    resolved_name = name_str or phone_str
+                    prop_unit = ""
+
                 # Query OpenPhone messages with required phoneNumberId and participants[]
                 try:
                     msg_url = f"{settings.QUO_API_URL}/messages?phoneNumberId={phone_id}&participants[]={quote(phone_str)}&maxResults=5"
@@ -760,14 +852,8 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                         msg_data = json.loads(resp.read().decode("utf-8"))
                         for m in (msg_data.get("data", []) or []):
                             txt = m.get("text", m.get("body", ""))
-                            resolved_name = name_str or phone_str
-                            prop_unit = ""
-                            if "8622205006" in phone_str:
-                                resolved_name = "Kukunoor Tenant"
-                                prop_unit = "8620 Fairgreen Avenue Unit 691"
-                            elif txt.startswith("Hi ") and "," in txt[:30]:
-                                resolved_name = txt[3:txt.index(",")].strip()
 
+                            # Try to extract property/unit from message text if not already resolved
                             if not prop_unit and " for " in txt and " was due" in txt:
                                 try:
                                     part_u = txt.split(" for ")[1].split(" was due")[0].strip()
@@ -784,7 +870,7 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                                 "status": m.get("status", "delivered").upper(),
                                 "tenant_name": resolved_name,
                                 "phone": phone_str,
-                                "tenant_id": "",
+                                "tenant_id": matched_tenant.id if matched_tenant else "",
                                 "property_unit": prop_unit,
                                 "source": "openphone_live",
                                 "line": selected_line,
@@ -799,9 +885,11 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                     logger.warning(f"[Quo] Failed to fetch messages for {phone_str}: {e}")
 
         # ─── 2. Build reminders queue from REAL workflow decisions only ───
-        # Note: Rent reminders are strictly associated with Tenants & Vendors line ((980) 300-7559)
+        # Strictly associated with Tenants & Vendors line ((980) 300-7559)
+        # Also includes HOLD_PROMISE tenants so they remain visible with their promise status
         latest_decisions = db.get_latest_decisions(limit=2000)
         reminders_needed = []
+        promises_on_hold = []
         seen_tenants = set()
 
         for d in latest_decisions:
@@ -809,22 +897,13 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                 continue
             seen_tenants.add(d.tenant_id)
 
-            if d.outcome != DecisionOutcome.SEND_REMINDER:
-                continue  # Most recent evaluation was SKIP_PAID, HOLD_PROMISE, etc.
-
-            # Cooldown check: if reminder was genuinely dispatched in the last 24h, skip it
-            last_rem = db.get_last_successful_reminder(d.tenant_id)
-            if last_rem and last_rem.sms_sent:
-                try:
-                    last_ts = datetime.fromisoformat(last_rem.timestamp)
-                    if (datetime.utcnow() - last_ts).total_seconds() < 24 * 3600:
-                        continue
-                except Exception:
-                    pass
-
             t = tenant_map.get(d.tenant_id)
             if not t:
                 continue  # skip orphaned decision records
+
+            # Only include tenants from the overdue whitelist (when available)
+            if overdue_tenant_ids and d.tenant_id not in overdue_tenant_ids:
+                continue
 
             # Safety check: ensure current balance is outstanding (> $0.00)
             rv = db.get_rentvine_record(d.tenant_id)
@@ -836,33 +915,103 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
             if not t.phone or t.phone.startswith("+1-415-555"):
                 continue
 
-            # Build SMS preview
-            sms_text = d.details.get("sms_text", "") if d.details else ""
-            if not sms_text:
+            # ── HOLD_PROMISE tenants: visible in log with hold status ──
+            if d.outcome == DecisionOutcome.HOLD_PROMISE:
+                promise_date = None
+                next_eligible = None
+                details = d.details or {}
+                if isinstance(details, str):
+                    try:
+                        import json as _json
+                        details = _json.loads(details)
+                    except Exception:
+                        details = {}
+                promise_date = details.get("promise_date") or details.get("extracted_date") or details.get("note_pdate")
+                if promise_date:
+                    try:
+                        from datetime import timedelta as _td
+                        pd_obj = datetime.strptime(str(promise_date)[:10], "%Y-%m-%d")
+                        next_eligible = (pd_obj + _td(days=1)).strftime("%Y-%m-%d")
+                    except Exception:
+                        next_eligible = promise_date
+
+                clean_prop = (t.property_name or d.property_unit or "").strip()
+                unit_val = (t.unit_number or "").strip()
+                prop_display = f"{clean_prop} {unit_val}".strip() if unit_val and unit_val not in clean_prop else clean_prop
+
+                promises_on_hold.append({
+                    "tenant_id": d.tenant_id,
+                    "tenant_name": d.tenant_name or t.full_name,
+                    "property_unit": prop_display,
+                    "phone": t.phone,
+                    "balance": effective_balance,
+                    "status": "ON_HOLD_PAYMENT_PROMISED",
+                    "hold_reason": d.reason,
+                    "promise_date": promise_date,
+                    "next_eligible_reminder_date": next_eligible,
+                    "timestamp": d.timestamp,
+                    "sender_phone": settings.QUO_PHONE_TENANTS_FORMATTED,
+                    "sender_inbox": "Tenants & Vendors",
+                })
+                continue  # Don't add to send queue
+
+            if d.outcome != DecisionOutcome.SEND_REMINDER:
+                continue  # Most recent evaluation was SKIP_PAID, SKIP_GRACE_PERIOD, etc.
+
+            # Cooldown check: if reminder was genuinely dispatched in the last 24h, skip it
+            last_rem = db.get_last_successful_reminder(d.tenant_id)
+            if last_rem and last_rem.sms_sent:
                 try:
-                    rv = db.get_rentvine_record(t.id)
-                    portal = rv.portal_link if rv else "https://redbricksproperties.rentvine.com/portal/pay"
-                    due = rv.due_date if rv else "1st of the month"
-                    sms_text = settings.REMINDER_TEMPLATE.format(
-                        tenant_name=t.first_name,
-                        balance=d.balance if d.balance else (rv.balance if rv else 0),
-                        property_name=t.property_name or d.property_unit,
-                        unit_number=t.unit_number or "",
-                        due_date=due,
-                        portal_link=portal
-                    )
+                    last_ts = datetime.fromisoformat(last_rem.timestamp)
+                    if (datetime.utcnow() - last_ts).total_seconds() < 24 * 3600:
+                        continue
                 except Exception:
-                    sms_text = (
-                        f"Hi {t.first_name}, this is a reminder from Red Bricks Property Management. "
-                        f"Your rent is overdue. Please pay via your RentVine portal. Thank you!"
-                    )
+                    pass
+
+            # Automatic Grace Period evaluation: suppress current-month rent during days 1–4
+            from src.engine.rules import BusinessRulesEngine
+            rules = BusinessRulesEngine()
+            is_in_grace, _ = rules.check_grace_period(rv, datetime.utcnow())
+            if is_in_grace:
+                continue
+
+            # Build SMS preview with proper paragraph spacing (WhatsApp / Quo SMS format)
+            portal = rv.portal_link if rv else "https://redbricksproperties.rentvine.com/portal/pay"
+            due = rv.due_date if rv else "2026-10-01"
+            clean_prop = (t.property_name or d.property_unit or "").strip()
+            effective_bal = float(d.balance if d.balance is not None else (rv.balance if rv else 0.0))
+
+            try:
+                sms_text = settings.REMINDER_TEMPLATE.format(
+                    tenant_name=t.first_name,
+                    balance=effective_bal,
+                    property_name=clean_prop,
+                    unit_number=t.unit_number or "",
+                    due_date=due,
+                    portal_link=portal
+                )
+            except Exception:
+                sms_text = (
+                    f"Hi {t.first_name},\n\n"
+                    f"Friendly reminder from Red Bricks Property Management:\n\n"
+                    f"Your rent of ${effective_bal:,.2f} was due on {due}.\n\n"
+                    f"Please pay via your RentVine portal ({portal}) or reply here if you've already sent it.\n\n"
+                    f"Thank you!"
+                )
+
+            # Deduplicate property_unit display for HITL table
+            unit_val = (t.unit_number or "").strip()
+            if unit_val and unit_val != clean_prop and unit_val not in clean_prop:
+                prop_display = f"{clean_prop} {unit_val}".strip()
+            else:
+                prop_display = clean_prop
 
             reminders_needed.append({
                 "tenant_id": d.tenant_id,
                 "tenant_name": d.tenant_name or t.full_name,
-                "property_unit": d.property_unit or f"{t.property_name} {t.unit_number}",
+                "property_unit": prop_display,
                 "phone": t.phone,
-                "balance": float(d.balance or 0),
+                "balance": effective_bal,
                 "status": "AWAITING_HITL_APPROVAL",
                 "sms_preview": sms_text,
                 "sender_phone": settings.QUO_PHONE_TENANTS_FORMATTED,
@@ -875,11 +1024,15 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
 
         # ─── 3. Build SMS message history: HITL-approved + any OpenPhone live msgs ───
         # Local DB messages (HITL approved or recorded) via single bulk query
+        # Only include messages for overdue tenants (when whitelist is available)
         local_sms = []
         recent_db_msgs = db.get_all_recent_messages(limit=150, channel=Channel.SMS)
         for m in recent_db_msgs:
             if m.status == "REMINDER_NEEDED (TESTING_MODE)":
                 continue  # Never display internal suppressed testing simulations in live message history
+            # Filter to overdue tenants when whitelist is available
+            if overdue_tenant_ids and m.tenant_id and m.tenant_id not in overdue_tenant_ids:
+                continue
             t = tenant_map.get(m.tenant_id)
             t_name = t.full_name if t else m.tenant_id
             prop_unit = f"{t.property_name} {t.unit_number}".strip() if t else ""
@@ -948,6 +1101,12 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
             "mode": "hitl_testing",
             "hitl_status": "LOCKED — Explicit HITL approval required per reminder",
             "selected_line": selected_line,
+            "overdue_filter": {
+                "source": "RentVine Report #72 (Rent Rem Praveen)",
+                "overdue_tenant_count": len(overdue_phones),
+                "conversations_matched": len(openphone_conversations),
+                "filtering_active": bool(overdue_phones)
+            },
             "channel": {
                 "name": f"Quo (OpenPhone) SMS — {inbox_name}",
                 "inbox_name": inbox_name,
@@ -962,17 +1121,18 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
             "available_lines": available_lines,
             "counts": {
                 "reminders_needed": len(reminders_needed),
+                "promises_on_hold": len(promises_on_hold),
                 "sms_messages": len(deduped),
                 "inbound_replies": inbound_count,
                 "hitl_approved_sent": hitl_sent
             },
             "reminders_needed": reminders_needed,
+            "promises_on_hold": promises_on_hold,
             "messages": deduped,
             "probe": quo_probe
         }
         _API_CACHE[cache_key] = (now_ts, resp_data)
         self._send_json(resp_data)
-
 
 
     def _handle_post_run_workflow(self, body: Dict[str, Any]):
@@ -1129,6 +1289,24 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
 
         if not hitl_approved:
             return self._send_json({"error": "HITL approval flag must be set to dispatch reminder"}, 403)
+
+        # Payment status verification: ensure rent is still unpaid
+        rv_rec = db.get_rentvine_record(tenant_id)
+        if rv_rec and float(rv_rec.balance or 0.0) <= 0.0:
+            return self._send_json({
+                "error": "Payment verified: Tenant balance is $0.00 (paid in full). No reminder sent.",
+                "status": "PAID"
+            }, 400)
+
+        # Automatic Grace Period verification for current-month rent dues
+        from src.engine.rules import BusinessRulesEngine
+        rules = BusinessRulesEngine()
+        is_in_grace, grace_msg = rules.check_grace_period(rv_rec, datetime.utcnow())
+        if is_in_grace:
+            return self._send_json({
+                "error": f"Cannot send reminder: {grace_msg}",
+                "status": "IN_GRACE_PERIOD"
+            }, 400)
 
         # Resolve sender phone number and inbox based on recipient type
         if sender_phone_override:

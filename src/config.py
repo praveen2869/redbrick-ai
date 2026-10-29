@@ -4,13 +4,14 @@ Loads settings from .env file (or OS environment) with smart mock_mode auto-dete
 """
 
 import os
+import re
 from dataclasses import dataclass
 from typing import Optional
 
 # ─────────────────────────────────────────────
 # Lightweight .env loader (no external deps)
 # ─────────────────────────────────────────────
-def _load_dotenv(path: str = ".env") -> None:
+def _load_dotenv(path: str = ".env", override: bool = False) -> None:
     """Parse KEY=VALUE lines from the .env file and inject into os.environ."""
     env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), path)
     if not os.path.exists(env_path):
@@ -28,8 +29,12 @@ def _load_dotenv(path: str = ".env") -> None:
             # Strip surrounding quotes if present
             if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
                 value = value[1:-1]
-            if key and key not in os.environ:  # don't override real env vars
+            if key and (override or key not in os.environ or not os.environ[key]):
                 os.environ[key] = value
+
+def reload_dotenv(path: str = ".env") -> None:
+    """Explicitly reloads .env values into os.environ."""
+    _load_dotenv(path=path, override=True)
 
 _load_dotenv()
 
@@ -61,6 +66,52 @@ def _mock_mode(env_var: str, credential_var: str, default: str = "") -> bool:
     if cred:
         return False  # non-empty, non-placeholder → live
     return True  # nothing set → simulation
+
+def normalize_ai_model(provider: str, model_name: Optional[str]) -> str:
+    """Normalizes model names and handles aliases like 'sonnet 5.5', 'claude-3-5-sonnet', etc."""
+    if not model_name:
+        if provider in ("claude", "anthropic"):
+            return "claude-3-5-sonnet-20241022"
+        elif provider == "groq":
+            return "llama-3.3-70b-versatile"
+        return "gpt-4o-mini"
+    
+    cleaned = model_name.strip()
+    low = cleaned.lower().replace("_", "-").replace(".", "-")
+    if provider in ("claude", "anthropic") or "sonnet" in low or "claude" in low:
+        if "3-7" in low:
+            return "claude-3-7-sonnet-20250219" if "2025" not in low else cleaned
+        if "5-5" in low or "3-5" in low or "sonnet" in low:
+            return "claude-3-5-sonnet-20241022" if "2024" not in low and "haiku" not in low and "opus" not in low else cleaned
+        return cleaned
+    return cleaned
+
+class ReminderTemplate(str):
+    """
+    Structured SMS Reminder Template supporting multi-paragraph formatting with blank lines,
+    clean spacing, and property/unit deduplication.
+    """
+    def format(self, *args, **kwargs):
+        prop = str(kwargs.get("property_name", "") or kwargs.get("property_unit", "")).strip()
+        unit = str(kwargs.get("unit_number", "")).strip()
+        if unit:
+            if unit in prop or prop.endswith(unit):
+                unit_fmt = ""
+            elif not unit.startswith(" "):
+                unit_fmt = f" {unit}"
+            else:
+                unit_fmt = unit
+        else:
+            unit_fmt = ""
+
+        kwargs["unit_number"] = unit_fmt
+        kwargs["property_name"] = prop
+        kwargs["property_unit"] = f"{prop}{unit_fmt}".strip()
+
+        res = super().format(*args, **kwargs)
+        res = re.sub(r' for\s+', ' for ', res)
+        res = re.sub(r'\s+was due on', ' was due on', res)
+        return res
 
 @dataclass
 class Settings:
@@ -154,11 +205,33 @@ class Settings:
     )
 
     # ── AI Engine ─────────────────────────────────────────────────────────
+    ANTHROPIC_API_KEY: Optional[str] = os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY") or None
+    CLAUDE_API_KEY: Optional[str] = os.getenv("CLAUDE_API_KEY") or os.getenv("ANTHROPIC_API_KEY") or None
     OPENAI_API_KEY: Optional[str] = os.getenv("OPENAI_API_KEY") or None
     GROQ_API_KEY: Optional[str] = os.getenv("GROQ_API_KEY") or None
-    AI_PROVIDER: str = os.getenv("AI_PROVIDER", "groq" if os.getenv("GROQ_API_KEY") else ("openai" if os.getenv("OPENAI_API_KEY") else "heuristics"))
-    AI_MODEL: str = os.getenv("AI_MODEL", "llama-3.3-70b-versatile" if os.getenv("GROQ_API_KEY") else "gpt-4o-mini")
+    AI_PROVIDER: str = os.getenv(
+        "AI_PROVIDER",
+        "claude" if (os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY"))
+        else ("groq" if os.getenv("GROQ_API_KEY")
+        else ("openai" if os.getenv("OPENAI_API_KEY") else "claude"))
+    )
+    AI_MODEL: str = normalize_ai_model(
+        AI_PROVIDER,
+        os.getenv(
+            "AI_MODEL",
+            "claude-3-5-sonnet-20241022" if AI_PROVIDER in ("claude", "anthropic")
+            else ("llama-3.3-70b-versatile" if AI_PROVIDER == "groq" else "gpt-4o-mini")
+        )
+    )
     AI_CONFIDENCE_THRESHOLD: float = float(os.getenv("AI_CONFIDENCE_THRESHOLD", "0.75"))
+
+    def get_anthropic_key(self) -> Optional[str]:
+        """Dynamically fetch Anthropic/Claude key from environment (reloads .env if empty)."""
+        k = os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY") or self.ANTHROPIC_API_KEY
+        if not k:
+            _load_dotenv()
+            k = os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY")
+        return k.strip() if k else None
 
     # ── Business Rules ────────────────────────────────────────────────────
     GRACE_PERIOD_DAYS: int = int(os.getenv("GRACE_PERIOD_DAYS", "3"))
@@ -168,10 +241,12 @@ class Settings:
     RETRY_BACKOFF_SECONDS: int = int(os.getenv("RETRY_BACKOFF_SECONDS", "300"))
 
     # ── SMS Reminder Template ─────────────────────────────────────────────
-    REMINDER_TEMPLATE: str = (
-        "Hi {tenant_name}, friendly reminder from Red Bricks Property Management: "
-        "Your rent of ${balance:,.2f} for {property_name} {unit_number} was due on {due_date}. "
-        "Please pay via your RentVine portal ({portal_link}) or reply here if you've already sent it. Thank you!"
+    REMINDER_TEMPLATE: ReminderTemplate = ReminderTemplate(
+        "Hi {tenant_name},\n\n"
+        "Friendly reminder from Red Bricks Property Management:\n\n"
+        "Your rent of ${balance:,.2f} for {property_name}{unit_number} was due on {due_date}.\n\n"
+        "Please pay via your RentVine portal ({portal_link}) or reply here if you've already sent it.\n\n"
+        "Thank you!"
     )
 
 settings = Settings()

@@ -35,18 +35,38 @@ class TestBusinessRules(unittest.TestCase):
         self.assertEqual(reason, "Legal hold")
 
     def test_grace_period(self):
-        # Due on Oct 1, grace 3 days -> valid through Oct 4
-        record = RentVineRecord(tenant_id="T-999", balance=1500.0, monthly_rent=1500.0, due_date="2026-10-01")
+        # Rent due on 1st of November
+        record_nov = RentVineRecord(tenant_id="T-NOV", balance=1500.0, monthly_rent=1500.0, due_date="2026-11-01")
         
-        # Day 2: within grace
-        day2 = datetime(2026, 10, 2)
-        in_grace, _ = self.rules.check_grace_period(record, current_date=day2)
-        self.assertTrue(in_grace)
+        # 1. 1st–4th of current month: Within grace period (reminders suppressed)
+        for day in (1, 2, 3, 4):
+            check_date = datetime(2026, 11, day, 10, 0)
+            in_grace, reason = self.rules.check_grace_period(record_nov, current_date=check_date)
+            self.assertTrue(in_grace, f"Day {day} of November should be in grace period")
+            self.assertIn("Within current-month grace period", reason)
 
-        # Day 5: grace period expired
-        day5 = datetime(2026, 10, 5)
-        in_grace, _ = self.rules.check_grace_period(record, current_date=day5)
+        # 2. Starting on the 5th: Grace period expired (reminders can begin)
+        day5 = datetime(2026, 11, 5, 9, 0)
+        in_grace, reason = self.rules.check_grace_period(record_nov, current_date=day5)
+        self.assertFalse(in_grace, "Day 5 of November should not be in grace period")
+        self.assertIn("expired", reason.lower())
+
+        day15 = datetime(2026, 11, 15, 12, 0)
+        in_grace, reason = self.rules.check_grace_period(record_nov, current_date=day15)
         self.assertFalse(in_grace)
+
+        # 3. Overdue rent from previous months: Handled under existing overdue rules
+        # October rent (due 2026-10-01) checked on November 2nd (Day 2 of Nov)
+        record_oct_overdue = RentVineRecord(tenant_id="T-OCT", balance=1200.0, monthly_rent=1200.0, due_date="2026-10-01")
+        nov_day2 = datetime(2026, 11, 2, 14, 0)
+        in_grace, reason = self.rules.check_grace_period(record_oct_overdue, current_date=nov_day2)
+        self.assertFalse(in_grace, "Previous month overdue rent should NOT be suppressed by current month grace period")
+        self.assertIn("previous month", reason.lower())
+
+        # 4. Future rent (e.g. December rent checked in November)
+        record_future = RentVineRecord(tenant_id="T-DEC", balance=1500.0, monthly_rent=1500.0, due_date="2026-12-01")
+        in_grace, reason = self.rules.check_grace_period(record_future, current_date=nov_day2)
+        self.assertTrue(in_grace, "Future rent dues should be suppressed")
 
     def test_existing_promise_in_notes(self):
         future_date = "2026-10-25"

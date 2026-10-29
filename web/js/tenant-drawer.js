@@ -160,7 +160,7 @@ class TenantDrawerController {
             : "margin-right:auto;background:#334155;color:#f1f5f9;padding:10px 14px;border-radius:12px 12px 12px 2px;max-width:85%;margin-bottom:10px;";
           const timeStr = m.timestamp ? m.timestamp.replace("T", " ").substring(0, 16) : "";
           bubble.innerHTML = `
-            <div style="font-size:13px;line-height:1.4;">${m.content}</div>
+            <div style="font-size:13px;line-height:1.55;white-space:pre-wrap;word-break:break-word;">${m.content}</div>
             <div class="bubble-meta" style="font-size:10px;opacity:0.8;margin-top:4px;text-align:right;">${timeStr} • ${m.status || "SENT"}</div>
           `;
           smsContainer.appendChild(bubble);

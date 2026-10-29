@@ -10,6 +10,7 @@ Step 5: Results & Daily Report Summary
 
 import logging
 from datetime import datetime
+from datetime import timedelta
 from typing import List, Optional, Dict, Any
 from src.config import settings
 from src.models import (
@@ -288,7 +289,9 @@ class WorkflowOrchestrator:
             db.save_decision(decision)
             return decision
 
-        # Step 2b: Pull Communication Data (Quo SMS & Gmail)
+        # Step 2b: Pull Communication Data ONLY for confirmed overdue tenants
+        # (Report #72 validation above ensures we only reach here for unpaid rent tenants)
+        logger.debug(f"[SMS Fetch] Fetching conversation history for overdue tenant {tenant.id} ({tenant.full_name})")
         sms_history = self.quo.get_conversation_history(tenant.id, tenant.phone, days=7, reference_time=current_time)
         email_history = self.gmail.get_recent_email_replies(tenant.id, tenant.email, hours=48, reference_time=current_time)
         combined_messages = sms_history + email_history
@@ -376,22 +379,21 @@ class WorkflowOrchestrator:
             db.save_decision(decision)
             return decision
 
-        # Rule 4: Grace Period Check
-        if rv_record:
-            is_in_grace, grace_reason = self.rules.check_grace_period(rv_record, current_time)
-            if is_in_grace:
-                decision = WorkflowDecision(
-                    tenant_id=tenant.id,
-                    tenant_name=tenant.full_name,
-                    property_unit=prop_unit,
-                    balance=balance,
-                    outcome=DecisionOutcome.SKIP_GRACE_PERIOD,
-                    reason=grace_reason,
-                    details={"step": "grace_period_check"},
-                    run_id=run_id
-                )
-                db.save_decision(decision)
-                return decision
+        # Rule 4: Grace Period Check (1st–4th of current month for current-month rent)
+        is_in_grace, grace_reason = self.rules.check_grace_period(rv_record, current_time)
+        if is_in_grace:
+            decision = WorkflowDecision(
+                tenant_id=tenant.id,
+                tenant_name=tenant.full_name,
+                property_unit=prop_unit,
+                balance=balance,
+                outcome=DecisionOutcome.SKIP_GRACE_PERIOD,
+                reason=grace_reason,
+                details={"step": "grace_period_check"},
+                run_id=run_id
+            )
+            db.save_decision(decision)
+            return decision
 
         # Rule 5: Deduplication Check (Has reminder been sent in last 24h?)
         is_dup, last_rem, dedup_reason = self.rules.check_recent_reminder_deduplication(tenant.id, current_time)
@@ -427,6 +429,24 @@ class WorkflowOrchestrator:
             db.save_decision(decision)
             return decision
 
+        # Step 4: Final Payment Status Verification before dispatch
+        # Re-check latest RentVine ledger record to ensure rent remains unpaid
+        verify_rv = self.rentvine.get_tenant_record(tenant.id) or rv_record
+        latest_balance = float(verify_rv.balance if verify_rv else balance)
+        if latest_balance <= 0.0:
+            decision = WorkflowDecision(
+                tenant_id=tenant.id,
+                tenant_name=tenant.full_name,
+                property_unit=prop_unit,
+                balance=0.0,
+                outcome=DecisionOutcome.SKIP_PAID,
+                reason="Payment status verified: balance is $0.00 — rent is already paid in full",
+                details={"step": "pre_dispatch_payment_verification", "balance": 0.0},
+                run_id=run_id
+            )
+            db.save_decision(decision)
+            return decision
+
         # Step 4: Unpaid & Eligible -> Dispatch Quo SMS Reminder
         sms_text = settings.REMINDER_TEMPLATE.format(
             tenant_name=tenant.first_name,
@@ -434,7 +454,7 @@ class WorkflowOrchestrator:
             property_name=tenant.property_name,
             unit_number=tenant.unit_number,
             due_date=rv_record.due_date if rv_record else "1st of the month",
-            portal_link=rv_record.portal_link if rv_record else "https://redbrick.rentvine.com/portal/pay"
+            portal_link=rv_record.portal_link if rv_record else "https://redbricksproperties.rentvine.com/portal/pay"
         )
 
         sms_sent = False

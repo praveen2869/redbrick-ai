@@ -121,5 +121,94 @@ class TestWorkflow(unittest.TestCase):
         self.assertEqual(msgs_t[-1].sender, "(980) 300-7559")
         self.assertEqual(msgs_t[-1].metadata.get("inbox"), "Tenants & Vendors")
 
+    def test_sms_reminder_template_paragraph_formatting(self):
+        """Validates that SMS reminder templates contain blank lines between paragraphs matching WhatsApp layout."""
+        from src.config import settings
+
+        # Kukunoor test case (single address, empty unit)
+        sms_kukunoor = settings.REMINDER_TEMPLATE.format(
+            tenant_name="Kukunoor",
+            balance=1000.0,
+            property_name="8620 Fairgreen Avenue",
+            unit_number="",
+            due_date="2026-10-01",
+            portal_link="https://redbricksproperties.rentvine.com/portal/pay"
+        )
+
+        expected_kukunoor = (
+            "Hi Kukunoor,\n\n"
+            "Friendly reminder from Red Bricks Property Management:\n\n"
+            "Your rent of $1,000.00 for 8620 Fairgreen Avenue was due on 2026-10-01.\n\n"
+            "Please pay via your RentVine portal (https://redbricksproperties.rentvine.com/portal/pay) or reply here if you've already sent it.\n\n"
+            "Thank you!"
+        )
+        self.assertEqual(sms_kukunoor, expected_kukunoor)
+
+        # Tao Peng test case (repeated unit name is cleanly deduplicated)
+        sms_tao = settings.REMINDER_TEMPLATE.format(
+            tenant_name="Tao",
+            balance=2209.0,
+            property_name="Brookdale Village_5601 Stafford Road",
+            unit_number="Brookdale Village_5601 Stafford Road",
+            due_date="2026-10-01",
+            portal_link="https://redbricksproperties.rentvine.com/portal/pay"
+        )
+        self.assertIn("Your rent of $2,209.00 for Brookdale Village_5601 Stafford Road was due on 2026-10-01.", sms_tao)
+        self.assertNotIn("Brookdale Village_5601 Stafford Road Brookdale Village_5601 Stafford Road", sms_tao)
+        self.assertEqual(sms_tao.count("\n\n"), 4)
+
+    def test_current_month_grace_period_and_previous_month_overdue_workflow(self):
+        """
+        Validates workflow logic:
+        1. Nov 1-4: Current month (Nov 1) rent is skipped under grace period.
+        2. Nov 5+: Current month rent is eligible for reminders.
+        3. Nov 1-4: Previous month (Oct 1) overdue rent is NOT skipped by Nov grace period.
+        4. Payment status verification: $0.00 balance is skipped as SKIP_PAID.
+        """
+        from src.database import db
+        from src.models import Tenant, RentVineRecord
+
+        # Setup test tenants
+        # Tenant A: November rent due Nov 1 (current month)
+        t_a = Tenant(id="T-GRACE-NOV", first_name="Grace", last_name="Nov", phone="+17045550001", email="grace@example.com", property_name="Apt 101", unit_number="101")
+        rv_a = RentVineRecord(tenant_id="T-GRACE-NOV", balance=1200.0, monthly_rent=1200.0, due_date="2026-11-01", lease_status="Active")
+        db.upsert_tenant(t_a)
+        db.upsert_rentvine_record(rv_a)
+
+        # Tenant B: October rent due Oct 1 (previous month overdue)
+        t_b = Tenant(id="T-OVERDUE-OCT", first_name="Overdue", last_name="Oct", phone="+17045550002", email="oct@example.com", property_name="Apt 102", unit_number="102")
+        rv_b = RentVineRecord(tenant_id="T-OVERDUE-OCT", balance=950.0, monthly_rent=950.0, due_date="2026-10-01", lease_status="Active")
+        db.upsert_tenant(t_b)
+        db.upsert_rentvine_record(rv_b)
+
+        # Tenant C: Paid in full (balance $0.00)
+        t_c = Tenant(id="T-PAID-ZERO", first_name="Paid", last_name="Full", phone="+17045550003", email="paid@example.com", property_name="Apt 103", unit_number="103")
+        rv_c = RentVineRecord(tenant_id="T-PAID-ZERO", balance=0.0, monthly_rent=1000.0, due_date="2026-11-01", lease_status="Active")
+        db.upsert_tenant(t_c)
+        db.upsert_rentvine_record(rv_c)
+
+        # Run 1: On November 2nd (within Nov 1-4 grace period)
+        nov_2 = datetime(2026, 11, 2, 10, 0)
+        dec_a_nov2 = self.orchestrator._process_tenant(t_a, run_id="run_nov2", is_dry_run=True, current_time=nov_2)
+        dec_b_nov2 = self.orchestrator._process_tenant(t_b, run_id="run_nov2", is_dry_run=True, current_time=nov_2)
+        dec_c_nov2 = self.orchestrator._process_tenant(t_c, run_id="run_nov2", is_dry_run=True, current_time=nov_2)
+
+        # Tenant A (Nov rent) -> in grace period on Nov 2
+        self.assertEqual(dec_a_nov2.outcome, DecisionOutcome.SKIP_GRACE_PERIOD)
+        self.assertIn("grace period", dec_a_nov2.reason.lower())
+
+        # Tenant B (Oct overdue rent) -> NOT suppressed by Nov 1-4 grace period
+        self.assertEqual(dec_b_nov2.outcome, DecisionOutcome.SEND_REMINDER)
+
+        # Tenant C (Paid $0.00) -> SKIP_PAID
+        self.assertEqual(dec_c_nov2.outcome, DecisionOutcome.SKIP_PAID)
+
+        # Run 2: On November 5th (grace period has ended)
+        nov_5 = datetime(2026, 11, 5, 9, 0)
+        dec_a_nov5 = self.orchestrator._process_tenant(t_a, run_id="run_nov5", is_dry_run=True, current_time=nov_5)
+
+        # Tenant A (Nov rent) -> grace period expired on 4th, reminder now eligible on the 5th
+        self.assertEqual(dec_a_nov5.outcome, DecisionOutcome.SEND_REMINDER)
+
 if __name__ == "__main__":
     unittest.main()

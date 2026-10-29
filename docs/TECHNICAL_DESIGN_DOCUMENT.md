@@ -90,7 +90,7 @@ graph TB
     subgraph External Cloud Services
         Ext_RV[RentVine API - Report #72]
         Ext_Quo[OpenPhone API v1]
-        Ext_Groq[Groq / OpenAI LLM Gateway]
+        Ext_LLM[Claude Sonnet / Anthropic / Groq / OpenAI Gateway]
         Ext_Gmail[Google Workspace API]
     end
 
@@ -103,7 +103,7 @@ graph TB
     Workflow_Orch --> Quo_Client
     Workflow_Orch --> RV_Client
     Workflow_Orch --> SQLite
-    AI_Classifier --> Ext_Groq
+    AI_Classifier --> Ext_LLM
     RV_Client --> Ext_RV
     Quo_Client --> Ext_Quo
     Gmail_Client --> Ext_Gmail
@@ -158,7 +158,7 @@ flowchart TD
 - **Rules Evaluated:**
   - `check_paid_status`: Evaluates if overdue balance is `$0.00`. (Note: The previous `$20` minimum threshold has been completely removed; all overdue amounts $\ge \$1.00$ are processed).
   - `check_exclusion_list`: Checks for active litigation holds, bankruptcy flags, section-8 special vouchers, or manual manager exclusions.
-  - `check_grace_period`: Verifies whether current date $\le$ due date + grace period (default: 3 days).
+  - `check_grace_period`: Evaluates monthly grace period (1st–4th of current month suppressed; starting on 5th reminders begin; previous month overdue rent remains eligible under overdue rules).
   - `check_recent_reminder_deduplication`: Enforces 24-hour cooldown between successive reminder dispatches.
   - `is_promise_still_valid`: Verifies if a detected promise date is still in the future.
 
