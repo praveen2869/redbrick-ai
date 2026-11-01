@@ -16,6 +16,30 @@ from src.database import db
 
 logger = logging.getLogger("QuoSMS")
 
+def normalize_phone_e164(phone: Optional[str]) -> Optional[str]:
+    """Normalizes phone numbers like (862) 220-5006 or 862-220-5006 to E.164 (+18622205006)."""
+    if not phone:
+        return None
+    digits = "".join([c for c in str(phone) if c.isdigit()])
+    if len(digits) == 10:
+        return f"+1{digits}"
+    elif len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}"
+    elif len(digits) > 7:
+        return f"+{digits}"
+    return None
+
+def phone_to_10digit(phone: Optional[str]) -> Optional[str]:
+    """Extracts trailing 10 digits for invariant matching."""
+    if not phone:
+        return None
+    digits = "".join([c for c in str(phone) if c.isdigit()])
+    return digits[-10:] if len(digits) >= 10 else (digits if digits else None)
+
+class QuoApiError(Exception):
+    """Raised when Quo/OpenPhone API retrieval fails."""
+    pass
+
 class QuoSMSClient:
     """
     Client for Quo (formerly OpenPhone) REST API.
@@ -106,11 +130,79 @@ class QuoSMSClient:
             "status": "REMINDER_NEEDED_SUPPRESSED"
         }
 
-    def get_conversation_history(self, tenant_id: str, phone_number: str, days: int = 7, reference_time: Optional[datetime] = None) -> List[CommunicationMessage]:
+
+    def get_conversation_history(
+        self,
+        tenant_id: str,
+        phone_number: str,
+        days: int = 7,
+        reference_time: Optional[datetime] = None,
+        phone_number_id: Optional[str] = None
+    ) -> List[CommunicationMessage]:
         """
         Retrieves the last `days` days of SMS conversation with this tenant.
+        When live mode is enabled, queries OpenPhone REST API for participant messages,
+        persists them to the local database, and returns the chronological history.
         """
-        messages = db.get_messages_for_tenant(tenant_id)
+        # Fetch live OpenPhone messages when live mode is active
+        if not self.mock_mode and self.api_key and phone_number:
+            e164 = normalize_phone_e164(phone_number)
+            if e164:
+                import urllib.parse
+                auth = self.api_key if self.api_key.startswith("Bearer ") else f"Bearer {self.api_key}"
+                headers = {
+                    "Authorization": auth,
+                    "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                }
+                target_pid = phone_number_id or settings.QUO_PHONE_TENANTS_ID
+                encoded_p = urllib.parse.quote(e164)
+                url = f"{self.api_url}/messages?phoneNumberId={target_pid}&participants[]={encoded_p}&maxResults=20"
+                
+                try:
+                    req = urllib.request.Request(url, headers=headers)
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        raw_msgs = data.get("data", []) or []
+                        for rm in raw_msgs:
+                            msg_id = rm.get("id") or f"openphone_{int(datetime.utcnow().timestamp()*1000)}"
+                            is_inc = (rm.get("direction") == "incoming")
+                            content = rm.get("text") or rm.get("body") or ""
+                            created_ts = rm.get("createdAt") or datetime.utcnow().isoformat()
+                            status = (rm.get("status") or "delivered").upper()
+                            sender_val = rm.get("from") or ""
+                            to_list = rm.get("to") or []
+                            recipient_val = to_list[0] if to_list else ""
+                            
+                            c_msg = CommunicationMessage(
+                                id=msg_id,
+                                tenant_id=tenant_id,
+                                channel=Channel.SMS,
+                                direction=MessageDirection.INBOUND if is_inc else MessageDirection.OUTBOUND,
+                                sender=sender_val,
+                                recipient=recipient_val,
+                                content=content,
+                                timestamp=created_ts,
+                                status=status,
+                                metadata={
+                                    "source": "OpenPhone REST API",
+                                    "phoneNumberId": rm.get("phoneNumberId"),
+                                    "conversationId": rm.get("conversationId"),
+                                    "userId": rm.get("userId")
+                                }
+                            )
+                            db.save_message(c_msg)
+                except urllib.error.HTTPError as he:
+                    logger.error(f"[Quo] HTTP error {he.code} fetching messages for {e164}: {he}")
+                    raise QuoApiError(f"Quo API error {he.code}: {he}")
+                except Exception as e:
+                    logger.error(f"[Quo] Network error fetching messages for {e164}: {e}")
+                    raise QuoApiError(f"Quo API retrieval failed: {e}")
+
+        # Retrieve messages for this tenant or matching phone
+        p10 = phone_to_10digit(phone_number)
+        messages = db.get_messages_for_tenant_or_phone(tenant_id, p10)
+
         # Filter to SMS and within time window
         now = reference_time or datetime.utcnow()
         cutoff = now - timedelta(days=days)
@@ -120,6 +212,8 @@ class QuoSMSClient:
             m for m in messages
             if m.channel == Channel.SMS and m.timestamp >= cutoff_iso
         ]
+        # Sort chronologically
+        sms_history.sort(key=lambda m: m.timestamp)
         return sms_history
 
     def receive_inbound_sms(self, tenant_id: str, from_number: str, text: str, recipient_type: str = "tenant") -> CommunicationMessage:

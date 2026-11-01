@@ -51,6 +51,7 @@ class RentVineRecord:
     notes: List[RentVineNote] = field(default_factory=list)
     portal_link: str = "https://redbrick.rentvine.com/portal/pay"
     lease_status: str = "ACTIVE"
+    follow_up_notes: Optional[str] = None
 
 @dataclass
 class Tenant:

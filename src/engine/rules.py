@@ -145,64 +145,158 @@ class BusinessRulesEngine:
         self, tenant_id: str, current_time: Optional[datetime] = None
     ) -> Tuple[bool, Optional[WorkflowDecision], str]:
         """
-        Rule 4: Prevent duplicate SMS reminders sent within the deduplication window (e.g. 24 hours).
+        Rule 4: Deduplication & Cooldown Rule.
+        Cooldown is triggered EXCLUSIVELY by workflow-generated rent reminders.
+        - When a workflow-generated rent reminder is sent today, put that tenant into cooldown
+          for the remainder of that day.
+        - The next morning (now.date() > reminder.date()), automatically reactivate the tenant
+          for reminder eligibility, provided they still have an outstanding balance.
+        - If no workflow-generated reminder was sent, do not activate cooldown.
         """
         now = current_time or datetime.utcnow()
+        if now.tzinfo is not None:
+            now = now.replace(tzinfo=None)
         last_reminder = db.get_last_successful_reminder(tenant_id)
 
         if not last_reminder:
-            return False, None, "No previous reminders on record"
+            return False, None, "No workflow-generated rent reminders on record"
 
         try:
-            last_ts = datetime.fromisoformat(last_reminder.timestamp)
+            last_ts = datetime.fromisoformat(last_reminder.timestamp.replace("Z", "+00:00"))
+            if last_ts.tzinfo is not None:
+                last_ts = last_ts.replace(tzinfo=None)
         except Exception:
-            return False, None, "Could not parse previous timestamp"
+            return False, None, "Could not parse previous reminder timestamp"
 
-        elapsed = now - last_ts
-        hours_elapsed = abs(elapsed.total_seconds()) / 3600.0
-
-        if hours_elapsed < self.dedup_window_hours:
-            remaining_hours = self.dedup_window_hours - hours_elapsed
+        # Check calendar day: Reminder was sent today?
+        if last_ts.date() == now.date():
+            elapsed = now - last_ts
+            hours_elapsed = max(0.0, elapsed.total_seconds() / 3600.0)
+            end_of_day = datetime(now.year, now.month, now.day, 23, 59, 59)
+            hours_remaining = max(0.0, (end_of_day - now).total_seconds() / 3600.0)
             return (
                 True,
                 last_reminder,
-                f"Reminder already sent {hours_elapsed:.1f}h ago (Deduplication lock active for {remaining_hours:.1f}h)"
+                f"Workflow rent reminder sent today ({hours_elapsed:.1f}h ago at {last_ts.strftime('%I:%M %p')}). "
+                f"Cooldown active for remainder of day ({hours_remaining:.1f}h remaining until morning reactivation)"
             )
+        elif last_ts.date() < now.date():
+            # Sent on a previous day -> automatically reactivate the next morning
+            return (
+                False,
+                last_reminder,
+                f"Previous workflow reminder sent on {last_ts.strftime('%Y-%m-%d')} (Reactivated for morning reminder eligibility)"
+            )
+        else:
+            # Future timestamp edge case
+            return True, last_reminder, "Workflow rent reminder sent today (Cooldown active)"
 
-        return False, last_reminder, f"Last reminder was {hours_elapsed:.1f}h ago (outside 24h window)"
+    def check_manual_review_in_notes(
+        self, record: Optional[RentVineRecord], raw_text: Optional[str] = None
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Rule: Check if RentVine Follow-Up Notes (or internal notes) contains 'Manual Review' (case-insensitive).
+        If present:
+        - Automatically move the tenant to Manual Review / Disputes.
+        - Disable automated rent reminders.
+        - Keep tracking balances, lease details, and SMS history.
+        """
+        candidates = []
+        if raw_text and raw_text.strip():
+            candidates.append(raw_text.strip())
+        if record:
+            if record.follow_up_notes and record.follow_up_notes.strip():
+                candidates.append(record.follow_up_notes.strip())
+            if record.notes:
+                for n in record.notes:
+                    if n.text and n.text.strip():
+                        candidates.append(n.text.strip())
+
+        for text in candidates:
+            if "manual review" in text.lower():
+                return True, "Follow-Up Notes contains 'Manual Review' in RentVine — automated reminders disabled for staff review"
+
+        return False, None
 
     def check_existing_promise_in_notes(
-        self, record: Optional[RentVineRecord], current_time: Optional[datetime] = None
+        self, record: Optional[RentVineRecord], current_time: Optional[datetime] = None, raw_follow_up: Optional[str] = None
     ) -> Tuple[bool, Optional[str], Optional[str]]:
         """
-        Rule 5: Check RentVine notes for a logged payment promise that hasn't expired.
-        Format in notes: [AI PROMISE ON FILE: Will pay by YYYY-MM-DD]
+        Rule 5: Check RentVine notes and Follow-Up Notes for a logged payment promise that hasn't expired.
+        Supports:
+        - [AI PROMISE ON FILE: Will pay by YYYY-MM-DD]
+        - Standard notes: will pay by YYYY-MM-DD
+        - Follow-Up Notes date commitments: MM/DD/YYYY - ...
+        - Promises like: Rent will be paid by MM/DD
         """
-        if not record or not record.notes:
+        candidates = []
+        if raw_follow_up and raw_follow_up.strip():
+            candidates.append((raw_follow_up.strip(), "RentVine Follow-Up Notes"))
+        if record:
+            if record.follow_up_notes and record.follow_up_notes.strip():
+                candidates.append((record.follow_up_notes.strip(), "RentVine Follow-Up Notes"))
+            if record.notes:
+                for note in record.notes:
+                    if note.text and note.text.strip():
+                        candidates.append((note.text.strip(), f"Note by {note.author}"))
+
+        if not candidates:
             return False, None, "No active payment promise recorded in notes"
 
         now = (current_time or datetime.utcnow()).date()
-        date_pattern = re.compile(r"will pay by\s+(\d{4}-\d{2}-\d{2})", re.IGNORECASE)
+        date_iso_pattern = re.compile(r"will pay by\s+(\d{4}-\d{2}-\d{2})", re.IGNORECASE)
+        date_us_pattern = re.compile(r"(?:will (?:be )?paid by|pay by|promise(?:d)? by)\s+(\d{1,2}/\d{1,2}(?:/\d{2,4})?)", re.IGNORECASE)
+        leading_date_pattern = re.compile(r"^(\d{1,2}/\d{1,2}/\d{4})\s*-\s*", re.IGNORECASE)
 
-        for note in record.notes:
-            match = date_pattern.search(note.text)
-            if match:
-                promise_date_str = match.group(1)
+        for text, source in candidates:
+            # 1. ISO format: will pay by YYYY-MM-DD
+            m_iso = date_iso_pattern.search(text)
+            if m_iso:
+                promise_date_str = m_iso.group(1)
                 try:
                     p_date = datetime.strptime(promise_date_str, "%Y-%m-%d").date()
                     if p_date >= now:
-                        return (
-                            True,
-                            promise_date_str,
-                            f"Active promise on file in RentVine notes to pay by {promise_date_str} (Author: {note.author})"
-                        )
+                        return True, promise_date_str, f"Active promise on file in {source} to pay by {promise_date_str}"
                     else:
-                        return (
-                            False,
-                            promise_date_str,
-                            f"Prior payment promise expired on {promise_date_str}"
-                        )
+                        return False, promise_date_str, f"Prior payment promise expired on {promise_date_str}"
                 except Exception:
-                    continue
+                    pass
+
+            # 2. Leading date in Follow-Up Notes: e.g. "10/31/2026 - Owner-approved extension..."
+            m_lead = leading_date_pattern.search(text)
+            if m_lead:
+                lead_str = m_lead.group(1)
+                try:
+                    p_date = datetime.strptime(lead_str, "%m/%d/%Y").date()
+                    p_iso = p_date.strftime("%Y-%m-%d")
+                    # Only hold if the text actually references a hold, promise, extension, or recheck
+                    text_lower = text.lower()
+                    if any(kw in text_lower for kw in ("hold", "extension", "promise", "plans", "pay remainder", "resubmit")):
+                        if p_date >= now:
+                            return True, p_iso, f"Active payment commitment/extension in {source} until {p_iso}"
+                        else:
+                            return False, p_iso, f"Prior payment follow-up deadline expired on {p_iso}"
+                except Exception:
+                    pass
+
+            # 3. US date format: will be paid by M/D or M/D/YYYY
+            m_us = date_us_pattern.search(text)
+            if m_us:
+                us_str = m_us.group(1)
+                try:
+                    parts = us_str.split("/")
+                    month = int(parts[0])
+                    day = int(parts[1])
+                    year = int(parts[2]) if len(parts) > 2 else now.year
+                    if year < 100:
+                        year += 2000
+                    p_date = datetime(year, month, day).date()
+                    p_iso = p_date.strftime("%Y-%m-%d")
+                    if p_date >= now:
+                        return True, p_iso, f"Active promise on file in {source} to pay by {p_iso}"
+                    else:
+                        return False, p_iso, f"Prior payment promise expired on {p_iso}"
+                except Exception:
+                    pass
 
         return False, None, "No active payment promise recorded in notes"

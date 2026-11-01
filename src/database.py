@@ -56,10 +56,17 @@ class Database:
                 last_payment_amount REAL DEFAULT 0.0,
                 portal_link TEXT,
                 lease_status TEXT DEFAULT 'ACTIVE',
+                follow_up_notes TEXT,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY (tenant_id) REFERENCES tenants(id)
             )
             """)
+
+            # Migration: ensure follow_up_notes column exists on rentvine_records
+            cursor.execute("PRAGMA table_info(rentvine_records)")
+            existing_cols = [c[1] for c in cursor.fetchall()]
+            if "follow_up_notes" not in existing_cols:
+                cursor.execute("ALTER TABLE rentvine_records ADD COLUMN follow_up_notes TEXT")
 
             # 3. RentVine notes table
             cursor.execute("""
@@ -146,13 +153,34 @@ class Database:
             )
             """)
 
+            # 8. Workflow-generated rent reminders tracking table (for strict cooldown & deduplication)
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS workflow_reminders (
+                id TEXT PRIMARY KEY,
+                reminder_id TEXT NOT NULL,
+                workflow_id TEXT,
+                tenant_id TEXT NOT NULL,
+                reminder_type TEXT NOT NULL DEFAULT 'RENT_REMINDER',
+                message_id TEXT NOT NULL,
+                phone TEXT NOT NULL,
+                content TEXT NOT NULL,
+                sender_phone TEXT,
+                delivery_status TEXT NOT NULL,
+                sent_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+            )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_workflow_reminders_tenant ON workflow_reminders (tenant_id, reminder_type, sent_at DESC)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_workflow_reminders_msg_id ON workflow_reminders (message_id)")
+
             conn.commit()
 
     def reset_database(self):
         """Clears all records from tables to reseed cleanly."""
         with self.get_connection() as conn:
             for table in [
-                "workflow_decisions", "daily_runs", "retry_queue",
+                "workflow_decisions", "daily_runs", "retry_queue", "workflow_reminders",
                 "communication_messages", "rentvine_notes", "rentvine_records", "tenants"
             ]:
                 conn.execute(f"DELETE FROM {table}")
@@ -184,8 +212,8 @@ class Database:
     def upsert_rentvine_record(self, record: RentVineRecord):
         with self.get_connection() as conn:
             conn.execute("""
-            INSERT INTO rentvine_records (tenant_id, balance, monthly_rent, due_date, last_payment_date, last_payment_amount, portal_link, lease_status, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO rentvine_records (tenant_id, balance, monthly_rent, due_date, last_payment_date, last_payment_amount, portal_link, lease_status, follow_up_notes, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(tenant_id) DO UPDATE SET
                 balance=excluded.balance,
                 monthly_rent=excluded.monthly_rent,
@@ -194,11 +222,12 @@ class Database:
                 last_payment_amount=excluded.last_payment_amount,
                 portal_link=excluded.portal_link,
                 lease_status=excluded.lease_status,
+                follow_up_notes=excluded.follow_up_notes,
                 updated_at=excluded.updated_at
             """, (
                 record.tenant_id, record.balance, record.monthly_rent,
                 record.due_date, record.last_payment_date, record.last_payment_amount,
-                record.portal_link, record.lease_status, datetime.utcnow().isoformat()
+                record.portal_link, record.lease_status, record.follow_up_notes, datetime.utcnow().isoformat()
             ))
             conn.commit()
 
@@ -258,8 +287,8 @@ class Database:
             ])
 
             conn.executemany("""
-            INSERT INTO rentvine_records (tenant_id, balance, monthly_rent, due_date, last_payment_date, last_payment_amount, portal_link, lease_status, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO rentvine_records (tenant_id, balance, monthly_rent, due_date, last_payment_date, last_payment_amount, portal_link, lease_status, follow_up_notes, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(tenant_id) DO UPDATE SET
                 balance=excluded.balance,
                 monthly_rent=excluded.monthly_rent,
@@ -268,12 +297,13 @@ class Database:
                 last_payment_amount=excluded.last_payment_amount,
                 portal_link=excluded.portal_link,
                 lease_status=excluded.lease_status,
+                follow_up_notes=excluded.follow_up_notes,
                 updated_at=excluded.updated_at
             """, [
                 (
                     r.tenant_id, r.balance, r.monthly_rent,
                     r.due_date, r.last_payment_date, r.last_payment_amount,
-                    r.portal_link, r.lease_status, now_str
+                    r.portal_link, r.lease_status, r.follow_up_notes, now_str
                 ) for r in records
             ])
             conn.commit()
@@ -372,7 +402,8 @@ class Database:
                 last_payment_amount=row["last_payment_amount"],
                 notes=notes,
                 portal_link=row["portal_link"],
-                lease_status=row["lease_status"]
+                lease_status=row["lease_status"],
+                follow_up_notes=row["follow_up_notes"] if "follow_up_notes" in row.keys() else None
             )
 
     # --- Communication Messages (SMS / Email) ---
@@ -399,6 +430,49 @@ class Database:
             ORDER BY timestamp ASC
             LIMIT ?
             """, (tenant_id, limit))
+            rows = cursor.fetchall()
+            messages = []
+            for r in rows:
+                try:
+                    meta = json.loads(r["metadata_json"])
+                except Exception:
+                    meta = {}
+                messages.append(
+                    CommunicationMessage(
+                        id=r["id"],
+                        tenant_id=r["tenant_id"],
+                        channel=Channel(r["channel"]),
+                        direction=MessageDirection(r["direction"]),
+                        sender=r["sender"],
+                        recipient=r["recipient"],
+                        content=r["content"],
+                        timestamp=r["timestamp"],
+                        status=r["status"],
+                        metadata=meta
+                    )
+                )
+            return messages
+
+    def get_messages_for_tenant_or_phone(self, tenant_id: str, phone: Optional[str] = None, limit: int = 50) -> List[CommunicationMessage]:
+        """Resiliently retrieves messages by tenant_id OR 10-digit phone number match."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            if phone:
+                clean_digits = "".join([c for c in phone if c.isdigit()])
+                suffix = f"%{clean_digits[-10:]}" if len(clean_digits) >= 10 else f"%{clean_digits}%"
+                cursor.execute("""
+                SELECT * FROM communication_messages
+                WHERE tenant_id = ? OR recipient LIKE ? OR sender LIKE ?
+                ORDER BY timestamp ASC
+                LIMIT ?
+                """, (tenant_id, suffix, suffix, limit))
+            else:
+                cursor.execute("""
+                SELECT * FROM communication_messages
+                WHERE tenant_id = ?
+                ORDER BY timestamp ASC
+                LIMIT ?
+                """, (tenant_id, limit))
             rows = cursor.fetchall()
             messages = []
             for r in rows:
@@ -464,45 +538,156 @@ class Database:
 
     # --- Deduplication & Decision Tracking ---
 
+    def record_workflow_reminder(
+        self,
+        reminder_id: str,
+        tenant_id: str,
+        message_id: str,
+        phone: str,
+        content: str,
+        sender_phone: str,
+        delivery_status: str,
+        sent_at: str,
+        workflow_id: Optional[str] = None,
+        reminder_type: str = "RENT_REMINDER"
+    ):
+        """
+        Records a workflow-generated rent reminder delivery record in workflow_reminders.
+        Associates each queued draft (reminder_id, workflow_id) with its actual Quo delivery record.
+        Tracks tenant_id, message_id, reminder_type, sending timestamp (sent_at), and delivery_status.
+        """
+        with self.get_connection() as conn:
+            conn.execute("""
+            INSERT INTO workflow_reminders (
+                id, reminder_id, workflow_id, tenant_id, reminder_type,
+                message_id, phone, content, sender_phone, delivery_status,
+                sent_at, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                delivery_status=excluded.delivery_status,
+                sent_at=excluded.sent_at
+            """, (
+                reminder_id,
+                reminder_id,
+                workflow_id,
+                tenant_id,
+                reminder_type,
+                message_id,
+                phone,
+                content,
+                sender_phone,
+                delivery_status,
+                sent_at,
+                datetime.utcnow().isoformat()
+            ))
+            conn.commit()
+
+    def get_workflow_reminders(self, tenant_id: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+        """Returns recorded workflow reminders, optionally filtered by tenant_id."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            if tenant_id:
+                cursor.execute("""
+                SELECT * FROM workflow_reminders
+                WHERE tenant_id = ?
+                ORDER BY sent_at DESC LIMIT ?
+                """, (tenant_id, limit))
+            else:
+                cursor.execute("""
+                SELECT * FROM workflow_reminders
+                ORDER BY sent_at DESC LIMIT ?
+                """, (limit,))
+            return [dict(r) for r in cursor.fetchall()]
+
     def get_last_successful_reminder(self, tenant_id: str) -> Optional[WorkflowDecision]:
         """
-        Finds the most recent reminder sent to this tenant to prevent duplicate messages.
-        Cooldown is ONLY active once a reminder was ACTUALLY dispatched (SENT_HITL_APPROVED, DELIVERED, or SENT).
+        Finds the most recent workflow-generated rent reminder sent to this tenant.
+        Cooldown is triggered EXCLUSIVELY by workflow-generated rent-reminder messages.
+        Normal conversations ("Hi", "Hello"), manually typed messages, greetings, maintenance
+        updates, or unrelated SMS communications must NOT trigger cooldown.
         """
         with self.get_connection() as conn:
             cursor = conn.cursor()
+            # 1. Primary source: explicitly tracked workflow_reminders table
             cursor.execute("""
-            SELECT * FROM communication_messages
-            WHERE tenant_id = ? AND direction = 'OUTBOUND' 
-              AND status IN ('SENT_HITL_APPROVED', 'DELIVERED', 'SENT')
-            ORDER BY timestamp DESC
+            SELECT * FROM workflow_reminders
+            WHERE tenant_id = ?
+              AND reminder_type = 'RENT_REMINDER'
+              AND delivery_status IN ('SENT_HITL_APPROVED', 'DELIVERED', 'SENT')
+            ORDER BY sent_at DESC
             LIMIT 1
             """, (tenant_id,))
-            msg_row = cursor.fetchone()
-            if msg_row:
+            w_row = cursor.fetchone()
+            if w_row:
                 return WorkflowDecision(
                     tenant_id=tenant_id,
                     tenant_name=tenant_id,
                     property_unit="",
                     balance=0.0,
                     outcome=DecisionOutcome.SEND_REMINDER,
-                    reason=f"Actual Reminder SMS dispatched ({msg_row['status']})",
-                    details={"message_id": msg_row["id"], "content": msg_row["content"]},
+                    reason=f"Workflow rent reminder dispatched ({w_row['delivery_status']})",
+                    details={
+                        "reminder_id": w_row["reminder_id"],
+                        "reminder_type": w_row["reminder_type"],
+                        "workflow_id": w_row["workflow_id"],
+                        "message_id": w_row["message_id"],
+                        "content": w_row["content"],
+                        "phone": w_row["phone"],
+                        "delivery_status": w_row["delivery_status"],
+                        "is_workflow_reminder": True
+                    },
+                    timestamp=w_row["sent_at"],
+                    sms_sent=True,
+                    sms_message_id=w_row["message_id"],
+                    note_written=False,
+                    run_id=w_row["workflow_id"] or "workflow_dispatch"
+                )
+
+            # 2. Check communication_messages ONLY if metadata specifically identifies it as a workflow reminder
+            cursor.execute("""
+            SELECT * FROM communication_messages
+            WHERE tenant_id = ? AND direction = 'OUTBOUND' 
+              AND status IN ('SENT_HITL_APPROVED', 'DELIVERED', 'SENT')
+              AND (metadata_json LIKE '%"is_workflow_reminder": true%' 
+                   OR metadata_json LIKE '%"reminder_type": "RENT_REMINDER"%')
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """, (tenant_id,))
+            msg_row = cursor.fetchone()
+            if msg_row:
+                meta = json.loads(msg_row["metadata_json"]) if msg_row["metadata_json"] else {}
+                return WorkflowDecision(
+                    tenant_id=tenant_id,
+                    tenant_name=tenant_id,
+                    property_unit="",
+                    balance=0.0,
+                    outcome=DecisionOutcome.SEND_REMINDER,
+                    reason=f"Workflow Reminder SMS dispatched ({msg_row['status']})",
+                    details=meta,
                     timestamp=msg_row["timestamp"],
                     sms_sent=True,
                     sms_message_id=msg_row["id"],
                     note_written=False,
-                    run_id="actual_dispatch"
+                    run_id=meta.get("workflow_id", "workflow_dispatch")
                 )
-            # Fallback: check workflow_decisions with sms_sent=1
+
+            # 3. Fallback: check workflow_decisions with sms_sent=1 from actual workflow runs or HITL
+            # (exclude legacy 'actual_dispatch' pseudo-decisions created from arbitrary chats)
             cursor.execute("""
             SELECT * FROM workflow_decisions
-            WHERE tenant_id = ? AND sms_sent = 1
+            WHERE tenant_id = ? AND sms_sent = 1 AND outcome = 'SEND_REMINDER'
+              AND run_id != 'actual_dispatch'
+              AND (details_json LIKE '%is_workflow_reminder%' 
+                   OR details_json LIKE '%RENT_REMINDER%'
+                   OR run_id = 'run_prior_batch'
+                   OR run_id LIKE 'hitl_%')
             ORDER BY timestamp DESC
             LIMIT 1
             """, (tenant_id,))
             dec_row = cursor.fetchone()
             if dec_row:
+                details = json.loads(dec_row["details_json"]) if dec_row["details_json"] else {}
                 return WorkflowDecision(
                     tenant_id=tenant_id,
                     tenant_name=dec_row["tenant_name"],
@@ -510,7 +695,7 @@ class Database:
                     balance=dec_row["balance"],
                     outcome=DecisionOutcome(dec_row["outcome"]),
                     reason=dec_row["reason"],
-                    details=json.loads(dec_row["details_json"]) if dec_row["details_json"] else {},
+                    details=details,
                     timestamp=dec_row["timestamp"],
                     sms_sent=bool(dec_row["sms_sent"]),
                     sms_message_id=dec_row["sms_message_id"],
@@ -519,6 +704,28 @@ class Database:
                 )
 
             return None
+
+    def cleanup_invalid_cooldown_decisions(self):
+        """
+        Removes any stale SKIP_ALREADY_REMINDED decisions from workflow_decisions
+        if the tenant has no actual workflow-generated rent reminders on record.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+            SELECT id, tenant_id FROM workflow_decisions
+            WHERE outcome = 'SKIP_ALREADY_REMINDED'
+            """)
+            rows = cursor.fetchall()
+            stale_ids = []
+            for r in rows:
+                tid = r["tenant_id"]
+                if self.get_last_successful_reminder(tid) is None:
+                    stale_ids.append(r["id"])
+            if stale_ids:
+                placeholders = ",".join("?" for _ in stale_ids)
+                cursor.execute(f"DELETE FROM workflow_decisions WHERE id IN ({placeholders})", stale_ids)
+                conn.commit()
 
     def save_decision(self, decision: WorkflowDecision):
         with self.get_connection() as conn:

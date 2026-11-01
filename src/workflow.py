@@ -194,19 +194,37 @@ class WorkflowOrchestrator:
         rv_record = self.rentvine.get_tenant_record(tenant.id)
         balance = rv_record.balance if rv_record else 0.0
         prop_unit = f"{tenant.property_name} {tenant.unit_number}"
+        report_rec = None
 
         # ─── Report #72 Source of Truth Validation ───
         if report_lookup:
-            report_rec = None
             clean_phone = "".join([c for c in (tenant.phone or "") if c.isdigit()])
             if clean_phone and clean_phone[-10:] in report_lookup:
                 report_rec = report_lookup[clean_phone[-10:]]
+            elif tenant.id.startswith("RV-") and tenant.id.replace("RV-", "") in report_lookup:
+                report_rec = report_lookup[tenant.id.replace("RV-", "")]
             elif tenant.id.startswith("rv_lease_") and tenant.id.replace("rv_lease_", "") in report_lookup:
                 report_rec = report_lookup[tenant.id.replace("rv_lease_", "")]
             elif tenant.full_name.strip().lower() in report_lookup:
                 report_rec = report_lookup[tenant.full_name.strip().lower()]
 
             if not report_rec:
+                # Safeguard: If tenant has Manual Review in Follow-Up Notes, always preserve Manual Review!
+                fu_text = getattr(rv_record, "follow_up_notes", "") or ""
+                if (tenant.is_excluded and "manual review" in (tenant.exclusion_reason or "").lower()) or "manual review" in fu_text.lower():
+                    decision = WorkflowDecision(
+                        tenant_id=tenant.id,
+                        tenant_name=tenant.full_name,
+                        property_unit=prop_unit,
+                        balance=balance,
+                        outcome=DecisionOutcome.FLAG_MANUAL_REVIEW,
+                        reason="Follow-Up Notes contains 'Manual Review' in RentVine — automated reminders disabled for staff review",
+                        details={"step": "manual_review_safeguard", "action": "Manual Review / Disputes", "follow_up_notes": fu_text},
+                        run_id=run_id
+                    )
+                    db.save_decision(decision)
+                    return decision
+
                 # Strictly excluded: Tenant is not listed in Report #72
                 decision = WorkflowDecision(
                     tenant_id=tenant.id,
@@ -257,7 +275,32 @@ class WorkflowOrchestrator:
             db.save_decision(decision)
             return decision
 
-        # Rule 2: Manual Exclusion Check
+        # Rule 1b: Follow-Up Notes Manual Review Check (RentVine Source of Truth)
+        fu_text = (report_rec.get("follow_up_notes") if report_rec else None) or (rv_record.follow_up_notes if rv_record else "")
+        has_mr, mr_reason = self.rules.check_manual_review_in_notes(rv_record, raw_text=fu_text)
+        if has_mr:
+            decision = WorkflowDecision(
+                tenant_id=tenant.id,
+                tenant_name=tenant.full_name,
+                property_unit=prop_unit,
+                balance=balance,
+                outcome=DecisionOutcome.FLAG_MANUAL_REVIEW,
+                reason=mr_reason,
+                details={"step": "follow_up_notes_manual_review", "action": "Manual Review / Disputes", "follow_up_notes": fu_text},
+                run_id=run_id
+            )
+            db.save_decision(decision)
+            return decision
+
+        # If Manual Review was previously stored on the tenant but has now been removed/cleared in RentVine,
+        # dynamically restore the tenant's normal reminder eligibility!
+        if tenant.is_excluded and "manual review" in (tenant.exclusion_reason or "").lower():
+            if not has_mr:
+                tenant.is_excluded = False
+                tenant.exclusion_reason = None
+                db.upsert_tenant(tenant)
+
+        # Rule 2: Manual Exclusion Check (Legal dispute / outside PM handling)
         is_excluded, excl_reason = self.rules.check_exclusion_list(tenant)
         if is_excluded:
             decision = WorkflowDecision(
@@ -273,8 +316,10 @@ class WorkflowOrchestrator:
             db.save_decision(decision)
             return decision
 
-        # Rule 3: Check existing active promise in RentVine notes
-        has_note_promise, note_pdate, note_preason = self.rules.check_existing_promise_in_notes(rv_record, current_time)
+        # Rule 3: Check existing active promise in RentVine notes and Follow-Up Notes
+        has_note_promise, note_pdate, note_preason = self.rules.check_existing_promise_in_notes(
+            rv_record, current_time, raw_follow_up=fu_text
+        )
         if has_note_promise:
             decision = WorkflowDecision(
                 tenant_id=tenant.id,
@@ -283,7 +328,7 @@ class WorkflowOrchestrator:
                 balance=balance,
                 outcome=DecisionOutcome.HOLD_PROMISE,
                 reason=note_preason,
-                details={"step": "active_note_promise", "promise_date": note_pdate},
+                details={"step": "active_note_promise", "promise_date": note_pdate, "follow_up_notes": fu_text},
                 run_id=run_id
             )
             db.save_decision(decision)
@@ -292,7 +337,28 @@ class WorkflowOrchestrator:
         # Step 2b: Pull Communication Data ONLY for confirmed overdue tenants
         # (Report #72 validation above ensures we only reach here for unpaid rent tenants)
         logger.debug(f"[SMS Fetch] Fetching conversation history for overdue tenant {tenant.id} ({tenant.full_name})")
-        sms_history = self.quo.get_conversation_history(tenant.id, tenant.phone, days=7, reference_time=current_time)
+        quo_fetch_failed = False
+        try:
+            sms_history = self.quo.get_conversation_history(tenant.id, tenant.phone, days=7, reference_time=current_time)
+        except Exception as e:
+            logger.error(f"[Quo Retrieval Error] Could not fetch SMS for {tenant.id} ({tenant.phone}): {e}")
+            quo_fetch_failed = True
+            sms_history = []
+
+        if quo_fetch_failed:
+            decision = WorkflowDecision(
+                tenant_id=tenant.id,
+                tenant_name=tenant.full_name,
+                property_unit=prop_unit,
+                balance=balance,
+                outcome=DecisionOutcome.FLAG_MANUAL_REVIEW,
+                reason="Quo SMS retrieval failed — reminder held to prevent sending reminder while payment commitment is unverified",
+                details={"step": "quo_api_failure", "phone": tenant.phone},
+                run_id=run_id
+            )
+            db.save_decision(decision)
+            return decision
+
         email_history = self.gmail.get_recent_email_replies(tenant.id, tenant.email, hours=48, reference_time=current_time)
         combined_messages = sms_history + email_history
 
@@ -302,34 +368,44 @@ class WorkflowOrchestrator:
         # AI Outcome A: PROMISE_MADE
         if ai_result.intent == IntentType.PROMISE_MADE:
             promise_date = ai_result.extracted_date or (current_time.date() + timedelta(days=3)).strftime("%Y-%m-%d")
-            note_text = (
-                f"[AI PAYMENT PROMISE ON FILE: Will pay by {promise_date}] "
-                f"Tenant confirmed via {ai_result.source_channel.value}: \"{ai_result.raw_text}\""
-            )
-            # Write back note to RentVine MCP
-            if not is_dry_run:
-                self.rentvine.write_tenant_note(tenant.id, note_text, author="AI Rent Reminder Agent")
+            today_str = current_time.strftime("%Y-%m-%d")
 
-            decision = WorkflowDecision(
-                tenant_id=tenant.id,
-                tenant_name=tenant.full_name,
-                property_unit=prop_unit,
-                balance=balance,
-                outcome=DecisionOutcome.HOLD_PROMISE,
-                reason=f"Valid payment promise detected: will pay by {promise_date} (Confidence: {ai_result.confidence * 100:.0f}%)",
-                details={
-                    "intent": ai_result.intent.value,
-                    "confidence": ai_result.confidence,
-                    "extracted_date": promise_date,
-                    "raw_text": ai_result.raw_text,
-                    "channel": ai_result.source_channel.value,
-                    "note_written": not is_dry_run
-                },
-                note_written=not is_dry_run,
-                run_id=run_id
-            )
-            db.save_decision(decision)
-            return decision
+            # Check if promise date is active (current or future date)
+            if promise_date >= today_str:
+                note_text = (
+                    f"[AI PAYMENT PROMISE ON FILE: Will pay by {promise_date}] "
+                    f"Tenant confirmed via {ai_result.source_channel.value}: \"{ai_result.raw_text}\""
+                )
+                # Write back note to RentVine MCP
+                if not is_dry_run:
+                    self.rentvine.write_tenant_note(tenant.id, note_text, author="AI Rent Reminder Agent")
+
+                decision = WorkflowDecision(
+                    tenant_id=tenant.id,
+                    tenant_name=tenant.full_name,
+                    property_unit=prop_unit,
+                    balance=balance,
+                    outcome=DecisionOutcome.HOLD_PROMISE,
+                    reason=f"Payment promised via {ai_result.source_channel.value} for {promise_date}: \"{ai_result.raw_text}\" — reminder held",
+                    details={
+                        "intent": ai_result.intent.value,
+                        "confidence": ai_result.confidence,
+                        "extracted_date": promise_date,
+                        "promise_date": promise_date,
+                        "raw_text": ai_result.raw_text,
+                        "channel": ai_result.source_channel.value,
+                        "note_written": not is_dry_run
+                    },
+                    note_written=not is_dry_run,
+                    run_id=run_id
+                )
+                db.save_decision(decision)
+                return decision
+            else:
+                logger.info(
+                    f"Prior payment promise for {tenant.id} expired on {promise_date}. "
+                    f"Balance is ${balance:,.2f}; proceeding to evaluate reminder eligibility."
+                )
 
         # AI Outcome B: DISPUTE
         if ai_result.intent == IntentType.DISPUTE:
@@ -477,6 +553,22 @@ class WorkflowOrchestrator:
                 sms_msg_id = send_res.get("message_id")
 
                 if is_actual_dispatch:
+                    # Record workflow-generated rent reminder delivery record
+                    now_iso_dispatch = datetime.utcnow().isoformat()
+                    reminder_id = f"rem_{tenant.id}_{datetime.utcnow().strftime('%Y%m%d')}"
+                    db.record_workflow_reminder(
+                        reminder_id=reminder_id,
+                        tenant_id=tenant.id,
+                        reminder_type="RENT_REMINDER",
+                        message_id=sms_msg_id or reminder_id,
+                        workflow_id=run_id,
+                        phone=tenant.phone,
+                        content=sms_text,
+                        sender_phone=settings.QUO_PHONE_TENANTS_FORMATTED,
+                        delivery_status="DELIVERED",
+                        sent_at=now_iso_dispatch
+                    )
+
                     # Log confirmation note to RentVine only when actually dispatched
                     rv_note_text = (
                         f"[AUTOMATED RENT REMINDER SENT] Quo SMS delivered to {tenant.phone} "

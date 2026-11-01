@@ -14,6 +14,7 @@ Authentication priority:
   Bearer token (DevTools capture) > Basic auth (API Key + Secret) > Local DB fallback
 """
 
+import os
 import json
 import base64
 import logging
@@ -458,6 +459,13 @@ class RentVineMCPClient:
             try:
                 raw_data = self._rest_get(f"reports/lease-balance?reportID={report_id}")
                 logger.info(f"Successfully fetched live RentVine reportID={report_id}: {raw_data.get('title')}")
+                # Update local cache with live data
+                cache_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "scratch", f"report_{report_id}.json")
+                try:
+                    with open(cache_path, "w", encoding="utf-8") as f:
+                        json.dump(raw_data, f, indent=2)
+                except Exception:
+                    pass
             except Exception as e:
                 logger.warning(f"Live RentVine report fetch failed for reportID={report_id} ({e}). Checking local cache.")
 
@@ -508,13 +516,31 @@ class RentVineMCPClient:
             past_due_total = float(d.get("pastDueTotalAmount") or 0.0)
             total_balance = float(d.get("totalBalanceDueAmount") or 0.0)
 
+            # Extract Follow-Up Notes - Automation Status (RentVine custom field lease_text_2)
+            automation_status = (d.get("lease_text_2") or "").strip()
+            lp1 = (d.get("lease_paragraph_1") or "").strip()
+            note_val = (d.get("note") or "").strip()
+            lease_notes = (d.get("leaseNotes") or "").strip()
+
+            # Exact field matching RentVine's "Follow-Up Notes - Automation Status" column
+            follow_up = automation_status if automation_status else (lp1 or note_val or lease_notes)
+            has_manual_review = (
+                "manual review" in automation_status.lower() 
+                or "manual review" in lp1.lower() 
+                or "manual review" in note_val.lower()
+            )
+
             # Determine reminder eligibility:
-            # - Must be Active lease
-            # - Has overdue balance (past_due_total > 0 or total_balance > 0, even $1.00)
-            is_eligible = (past_due_total > 0) or (total_balance > 0)
-            if not is_eligible:
+            # - Must be Active lease with overdue balance
+            # - When Follow-Up Notes contains "Manual Review": Disabled (Manual Review / Disputes)
+            if (past_due_total <= 0) and (total_balance <= 0):
+                is_eligible = False
                 eligibility_reason = "Paid / Settled: $0.00 balance"
+            elif has_manual_review:
+                is_eligible = False
+                eligibility_reason = "Manual Review / Disputes: Automated reminders disabled per RentVine Follow-Up Notes"
             else:
+                is_eligible = True
                 eligibility_reason = f"Eligible: Total balance ${total_balance:,.2f} | Total past due ${past_due_total:,.2f}"
 
             rows.append({
@@ -533,6 +559,9 @@ class RentVineMCPClient:
                 "past_due_rent": past_due_rent,
                 "past_due_total": past_due_total,
                 "total_balance": total_balance,
+                "follow_up_notes": automation_status,
+                "automation_status": automation_status,
+                "has_manual_review": has_manual_review,
                 "start_date": d.get("startDate"),
                 "end_date": d.get("endDate"),
                 "portal_link": f"https://redbricksproperties.rentvine.com/portal/pay",
@@ -563,6 +592,8 @@ class RentVineMCPClient:
         Synchronizes the authoritative Report #72 into the local SQLite database.
         - Updates or creates tenant records with their exact contact details and unit.
         - Sets exact past due balances on rentvine_records.
+        - Dynamically updates Manual Review status based on RentVine Follow-Up Notes.
+        - When Manual Review is removed and field becomes blank, automatically clears the restriction.
         - Sets all other non-report tenants to balance = 0.00 so only Report #72 overdue tenants remain active.
         """
         report_data = self.fetch_lease_balance_report(report_id)
@@ -580,6 +611,8 @@ class RentVineMCPClient:
             email = rec["email"]
             prop_name = rec["property_name"]
             unit_name = rec["unit_name"] or rec["unit_address"]
+            follow_up = rec.get("follow_up_notes", "")
+            has_manual_review = "manual review" in (follow_up or "").lower()
 
             # Check if tenant exists by phone or lease_id
             existing_tenant = None
@@ -589,6 +622,16 @@ class RentVineMCPClient:
             tenant_id = existing_tenant.id if existing_tenant else f"rv_lease_{lease_id}"
             report_tenant_ids.add(tenant_id)
 
+            # Dynamic sync:
+            # - When Follow-Up Notes contains "Manual Review", mark is_excluded = True
+            # - When Follow-Up Notes is blank or Manual Review is removed, mark is_excluded = False
+            if has_manual_review:
+                is_excluded = True
+                exclusion_reason = "Manual Review in RentVine Follow-Up Notes"
+            else:
+                is_excluded = False
+                exclusion_reason = None
+
             t_obj = Tenant(
                 id=tenant_id,
                 first_name=first_name,
@@ -597,12 +640,12 @@ class RentVineMCPClient:
                 email=email,
                 property_name=prop_name,
                 unit_number=unit_name,
-                is_excluded=False,
-                exclusion_reason=None
+                is_excluded=is_excluded,
+                exclusion_reason=exclusion_reason
             )
             db.upsert_tenant(t_obj)
 
-            # Upsert RentVine record
+            # Upsert RentVine record with follow_up_notes
             rv_rec = RentVineRecord(
                 tenant_id=tenant_id,
                 balance=rec["total_balance"],
@@ -611,7 +654,8 @@ class RentVineMCPClient:
                 last_payment_date=None,
                 last_payment_amount=0.0,
                 portal_link=rec["portal_link"],
-                lease_status="ACTIVE"
+                lease_status="ACTIVE",
+                follow_up_notes=follow_up
             )
             db.upsert_rentvine_record(rv_rec)
             synced_count += 1

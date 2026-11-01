@@ -449,7 +449,7 @@ class AppController {
     if (pillReminded) pillReminded.textContent = `📩 Reminders Needed (${countSent})`;
     if (pillPromised) pillPromised.textContent = `🛡️ Promises on File (${countPromises})`;
     if (pillPaid) pillPaid.textContent = `✅ Paid / Cleared (${countPaid})`;
-    if (pillFlagged) pillFlagged.textContent = `🔴 Flagged / Disputes (${countFlagged})`;
+    if (pillFlagged) pillFlagged.textContent = `🔴 Manual Review / Disputes (${countFlagged})`;
     if (pillCooldown) pillCooldown.textContent = `🚫 In Cooldown / Grace (${countCooldown})`;
   }
 
@@ -582,7 +582,7 @@ class AppController {
     } else if (outcome === "SKIP_GRACE_PERIOD") {
       return `<span class="badge badge-grace">🕒 In Grace Period</span>`;
     } else if (outcome === "FLAG_MANUAL_REVIEW") {
-      return `<span class="badge badge-flag">🔴 Manual Review</span>`;
+      return `<span class="badge badge-flag">🔴 Manual Review / Disputes</span>`;
     }
     return `<span class="badge" style="background:#1e293b;color:#94a3b8;">Pending</span>`;
   }
@@ -592,7 +592,7 @@ class AppController {
   async loadRentVineReport(forceSync = false) {
     const tbody = document.getElementById("report-72-tbody");
     if (tbody) {
-      tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;padding:24px;color:#94a3b8;"><span class="spinner-sm"></span> Fetching live data from RentVine Report #72...</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="11" style="text-align:center;padding:24px;color:#94a3b8;"><span class="spinner-sm"></span> Fetching live data from RentVine Report #72...</td></tr>`;
     }
 
     try {
@@ -626,21 +626,32 @@ class AppController {
 
       if (!tbody) return;
       if (records.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;padding:24px;color:#94a3b8;">No overdue records in Report #72.</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="11" style="text-align:center;padding:24px;color:#94a3b8;">No overdue records in Report #72.</td></tr>`;
         return;
       }
 
       tbody.innerHTML = records.map((r, idx) => {
         const isEligible = r.is_eligible;
-        const eligBadge = isEligible
-          ? `<span class="badge" style="background:#10b98122;color:#10b981;border:1px solid #10b98155;padding:3px 8px;border-radius:12px;font-size:11px;font-weight:600;">Eligible for Reminder</span>`
-          : `<span class="badge" style="background:#64748b22;color:#94a3b8;border:1px solid #64748b55;padding:3px 8px;border-radius:12px;font-size:11px;">Paid ($0.00 Balance)</span>`;
+        let eligBadge = '';
+        if (r.has_manual_review) {
+          eligBadge = `<span class="badge" style="background:#ef444422;color:#f87171;border:1px solid #ef444455;padding:3px 8px;border-radius:12px;font-size:11px;font-weight:700;">🔴 Manual Review</span>`;
+        } else if (isEligible) {
+          eligBadge = `<span class="badge" style="background:#10b98122;color:#10b981;border:1px solid #10b98155;padding:3px 8px;border-radius:12px;font-size:11px;font-weight:600;">Eligible for Reminder</span>`;
+        } else {
+          eligBadge = `<span class="badge" style="background:#64748b22;color:#94a3b8;border:1px solid #64748b55;padding:3px 8px;border-radius:12px;font-size:11px;">Paid ($0.00 Balance)</span>`;
+        }
 
         const phoneDisplay = r.phone ? `<a href="tel:${r.phone}" style="color:#38bdf8;text-decoration:none;">${r.phone}</a>` : `<span style="color:#64748b;">No Phone</span>`;
         const emailDisplay = r.email ? `<span style="font-size:11px;color:#94a3b8;display:block;">${r.email}</span>` : "";
 
+        const fuDisplay = r.follow_up_notes
+          ? (r.has_manual_review 
+              ? `<span style="color:#fca5a5;font-weight:600;font-size:11px;line-height:1.4;display:block;max-width:260px;">🔴 ${r.follow_up_notes}</span>` 
+              : `<span style="color:#cbd5e1;font-size:11px;line-height:1.4;display:block;max-width:260px;">${r.follow_up_notes}</span>`)
+          : `<span style="color:#64748b;font-size:11px;font-style:italic;">(Blank)</span>`;
+
         return `
-          <tr style="${isEligible ? 'background:rgba(245,158,11,0.03);' : ''}">
+          <tr style="${r.has_manual_review ? 'background:rgba(239,68,68,0.05);' : (isEligible ? 'background:rgba(245,158,11,0.03);' : '')}">
             <td style="color:#64748b;font-size:12px;">${idx + 1}</td>
             <td><span style="font-family:'JetBrains Mono',monospace;color:#38bdf8;font-size:12px;">#${r.lease_id}</span></td>
             <td>
@@ -666,6 +677,9 @@ class AppController {
               <span class="badge" style="background:#0284c722;color:#38bdf8;padding:2px 8px;border-radius:10px;font-size:11px;">${r.lease_status}</span>
             </td>
             <td>
+              ${fuDisplay}
+            </td>
+            <td>
               ${eligBadge}
               <div style="font-size:10px;color:#64748b;margin-top:2px;">${r.eligibility_reason}</div>
             </td>
@@ -676,7 +690,7 @@ class AppController {
     } catch (err) {
       console.error("Error loading RentVine report #72:", err);
       if (tbody) {
-        tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;padding:24px;color:#f43f5e;">Error loading Report #72: ${err.message}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="11" style="text-align:center;padding:24px;color:#f43f5e;">Error loading Report #72: ${err.message}</td></tr>`;
       }
     }
   }
@@ -1100,7 +1114,16 @@ class AppController {
       if (filterBadge && data.overdue_filter) {
         if (data.overdue_filter.filtering_active && data.overdue_filter.overdue_tenant_count > 0) {
           filterBadge.style.display = "block";
-          filterBadge.innerHTML = `🎯 Filtered: showing ${data.overdue_filter.conversations_matched} conversations for ${data.overdue_filter.overdue_tenant_count} overdue tenants only`;
+          const isError = data.overdue_filter.api_status && data.overdue_filter.api_status !== "CONNECTED";
+          if (isError) {
+            filterBadge.style.background = "#7f1d1d";
+            filterBadge.style.color = "#fca5a5";
+            filterBadge.innerHTML = `⚠️ Quo API: ${data.overdue_filter.api_status} • Unverified reminders held`;
+          } else {
+            filterBadge.style.background = "#064e3b";
+            filterBadge.style.color = "#6ee7b7";
+            filterBadge.innerHTML = `🎯 Filtered: showing ${data.overdue_filter.conversations_matched} conversations (${data.overdue_filter.total_messages_retrieved || 0} messages) for ${data.overdue_filter.overdue_tenant_count} overdue tenants only • Quo Live`;
+          }
         } else {
           filterBadge.style.display = "none";
         }
@@ -1152,6 +1175,33 @@ class AppController {
                 <td>${promiseLabel}</td>
                 <td>${nextLabel}</td>
                 <td style="max-width:260px;font-size:12px;color:#94a3b8;line-height:1.5;">${p.hold_reason || '—'}</td>
+              </tr>
+            `;
+          }).join("");
+        }
+      }
+
+      // ─── Render Manual Review / Disputes table ───
+      const manualReviewContainer = document.getElementById("quo-manual-review-container");
+      const tbodyManualReview = document.getElementById("quo-manual-review-tbody");
+      const manualReviewList = data.manual_review_tenants || [];
+      if (manualReviewContainer && tbodyManualReview) {
+        if (manualReviewList.length === 0) {
+          manualReviewContainer.style.display = "none";
+        } else {
+          manualReviewContainer.style.display = "block";
+          tbodyManualReview.innerHTML = manualReviewList.map(m => {
+            return `
+              <tr style="background:rgba(239,68,68,0.04);border-left:3px solid #ef4444;">
+                <td><strong>${m.tenant_name}</strong><br><small style="color:#64748b;">${m.tenant_id}</small></td>
+                <td>${m.property_unit}</td>
+                <td><code>${m.phone}</code></td>
+                <td><strong style="color:#f87171;">$${Number(m.balance).toLocaleString('en-US', {minimumFractionDigits:2})}</strong></td>
+                <td><span class="badge badge-flag" style="font-size:11px;">🔴 Reminders Disabled</span></td>
+                <td style="max-width:320px;font-size:12px;color:#cbd5e1;line-height:1.5;">
+                  ${m.follow_up_notes ? `<div style="color:#fca5a5;font-weight:600;margin-bottom:2px;">Follow-Up Note: "${m.follow_up_notes}"</div>` : ''}
+                  <div style="color:#94a3b8;font-size:11px;">${m.reason || 'Manual review required'}</div>
+                </td>
               </tr>
             `;
           }).join("");
@@ -1232,6 +1282,9 @@ class AppController {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ 
+          reminder_id: item.reminder_id || `rem_${tenantId}_${Date.now()}`,
+          reminder_type: item.reminder_type || "RENT_REMINDER",
+          workflow_id: item.workflow_id || "hitl_queue",
           tenant_id: tenantId, 
           phone: item.phone, 
           text: item.sms_preview, 

@@ -19,7 +19,7 @@ from src.config import settings
 from src.database import db
 from src.models import (
     Tenant, RentVineRecord, RentVineNote, CommunicationMessage,
-    Channel, MessageDirection, DecisionOutcome, IntentType
+    Channel, MessageDirection, DecisionOutcome, IntentType, WorkflowDecision
 )
 from src.clients.rentvine_mcp import RentVineMCPClient
 from src.clients.quo_sms import QuoSMSClient
@@ -211,7 +211,7 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                         t.id, t.first_name, t.last_name, t.phone, t.email,
                         t.property_name, t.unit_number, t.is_excluded, t.exclusion_reason,
                         r.balance, r.monthly_rent, r.due_date, r.last_payment_date,
-                        r.last_payment_amount, r.portal_link, r.lease_status
+                        r.last_payment_amount, r.portal_link, r.lease_status, r.follow_up_notes
                     FROM tenants t
                     JOIN rentvine_records r ON t.id = r.tenant_id
                     WHERE r.lease_status = 'ACTIVE'
@@ -223,7 +223,7 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                         t.id, t.first_name, t.last_name, t.phone, t.email,
                         t.property_name, t.unit_number, t.is_excluded, t.exclusion_reason,
                         r.balance, r.monthly_rent, r.due_date, r.last_payment_date,
-                        r.last_payment_amount, r.portal_link, r.lease_status
+                        r.last_payment_amount, r.portal_link, r.lease_status, r.follow_up_notes
                     FROM tenants t
                     LEFT JOIN rentvine_records r ON t.id = r.tenant_id
                     ORDER BY t.property_name, t.unit_number
@@ -242,9 +242,19 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                     "note_written": d.note_written
                 }
 
+        current_month_first = datetime.utcnow().strftime("%Y-%m-01")
         results = []
         for r in tenant_rows:
             tid = r["id"]
+            bal = float(r["balance"] or 0.0)
+            raw_due = r["due_date"]
+            # If tenant is fully paid ($0 balance) and recorded due date is in prior month,
+            # display current active billing cycle (1st of current month)
+            if bal <= 0.0 and raw_due and raw_due < current_month_first:
+                effective_due = current_month_first
+            else:
+                effective_due = raw_due or current_month_first
+
             results.append({
                 "id": tid,
                 "first_name": r["first_name"],
@@ -256,12 +266,13 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                 "unit_number": r["unit_number"],
                 "is_excluded": bool(r["is_excluded"]),
                 "exclusion_reason": r["exclusion_reason"],
-                "balance": float(r["balance"] or 0.0),
+                "balance": bal,
                 "monthly_rent": float(r["monthly_rent"] or 0.0),
-                "due_date": r["due_date"],
+                "due_date": effective_due,
                 "last_payment_date": r["last_payment_date"],
                 "last_payment_amount": float(r["last_payment_amount"] or 0.0),
                 "lease_status": r["lease_status"] or "ACTIVE",
+                "follow_up_notes": r["follow_up_notes"] if "follow_up_notes" in r.keys() else None,
                 "latest_decision": latest_decision_by_tenant.get(tid),
                 "latest_message": None,
                 "message_count": 0,
@@ -771,118 +782,120 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                         overdue_phones.add(clean_p[-10:])
                         overdue_tenant_ids.add(t.id)
 
-        # ─── 1. Fetch real OpenPhone conversations + messages ONLY for overdue tenants ───
-        openphone_conversations = []
+        # ─── 1. Fetch real OpenPhone messages ONLY for overdue tenants ───
         openphone_messages = []
+        matched_overdue_convs = 0
+        quo_api_status = "CONNECTED"
+        quo_api_error = None
         quo_probe = self._test_quo_connection()
 
         if not settings.QUO_MOCK_MODE and settings.QUO_API_KEY:
-            import urllib.request as _ur, urllib.error as _ue
+            import urllib.request as _ur, urllib.error as _ue, urllib.parse as _up
             auth = settings.QUO_API_KEY if settings.QUO_API_KEY.startswith("Bearer ") else f"Bearer {settings.QUO_API_KEY}"
             headers = {
                 "Authorization": auth,
                 "Content-Type": "application/json",
-                "User-Agent": "RedBricks-Dashboard/1.0"
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             }
 
-            # Fetch conversations for the selected phone number ID
-            try:
-                req = _ur.Request(
-                    f"{settings.QUO_API_URL}/conversations?phoneNumberId={phone_id}&maxResults=50",
-                    headers=headers
-                )
-                with _ur.urlopen(req, timeout=10) as resp:
-                    conv_data = json.loads(resp.read().decode("utf-8"))
-                    all_convs = conv_data.get("data", []) or []
+            classifier = AIIntentClassifier()
 
-                    # ── Filter: only keep conversations whose participant phone is in the overdue whitelist ──
-                    if overdue_phones:
-                        filtered_convs = []
-                        for conv in all_convs:
-                            participants = conv.get("participants", [])
-                            if not participants:
-                                continue
-                            p0 = participants[0]
-                            phone_str = p0.get("phoneNumber", "") if isinstance(p0, dict) else str(p0)
-                            clean_p = "".join([c for c in phone_str if c.isdigit()])
-                            if clean_p and clean_p[-10:] in overdue_phones:
-                                filtered_convs.append(conv)
-                        openphone_conversations = filtered_convs
-                        logger.info(
-                            f"[Quo - {inbox_name}] Fetched {len(all_convs)} conversations; "
-                            f"{len(openphone_conversations)} matched overdue tenants from Report #72."
-                        )
-                    else:
-                        # No whitelist available — fall back to showing up to 15 conversations
-                        openphone_conversations = all_convs[:15]
-                        logger.info(f"[Quo - {inbox_name}] No overdue whitelist; showing {len(openphone_conversations)} conversations.")
+            # Query OpenPhone /messages directly for each overdue tenant's phone
+            for p10 in overdue_phones:
+                t = report_phone_to_tenant.get(p10)
+                e164 = f"+1{p10}"
+                encoded_p = _up.quote(e164)
+                msg_url = f"{settings.QUO_API_URL}/messages?phoneNumberId={phone_id}&participants[]={encoded_p}&maxResults=10"
 
-            except Exception as e:
-                logger.warning(f"[Quo - {inbox_name}] Failed to fetch conversations for {phone_id}: {e}")
-
-            # For filtered overdue conversations, fetch messages
-            for conv in openphone_conversations[:15]:
-                conv_id = conv.get("id")
-                if not conv_id:
-                    continue
-                participants = conv.get("participants", [])
-                phone_str = ""
-                name_str = conv.get("name") or ""
-                if participants:
-                    p0 = participants[0]
-                    phone_str = p0.get("phoneNumber", "") if isinstance(p0, dict) else str(p0)
-                if not phone_str:
-                    continue
-
-                # Resolve tenant info from our whitelist mapping
-                clean_p = "".join([c for c in phone_str if c.isdigit()])
-                matched_tenant = report_phone_to_tenant.get(clean_p[-10:] if clean_p else "")
-                if matched_tenant:
-                    resolved_name = matched_tenant.full_name
-                    prop_unit = f"{matched_tenant.property_name} {matched_tenant.unit_number}".strip()
-                else:
-                    resolved_name = name_str or phone_str
-                    prop_unit = ""
-
-                # Query OpenPhone messages with required phoneNumberId and participants[]
                 try:
-                    msg_url = f"{settings.QUO_API_URL}/messages?phoneNumberId={phone_id}&participants[]={quote(phone_str)}&maxResults=5"
                     req = _ur.Request(msg_url, headers=headers)
-                    with _ur.urlopen(req, timeout=4) as resp:
+                    with _ur.urlopen(req, timeout=6) as resp:
                         msg_data = json.loads(resp.read().decode("utf-8"))
-                        for m in (msg_data.get("data", []) or []):
-                            txt = m.get("text", m.get("body", ""))
+                        raw_msgs = msg_data.get("data", []) or []
+                        if raw_msgs:
+                            matched_overdue_convs += 1
+                            t_name = t.full_name if t else "Tenant"
+                            prop_unit = f"{t.property_name} {t.unit_number}".strip() if t else ""
 
-                            # Try to extract property/unit from message text if not already resolved
-                            if not prop_unit and " for " in txt and " was due" in txt:
-                                try:
-                                    part_u = txt.split(" for ")[1].split(" was due")[0].strip()
-                                    prop_unit = part_u
-                                except Exception:
-                                    pass
+                            comm_msgs = []
+                            for m in raw_msgs:
+                                txt = m.get("text", m.get("body", ""))
+                                is_inbound = (m.get("direction") == "incoming")
+                                created_ts = m.get("createdAt", m.get("deliveredAt", ""))
+                                msg_status = m.get("status", "delivered").upper()
 
-                            openphone_messages.append({
-                                "id": m.get("id", ""),
-                                "conversation_id": conv_id,
-                                "direction": "INBOUND" if m.get("direction") == "incoming" else "OUTBOUND",
-                                "content": txt,
-                                "timestamp": m.get("createdAt", m.get("deliveredAt", "")),
-                                "status": m.get("status", "delivered").upper(),
-                                "tenant_name": resolved_name,
-                                "phone": phone_str,
-                                "tenant_id": matched_tenant.id if matched_tenant else "",
-                                "property_unit": prop_unit,
-                                "source": "openphone_live",
-                                "line": selected_line,
-                                "inbox": inbox_name
-                            })
+                                c_msg = CommunicationMessage(
+                                    id=m.get("id", ""),
+                                    tenant_id=t.id if t else f"phone_{p10}",
+                                    channel=Channel.SMS,
+                                    direction=MessageDirection.INBOUND if is_inbound else MessageDirection.OUTBOUND,
+                                    sender=m.get("from", ""),
+                                    recipient=(m.get("to") or [""])[0] if m.get("to") else "",
+                                    content=txt,
+                                    timestamp=created_ts,
+                                    status=msg_status
+                                )
+                                comm_msgs.append(c_msg)
+                                db.save_message(c_msg)
+
+                                openphone_messages.append({
+                                    "id": m.get("id", ""),
+                                    "conversation_id": m.get("conversationId", ""),
+                                    "direction": "INBOUND" if is_inbound else "OUTBOUND",
+                                    "content": txt,
+                                    "timestamp": created_ts,
+                                    "status": "RECEIVED" if is_inbound else msg_status,
+                                    "tenant_name": t_name,
+                                    "phone": e164,
+                                    "tenant_id": t.id if t else "",
+                                    "property_unit": prop_unit,
+                                    "source": "openphone_live",
+                                    "line": selected_line,
+                                    "inbox": inbox_name
+                                })
+
+                            # Check tenant communications for payment promise
+                            if t and comm_msgs:
+                                ai_res = classifier.classify_tenant_communications(comm_msgs, reference_date=datetime.utcnow())
+                                if ai_res.intent == IntentType.PROMISE_MADE:
+                                    from datetime import timedelta as _td
+                                    p_date = ai_res.extracted_date or (datetime.utcnow().date() + _td(days=3)).strftime("%Y-%m-%d")
+                                    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+                                    if p_date >= today_str:
+                                        # Save HOLD_PROMISE decision so reminder is suppressed
+                                        rv_bal = db.get_rentvine_record(t.id)
+                                        bal_val = float(rv_bal.balance) if rv_bal else 0.0
+                                        hold_dec = WorkflowDecision(
+                                            tenant_id=t.id,
+                                            tenant_name=t.full_name,
+                                            property_unit=prop_unit,
+                                            balance=bal_val,
+                                            outcome=DecisionOutcome.HOLD_PROMISE,
+                                            reason=f"Payment promised via Quo SMS for {p_date}: \"{ai_res.raw_text}\" — reminder held",
+                                            details={
+                                                "intent": "PROMISE_MADE",
+                                                "promise_date": p_date,
+                                                "extracted_date": p_date,
+                                                "raw_text": ai_res.raw_text,
+                                                "channel": "SMS"
+                                            },
+                                            timestamp=datetime.utcnow().isoformat(),
+                                            run_id="quo_sync"
+                                        )
+                                        db.save_decision(hold_dec)
+                                        logger.info(f"[Quo Promise] Payment commitment recorded for {t.full_name}: pay by {p_date}")
+
                 except _ue.HTTPError as he:
-                    logger.warning(f"[Quo] HTTP {he.code} fetching messages for {phone_str}: {he}")
+                    logger.warning(f"[Quo] HTTP {he.code} fetching messages for {e164}: {he}")
+                    quo_api_status = f"HTTP {he.code}"
+                    quo_api_error = str(he)
                     if he.code in (401, 403):
                         logger.warning("[Quo] Token expired or unauthorized; skipping remaining queries.")
                         break
                 except Exception as e:
-                    logger.warning(f"[Quo] Failed to fetch messages for {phone_str}: {e}")
+                    logger.warning(f"[Quo] Failed to fetch messages for {e164}: {e}")
+                    quo_api_status = "ERROR"
+                    quo_api_error = str(e)
 
         # ─── 2. Build reminders queue from REAL workflow decisions only ───
         # Strictly associated with Tenants & Vendors line ((980) 300-7559)
@@ -890,6 +903,7 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
         latest_decisions = db.get_latest_decisions(limit=2000)
         reminders_needed = []
         promises_on_hold = []
+        manual_review_tenants = []
         seen_tenants = set()
 
         for d in latest_decisions:
@@ -915,7 +929,33 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
             if not t.phone or t.phone.startswith("+1-415-555"):
                 continue
 
-            # ── HOLD_PROMISE tenants: visible in log with hold status ──
+            clean_prop = (t.property_name or d.property_unit or "").strip()
+            unit_val = (t.unit_number or "").strip()
+            prop_display = f"{clean_prop} {unit_val}".strip() if unit_val and unit_val not in clean_prop else clean_prop
+            fu_text = getattr(rv, "follow_up_notes", "") or ""
+
+            # ── 1. Manual Review / Disputes: reminders disabled per Follow-Up Notes or AI dispute ──
+            is_manual_review = (
+                d.outcome == DecisionOutcome.FLAG_MANUAL_REVIEW or 
+                (fu_text and "manual review" in fu_text.lower())
+            )
+            if is_manual_review:
+                manual_review_tenants.append({
+                    "tenant_id": d.tenant_id,
+                    "tenant_name": d.tenant_name or t.full_name,
+                    "property_unit": prop_display,
+                    "phone": t.phone,
+                    "balance": effective_balance,
+                    "status": "MANUAL_REVIEW_DISABLED",
+                    "reason": d.reason if d.outcome == DecisionOutcome.FLAG_MANUAL_REVIEW else "RentVine Follow-Up Notes: Manual Review",
+                    "follow_up_notes": fu_text,
+                    "timestamp": d.timestamp,
+                    "sender_phone": settings.QUO_PHONE_TENANTS_FORMATTED,
+                    "sender_inbox": "Tenants & Vendors",
+                })
+                continue  # Disabled from automated reminder queue
+
+            # ── 2. HOLD_PROMISE tenants: visible in log with hold status ──
             if d.outcome == DecisionOutcome.HOLD_PROMISE:
                 promise_date = None
                 next_eligible = None
@@ -934,10 +974,6 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                         next_eligible = (pd_obj + _td(days=1)).strftime("%Y-%m-%d")
                     except Exception:
                         next_eligible = promise_date
-
-                clean_prop = (t.property_name or d.property_unit or "").strip()
-                unit_val = (t.unit_number or "").strip()
-                prop_display = f"{clean_prop} {unit_val}".strip() if unit_val and unit_val not in clean_prop else clean_prop
 
                 promises_on_hold.append({
                     "tenant_id": d.tenant_id,
@@ -958,12 +994,14 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
             if d.outcome != DecisionOutcome.SEND_REMINDER:
                 continue  # Most recent evaluation was SKIP_PAID, SKIP_GRACE_PERIOD, etc.
 
-            # Cooldown check: if reminder was genuinely dispatched in the last 24h, skip it
+            # Cooldown check: if workflow-generated rent reminder was sent today, skip it (in cooldown for remainder of day)
             last_rem = db.get_last_successful_reminder(d.tenant_id)
             if last_rem and last_rem.sms_sent:
                 try:
-                    last_ts = datetime.fromisoformat(last_rem.timestamp)
-                    if (datetime.utcnow() - last_ts).total_seconds() < 24 * 3600:
+                    last_ts = datetime.fromisoformat(last_rem.timestamp.replace("Z", "+00:00"))
+                    if last_ts.tzinfo is not None:
+                        last_ts = last_ts.replace(tzinfo=None)
+                    if last_ts.date() == datetime.utcnow().date():
                         continue
                 except Exception:
                     pass
@@ -1006,7 +1044,12 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
             else:
                 prop_display = clean_prop
 
+            # Associate queued draft with unique reminder ID, workflow run, and reminder type
+            reminder_id = f"rem_{d.tenant_id}_{datetime.utcnow().strftime('%Y%m%d')}"
             reminders_needed.append({
+                "reminder_id": reminder_id,
+                "reminder_type": "RENT_REMINDER",
+                "workflow_id": d.run_id or "daily_workflow",
                 "tenant_id": d.tenant_id,
                 "tenant_name": d.tenant_name or t.full_name,
                 "property_unit": prop_display,
@@ -1104,7 +1147,10 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
             "overdue_filter": {
                 "source": "RentVine Report #72 (Rent Rem Praveen)",
                 "overdue_tenant_count": len(overdue_phones),
-                "conversations_matched": len(openphone_conversations),
+                "conversations_matched": matched_overdue_convs,
+                "total_messages_retrieved": len(openphone_messages),
+                "api_status": quo_api_status,
+                "api_error": quo_api_error,
                 "filtering_active": bool(overdue_phones)
             },
             "channel": {
@@ -1115,19 +1161,21 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                 "purpose": line_purpose,
                 "api_endpoint": settings.QUO_API_URL,
                 "live_status": quo_probe.get("status", "simulation"),
-                "openphone_conversations": len(openphone_conversations),
+                "openphone_conversations": matched_overdue_convs,
                 "openphone_messages_fetched": len(openphone_messages)
             },
             "available_lines": available_lines,
             "counts": {
                 "reminders_needed": len(reminders_needed),
                 "promises_on_hold": len(promises_on_hold),
+                "manual_review": len(manual_review_tenants),
                 "sms_messages": len(deduped),
                 "inbound_replies": inbound_count,
                 "hitl_approved_sent": hitl_sent
             },
             "reminders_needed": reminders_needed,
             "promises_on_hold": promises_on_hold,
+            "manual_review_tenants": manual_review_tenants,
             "messages": deduped,
             "probe": quo_probe
         }
@@ -1283,6 +1331,9 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
         recipient_type = body.get("recipient_type", "tenant")
         sender_phone_override = body.get("sender_phone_id")
         hitl_approved = bool(body.get("hitl_approved", False))
+        reminder_id = body.get("reminder_id") or f"rem_{tenant_id}_{int(__import__('datetime').datetime.utcnow().timestamp() * 1000)}"
+        reminder_type = body.get("reminder_type", "RENT_REMINDER")
+        workflow_id = body.get("workflow_id", "hitl_send")
 
         if not tenant_id or not phone or not text:
             return self._send_json({"error": "tenant_id, phone, and text are required"}, 400)
@@ -1296,6 +1347,13 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
             return self._send_json({
                 "error": "Payment verified: Tenant balance is $0.00 (paid in full). No reminder sent.",
                 "status": "PAID"
+            }, 400)
+
+        # Manual Review verification: ensure tenant is not marked for Manual Review
+        if rv_rec and rv_rec.follow_up_notes and "manual review" in rv_rec.follow_up_notes.lower():
+            return self._send_json({
+                "error": "Cannot dispatch automated reminder: Tenant is marked for Manual Review in RentVine Follow-Up Notes.",
+                "status": "FLAG_MANUAL_REVIEW"
             }, 400)
 
         # Automatic Grace Period verification for current-month rent dues
@@ -1368,13 +1426,32 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                         "recipient_type": recipient_type,
                         "hitl_approved": True,
                         "sms_dispatched": True,
-                        "ext_message_id": ext_id
+                        "ext_message_id": ext_id,
+                        "reminder_id": reminder_id,
+                        "reminder_type": reminder_type,
+                        "workflow_id": workflow_id,
+                        "is_workflow_reminder": True,
+                        "delivery_status": "DELIVERED"
                     }
                 )
                 _db.save_message(outbound)
                 logger.info(f"[HITL APPROVED] SMS sent to {phone} from {sender_fmt} ({inbox_name}) for {tenant_id}. ext_id={ext_id}")
 
-                # Record successful reminder send so 24h cooldown activates now that it's sent
+                # Record in dedicated workflow_reminders tracking table
+                _db.record_workflow_reminder(
+                    reminder_id=reminder_id,
+                    tenant_id=tenant_id,
+                    reminder_type=reminder_type,
+                    message_id=ext_id,
+                    workflow_id=workflow_id,
+                    phone=phone,
+                    content=text,
+                    sender_phone=sender_fmt,
+                    delivery_status="DELIVERED",
+                    sent_at=now_iso
+                )
+
+                # Record successful reminder send so cooldown activates for today
                 from src.models import WorkflowDecision, DecisionOutcome
                 _db.save_decision(WorkflowDecision(
                     tenant_id=tenant_id,
@@ -1383,18 +1460,32 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                     balance=0.0,
                     outcome=DecisionOutcome.SEND_REMINDER,
                     reason=f"HITL Reminder SMS approved and sent to {phone} from {sender_fmt} ({inbox_name})",
-                    details={"text": text, "phone": phone, "sender_phone": sender_fmt, "inbox": inbox_name, "hitl_approved": True},
+                    details={
+                        "text": text,
+                        "phone": phone,
+                        "sender_phone": sender_fmt,
+                        "inbox": inbox_name,
+                        "hitl_approved": True,
+                        "reminder_id": reminder_id,
+                        "reminder_type": reminder_type,
+                        "workflow_id": workflow_id,
+                        "is_workflow_reminder": True,
+                        "delivery_status": "DELIVERED"
+                    },
                     timestamp=now_iso,
                     sms_sent=True,
                     sms_message_id=ext_id,
                     note_written=False,
-                    run_id="hitl_sent"
+                    run_id=workflow_id
                 ))
 
                 return self._send_json({
                     "success": True,
                     "mock_mode": False,
                     "message_id": ext_id,
+                    "reminder_id": reminder_id,
+                    "reminder_type": reminder_type,
+                    "workflow_id": workflow_id,
                     "timestamp": now_iso,
                     "recipient": phone,
                     "sender": sender_fmt,
@@ -1427,11 +1518,30 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                         "hitl_approved": True,
                         "sms_dispatched": False,
                         "mock_mode": True,
+                        "reminder_id": reminder_id,
+                        "reminder_type": reminder_type,
+                        "workflow_id": workflow_id,
+                        "is_workflow_reminder": True,
+                        "delivery_status": "SENT_HITL_APPROVED",
                         "note": f"HITL approved — SMS would be sent from {sender_fmt} ({inbox_name}) if QUO_MOCK_MODE=false"
                     }
                 )
                 _db.save_message(outbound)
                 logger.info(f"[HITL APPROVED - MOCK] SMS logged for {phone} from {sender_fmt} ({inbox_name})")
+
+                # Record in dedicated workflow_reminders tracking table
+                _db.record_workflow_reminder(
+                    reminder_id=reminder_id,
+                    tenant_id=tenant_id,
+                    reminder_type=reminder_type,
+                    message_id=msg_id,
+                    workflow_id=workflow_id,
+                    phone=phone,
+                    content=text,
+                    sender_phone=sender_fmt,
+                    delivery_status="SENT_HITL_APPROVED",
+                    sent_at=now_iso
+                )
 
                 # Record decision so cooldown activates for this tenant after manager triggers send
                 from src.models import WorkflowDecision, DecisionOutcome
@@ -1442,18 +1552,33 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                     balance=0.0,
                     outcome=DecisionOutcome.SEND_REMINDER,
                     reason=f"HITL Reminder approved and recorded for {phone} from {sender_fmt} ({inbox_name})",
-                    details={"text": text, "phone": phone, "sender_phone": sender_fmt, "inbox": inbox_name, "hitl_approved": True, "mock_mode": True},
+                    details={
+                        "text": text,
+                        "phone": phone,
+                        "sender_phone": sender_fmt,
+                        "inbox": inbox_name,
+                        "hitl_approved": True,
+                        "mock_mode": True,
+                        "reminder_id": reminder_id,
+                        "reminder_type": reminder_type,
+                        "workflow_id": workflow_id,
+                        "is_workflow_reminder": True,
+                        "delivery_status": "SENT_HITL_APPROVED"
+                    },
                     timestamp=now_iso,
                     sms_sent=True,
                     sms_message_id=msg_id,
                     note_written=False,
-                    run_id="hitl_sent_mock"
+                    run_id=workflow_id
                 ))
 
                 return self._send_json({
                     "success": True,
                     "mock_mode": True,
                     "message_id": msg_id,
+                    "reminder_id": reminder_id,
+                    "reminder_type": reminder_type,
+                    "workflow_id": workflow_id,
                     "timestamp": now_iso,
                     "recipient": phone,
                     "sender": sender_fmt,

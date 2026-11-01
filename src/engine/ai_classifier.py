@@ -105,6 +105,17 @@ class AIIntentClassifier:
         latest_msg = sorted(inbound_messages, key=lambda x: x.timestamp, reverse=True)[0]
         text = latest_msg.content.strip()
 
+        # Resolve relative dates using the message timestamp and applicable local date
+        msg_date = now
+        if latest_msg.timestamp:
+            try:
+                parsed_ts = datetime.fromisoformat(latest_msg.timestamp.replace("Z", "+00:00"))
+                if parsed_ts.tzinfo is not None:
+                    parsed_ts = parsed_ts.replace(tzinfo=None)
+                msg_date = parsed_ts
+            except Exception:
+                msg_date = now
+
         # Dynamic reload if key was not available during initialization
         if not self.api_key:
             reload_dotenv()
@@ -119,9 +130,9 @@ class AIIntentClassifier:
         if self.api_key and not AIIntentClassifier._llm_disabled:
             try:
                 if self.provider == "claude":
-                    return self._classify_with_claude(text, latest_msg.channel, now)
+                    return self._classify_with_claude(text, latest_msg.channel, msg_date)
                 else:
-                    return self._classify_with_openai_compatible(text, latest_msg.channel, now)
+                    return self._classify_with_openai_compatible(text, latest_msg.channel, msg_date)
             except Exception as e:
                 provider_display = (
                     f"Claude Sonnet ({self.model})" if self.provider == "claude"
@@ -137,7 +148,7 @@ class AIIntentClassifier:
                     logger.warning(f"{provider_display} API call failed: {e}. Falling back to internal NLP engine.")
 
         # Fallback to internal heuristic semantic classifier
-        return self._classify_with_heuristics(text, latest_msg.channel, now)
+        return self._classify_with_heuristics(text, latest_msg.channel, msg_date)
 
     def _classify_with_claude(
         self, text: str, channel: Channel, reference_date: datetime
