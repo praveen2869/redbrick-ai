@@ -68,19 +68,44 @@ class BusinessRulesEngine:
         now = current_date or datetime.utcnow()
         now_date = now.date()
 
-        # Parse due date with multi-format resilience
+        # Parse due date with multi-format resilience (ISO, human-readable, and multi-month lists)
         due_str = (record.due_date or "").strip()
-        due_dt = None
-        if due_str:
-            clean_str = due_str.split("T")[0].split(" ")[0].strip()
-            for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%Y/%m/%d"):
-                try:
-                    due_dt = datetime.strptime(clean_str, fmt)
-                    break
-                except (ValueError, TypeError):
-                    continue
+        parsed_dates = []
 
-        if not due_dt:
+        if due_str:
+            # 1. Match month name date: e.g. "November 1, 2026" or "October 9, 2026"
+            for m in re.finditer(
+                r'\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(\d{4})\b',
+                due_str, re.IGNORECASE
+            ):
+                try:
+                    month_str, day_str, year_str = m.group(1), m.group(2), m.group(3)
+                    dt = datetime.strptime(f"{month_str} {day_str} {year_str}", "%B %d %Y")
+                    parsed_dates.append(dt)
+                except Exception:
+                    pass
+
+            # 2. Match ISO date: e.g. "2026-11-01" or "2026-10-09"
+            for m in re.finditer(r'\b(\d{4})-(\d{1,2})-(\d{1,2})\b', due_str):
+                try:
+                    dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                    parsed_dates.append(dt)
+                except Exception:
+                    pass
+
+            # 3. Match US slashes: e.g. "11/01/2026"
+            for m in re.finditer(r'\b(\d{1,2})/(\d{1,2})/(\d{4})\b', due_str):
+                try:
+                    dt = datetime(int(m.group(3)), int(m.group(1)), int(m.group(2)))
+                    parsed_dates.append(dt)
+                except Exception:
+                    pass
+
+        if parsed_dates:
+            # Use earliest date for grace period checking so prior-month overdue balances are not suppressed
+            parsed_dates.sort()
+            due_dt = parsed_dates[0]
+        else:
             # Default to the 1st of the current month if unstated or standard monthly lease
             due_dt = datetime(now_date.year, now_date.month, 1)
 

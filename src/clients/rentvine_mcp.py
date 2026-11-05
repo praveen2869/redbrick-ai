@@ -1,3 +1,5 @@
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 """
 Red Bricks Property Management - RentVine Client
 Supports two integration paths:
@@ -21,12 +23,84 @@ import logging
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from src.config import settings
 from src.models import Tenant, RentVineRecord, RentVineNote
 from src.database import db
 
 logger = logging.getLogger("RentVineMCP")
+
+def clean_property_address(prop_name: Optional[str]) -> str:
+    """
+    Cleans internal RentVine portfolio and community prefixes.
+    e.g. 'NONE_5100 @ Central_4124 Salient Street' -> '4124 Salient Street'
+         'Woodcroft(Davis Lake)_4709 Morning Dew Ct' -> '4709 Morning Dew Ct'
+    """
+    if not prop_name:
+        return ""
+    p = str(prop_name).strip()
+    if "_" in p:
+        candidate = p.split("_")[-1].strip()
+        if any(c.isdigit() for c in candidate):
+            return candidate
+    return p
+
+def format_friendly_due_date(val: Optional[str]) -> str:
+    """
+    Formats dates into friendly human-readable format.
+    e.g. '2026-11-01' -> 'November 1, 2026'
+         '2026-10-09' -> 'October 9, 2026'
+         'November 1, 2026' -> 'November 1, 2026'
+    """
+    if not val:
+        return ""
+    val_str = str(val).strip()
+    months_pat = r'\b(January|February|March|April|May|June|July|August|September|October|November|December)\b'
+    if re.search(months_pat, val_str, re.IGNORECASE):
+        return val_str
+    m = re.match(r'^(\d{4})-(\d{1,2})-(\d{1,2})$', val_str)
+    if m:
+        try:
+            year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            dt = datetime(year, month, day)
+            return f"{dt.strftime('%B')} {dt.day}, {dt.year}"
+        except Exception:
+            pass
+    return val_str
+
+def parse_billing_period_and_due(desc: str, date_posted: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Extracts the billing period name and due date from RentVine charge descriptions and datePosted.
+    e.g. 'Rent Income (11-2026)', '2026-11-01' -> ('November 2026', '2026-11-01')
+    """
+    billing_period = None
+    if desc:
+        m = re.search(r'\((\d{1,2})[-/](\d{4})\)', desc)
+        if m:
+            month, year = int(m.group(1)), int(m.group(2))
+            try:
+                billing_period = datetime(year, month, 1).strftime("%B %Y")
+            except Exception:
+                pass
+        else:
+            m2 = re.search(r'\((\d{4})[-/](\d{1,2})\)', desc)
+            if m2:
+                year, month = int(m2.group(1)), int(m2.group(2))
+                try:
+                    billing_period = datetime(year, month, 1).strftime("%B %Y")
+                except Exception:
+                    pass
+
+    if not billing_period and date_posted:
+        try:
+            dt = datetime.strptime(date_posted[:10], "%Y-%m-%d")
+            billing_period = dt.strftime("%B %Y")
+        except Exception:
+            pass
+
+    due_date = date_posted[:10] if date_posted else None
+    return billing_period, due_date
+
 
 
 class RentVineMCPClient:
@@ -217,76 +291,108 @@ class RentVineMCPClient:
         logger.info(f"Synchronized {synced_count} live RentVine leases into local database.")
         return synced_count
 
+    def extract_unpaid_rent_details(self, transactions: List[Dict[str, Any]], total_balance: float = 0.0) -> Dict[str, Any]:
+        """
+        Analyzes RentVine accounting transactions to identify unpaid rent charges,
+        their respective billing periods, and lease-specific due dates.
+        Distinguishes single-month vs. multi-month dues and formats human-readable dates.
+        """
+        unpaid_rent_charges = []
+        seen_periods = set()
+
+        for item in transactions:
+            t = item.get("transaction", {}) if isinstance(item, dict) else {}
+            if str(t.get("isVoided", "0")) == "1" or str(t.get("isSuppressed", "0")) == "1":
+                continue
+
+            ttype = str(t.get("transactionTypeID", ""))
+            desc = (t.get("description") or "").strip()
+            desc_lower = desc.lower()
+            date_posted = str(t.get("datePosted") or "")[:10]
+
+            amt = float(t.get("amount") or 0.0)
+            paid = float(t.get("amountPaid") or 0.0) if t.get("amountPaid") is not None else 0.0
+            remaining = round(amt - paid, 2)
+
+            # Genuine rent charges (excluding insurance, utilities, convenience/reminder fees)
+            is_rent = ("rent" in desc_lower or "prorated" in desc_lower) and ("insurance" not in desc_lower)
+
+            if ttype == "1" and is_rent and remaining > 0:
+                period, due_date = parse_billing_period_and_due(desc, date_posted)
+                key = (period, due_date)
+                if key not in seen_periods:
+                    seen_periods.add(key)
+                    friendly = format_friendly_due_date(due_date) if due_date else ""
+                    unpaid_rent_charges.append({
+                        "description": desc,
+                        "amount": amt,
+                        "unpaid": remaining,
+                        "date_posted": due_date,
+                        "billing_period": period or (due_date[:7] if due_date else ""),
+                        "friendly_due": friendly
+                    })
+
+        # Sort chronological by date_posted
+        unpaid_rent_charges.sort(key=lambda x: x["date_posted"] or "")
+
+        if len(unpaid_rent_charges) == 1:
+            c = unpaid_rent_charges[0]
+            due_date_str = c["friendly_due"]
+            raw_due_date = c["date_posted"]
+            billing_period_str = c["billing_period"]
+            billing_periods = [c["billing_period"]]
+        elif len(unpaid_rent_charges) > 1:
+            # Multi-month outstanding rent: identify and distinguish each billing period
+            parts = [
+                f"{c['friendly_due']} ({c['billing_period']})" if c['billing_period'] else c['friendly_due']
+                for c in unpaid_rent_charges
+            ]
+            if len(parts) == 2:
+                due_date_str = f"{parts[0]} and {parts[1]}"
+            else:
+                due_date_str = ", ".join(parts[:-1]) + f", and {parts[-1]}"
+            raw_due_date = unpaid_rent_charges[0]["date_posted"]
+            billing_period_str = " & ".join(c["billing_period"] for c in unpaid_rent_charges if c["billing_period"])
+            billing_periods = [c["billing_period"] for c in unpaid_rent_charges if c["billing_period"]]
+        else:
+            now = datetime.utcnow()
+            raw_due_date = now.strftime("%Y-%m-01")
+            due_date_str = format_friendly_due_date(raw_due_date)
+            billing_period_str = now.strftime("%B %Y")
+            billing_periods = [billing_period_str]
+
+        return {
+            "due_date": due_date_str,
+            "raw_due_date": raw_due_date,
+            "billing_period": billing_period_str,
+            "billing_periods": billing_periods,
+            "unpaid_rent_charges": unpaid_rent_charges,
+            "unpaid_rent_total": sum(c["unpaid"] for c in unpaid_rent_charges)
+        }
+
     def get_lease_actual_balance(self, lease_id: str, default_rent: float) -> tuple:
         """
         Pulls actual accounting transactions from RentVine to determine whether the tenant
         has already paid (balance = 0.0) or has an outstanding overdue balance.
-        Excludes voided transactions, suppressed system fees, and convenience/processing fees.
-        Enforces a minimum balance threshold ($20.00) so minor residual fees never trigger
-        misleading rent demand reminders. Resolves the true rent due date.
+        Identifies the exact billing period and lease-specific due date.
         """
         now = datetime.now(timezone.utc)
-        current_month_due = now.strftime("%Y-%m-01")
+        current_month_due = format_friendly_due_date(now.strftime("%Y-%m-01"))
         if self.mock_mode or not self._api_base:
             return default_rent, current_month_due
 
         try:
-            today_iso = now.strftime("%Y-%m-%d")
             txs, _ = self._rest_get_with_headers(f"accounting/transactions?leaseID={lease_id}&pageSize=25")
             if not isinstance(txs, list) or len(txs) == 0:
                 return default_rent, current_month_due
 
-            unpaid = 0.0
-            earliest_rent_due = ""
-            total_charges = 0.0
-            total_payments = 0.0
-
-            for item in txs:
-                t = item.get("transaction", {})
-                # Skip voided or suppressed transactions
-                if t.get("isVoided") == "1" or t.get("isSuppressed") == "1":
-                    continue
-
-                ttype = str(t.get("transactionTypeID", ""))
-                date_posted = t.get("datePosted", "")
-                desc = (t.get("description") or "").lower()
-                amount = float(t.get("amount") or 0.0)
-                amount_paid = float(t.get("amountPaid") or 0.0)
-
-                # Skip credit card / eCheck portal convenience fees completely (never rent)
-                if "convenience fee" in desc:
-                    continue
-
-                if ttype == "2":  # Resident payment
-                    total_payments += amount
-                    continue
-                elif ttype == "4":  # eCheck return / NSF (reverses payment)
-                    total_payments -= amount
-                    continue
-
-                # Type 1 = Charges (Rent, Late Fee, etc.)
-                if date_posted and date_posted <= today_iso:
-                    total_charges += amount
-                    # Only genuine rent and late fees count toward overdue rent balance
-                    is_rent = "rent" in desc or "prorated" in desc
-                    is_late_fee = "late fee" in desc
-
-                    if is_rent or is_late_fee:
-                        remaining = max(0.0, amount - amount_paid)
-                        if remaining > 0:
-                            unpaid += remaining
-                            if is_rent and (not earliest_rent_due or date_posted < earliest_rent_due):
-                                earliest_rent_due = date_posted
-
-            # If total payments meet or exceed total charges, balance is fully cleared
-            if total_payments >= total_charges:
-                unpaid = 0.0
-
-            resolved_due = earliest_rent_due if unpaid > 0 and earliest_rent_due else current_month_due
-            return round(unpaid, 2), resolved_due
+            details = self.extract_unpaid_rent_details(txs, total_balance=default_rent)
+            unpaid = details["unpaid_rent_total"] if details["unpaid_rent_charges"] else (default_rent if default_rent > 0 else 0.0)
+            return round(unpaid, 2), details["due_date"]
         except Exception as e:
             logger.warning(f"Failed to check accounting transactions for lease {lease_id}: {e}")
             return default_rent, current_month_due
+
 
     # ─── MCP JSON-RPC (Bearer only) ──────────────────────────────────────────
 
@@ -471,7 +577,6 @@ class RentVineMCPClient:
 
         if not raw_data:
             # Fallback to cached scratch/report_72.json if available
-            import os
             cache_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "scratch", f"report_{report_id}.json")
             if os.path.exists(cache_path):
                 try:
@@ -590,7 +695,8 @@ class RentVineMCPClient:
     def sync_report_to_database(self, report_id: int = 72) -> Dict[str, Any]:
         """
         Synchronizes the authoritative Report #72 into the local SQLite database.
-        - Updates or creates tenant records with their exact contact details and unit.
+        - Updates or creates tenant records with clean property street addresses.
+        - Resolves exact billing periods and lease-specific due dates from RentVine transactions.
         - Sets exact past due balances on rentvine_records.
         - Dynamically updates Manual Review status based on RentVine Follow-Up Notes.
         - When Manual Review is removed and field becomes blank, automatically clears the restriction.
@@ -602,6 +708,22 @@ class RentVineMCPClient:
         synced_count = 0
         report_tenant_ids = set()
 
+        # Parallel fetch transactions for all report leases to extract exact billing periods and due dates
+        lease_tx_map = {}
+        if not self.mock_mode and self._api_base:
+            def _fetch_tx(lid):
+                txs, _ = self._rest_get_with_headers(f"accounting/transactions?leaseID={lid}&pageSize=25")
+                return lid, txs if isinstance(txs, list) else []
+
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                futures = {executor.submit(_fetch_tx, r["lease_id"]): r["lease_id"] for r in records}
+                for f in as_completed(futures):
+                    try:
+                        lid, tx_list = f.result()
+                        lease_tx_map[lid] = tx_list
+                    except Exception as err:
+                        logger.warning(f"Failed to fetch transactions for lease {futures[f]}: {err}")
+
         for rec in records:
             lease_id = rec["lease_id"]
             phone = rec["phone"]
@@ -610,6 +732,8 @@ class RentVineMCPClient:
             last_name = rec["last_name"]
             email = rec["email"]
             prop_name = rec["property_name"]
+            prop_addr = rec.get("property_address") or prop_name
+            clean_prop = clean_property_address(prop_addr)
             unit_name = rec["unit_name"] or rec["unit_address"]
             follow_up = rec.get("follow_up_notes", "")
             has_manual_review = "manual review" in (follow_up or "").lower()
@@ -638,21 +762,26 @@ class RentVineMCPClient:
                 last_name=last_name,
                 phone=phone,
                 email=email,
-                property_name=prop_name,
+                property_name=clean_prop,
                 unit_number=unit_name,
                 is_excluded=is_excluded,
                 exclusion_reason=exclusion_reason
             )
             db.upsert_tenant(t_obj)
 
-            # Upsert RentVine record with follow_up_notes
+            # Resolve exact billing period and due date from transactions
+            tx_list = lease_tx_map.get(lease_id, [])
+            billing_details = self.extract_unpaid_rent_details(tx_list, total_balance=rec["total_balance"])
+            actual_due = billing_details["due_date"]
+
+            # Upsert RentVine record with authoritative balance and actual due date
             rv_rec = RentVineRecord(
                 tenant_id=tenant_id,
                 balance=rec["total_balance"],
                 monthly_rent=rec["monthly_rent"],
-                due_date="2026-10-01",
-                last_payment_date=None,
-                last_payment_amount=0.0,
+                due_date=actual_due,
+                last_payment_date=rec.get("last_payment_date"),
+                last_payment_amount=float(rec.get("last_payment_amount") or 0.0),
                 portal_link=rec["portal_link"],
                 lease_status="ACTIVE",
                 follow_up_notes=follow_up

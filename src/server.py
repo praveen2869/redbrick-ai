@@ -11,7 +11,7 @@ import os
 import sys
 from datetime import datetime
 from http import HTTPStatus
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from typing import Dict, Any, Optional
 from urllib.parse import urlparse, parse_qs, quote
 
@@ -21,7 +21,7 @@ from src.models import (
     Tenant, RentVineRecord, RentVineNote, CommunicationMessage,
     Channel, MessageDirection, DecisionOutcome, IntentType, WorkflowDecision
 )
-from src.clients.rentvine_mcp import RentVineMCPClient
+from src.clients.rentvine_mcp import RentVineMCPClient, clean_property_address, format_friendly_due_date
 from src.clients.quo_sms import QuoSMSClient
 from src.clients.gmail_client import GmailClient
 from src.engine.rules import BusinessRulesEngine
@@ -718,7 +718,7 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
         cache_key = f"quo_live_{selected_line}"
         if cache_key in _API_CACHE:
             cached_time, cached_val = _API_CACHE[cache_key]
-            if now_ts - cached_time < 20:
+            if now_ts - cached_time < 300:
                 return self._send_json(cached_val)
 
         # Resolve phone line identity based on selection
@@ -800,102 +800,97 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
 
             classifier = AIIntentClassifier()
 
-            # Query OpenPhone /messages directly for each overdue tenant's phone
-            for p10 in overdue_phones:
+            # Query OpenPhone /messages in parallel for overdue tenant phones
+            def _fetch_phone_msgs(p10):
                 t = report_phone_to_tenant.get(p10)
                 e164 = f"+1{p10}"
                 encoded_p = _up.quote(e164)
                 msg_url = f"{settings.QUO_API_URL}/messages?phoneNumberId={phone_id}&participants[]={encoded_p}&maxResults=10"
-
                 try:
                     req = _ur.Request(msg_url, headers=headers)
-                    with _ur.urlopen(req, timeout=6) as resp:
+                    with _ur.urlopen(req, timeout=5) as resp:
                         msg_data = json.loads(resp.read().decode("utf-8"))
-                        raw_msgs = msg_data.get("data", []) or []
-                        if raw_msgs:
-                            matched_overdue_convs += 1
-                            t_name = t.full_name if t else "Tenant"
-                            prop_unit = f"{t.property_name} {t.unit_number}".strip() if t else ""
-
-                            comm_msgs = []
-                            for m in raw_msgs:
-                                txt = m.get("text", m.get("body", ""))
-                                is_inbound = (m.get("direction") == "incoming")
-                                created_ts = m.get("createdAt", m.get("deliveredAt", ""))
-                                msg_status = m.get("status", "delivered").upper()
-
-                                c_msg = CommunicationMessage(
-                                    id=m.get("id", ""),
-                                    tenant_id=t.id if t else f"phone_{p10}",
-                                    channel=Channel.SMS,
-                                    direction=MessageDirection.INBOUND if is_inbound else MessageDirection.OUTBOUND,
-                                    sender=m.get("from", ""),
-                                    recipient=(m.get("to") or [""])[0] if m.get("to") else "",
-                                    content=txt,
-                                    timestamp=created_ts,
-                                    status=msg_status
-                                )
-                                comm_msgs.append(c_msg)
-                                db.save_message(c_msg)
-
-                                openphone_messages.append({
-                                    "id": m.get("id", ""),
-                                    "conversation_id": m.get("conversationId", ""),
-                                    "direction": "INBOUND" if is_inbound else "OUTBOUND",
-                                    "content": txt,
-                                    "timestamp": created_ts,
-                                    "status": "RECEIVED" if is_inbound else msg_status,
-                                    "tenant_name": t_name,
-                                    "phone": e164,
-                                    "tenant_id": t.id if t else "",
-                                    "property_unit": prop_unit,
-                                    "source": "openphone_live",
-                                    "line": selected_line,
-                                    "inbox": inbox_name
-                                })
-
-                            # Check tenant communications for payment promise
-                            if t and comm_msgs:
-                                ai_res = classifier.classify_tenant_communications(comm_msgs, reference_date=datetime.utcnow())
-                                if ai_res.intent == IntentType.PROMISE_MADE:
-                                    from datetime import timedelta as _td
-                                    p_date = ai_res.extracted_date or (datetime.utcnow().date() + _td(days=3)).strftime("%Y-%m-%d")
-                                    today_str = datetime.utcnow().strftime("%Y-%m-%d")
-                                    if p_date >= today_str:
-                                        # Save HOLD_PROMISE decision so reminder is suppressed
-                                        rv_bal = db.get_rentvine_record(t.id)
-                                        bal_val = float(rv_bal.balance) if rv_bal else 0.0
-                                        hold_dec = WorkflowDecision(
-                                            tenant_id=t.id,
-                                            tenant_name=t.full_name,
-                                            property_unit=prop_unit,
-                                            balance=bal_val,
-                                            outcome=DecisionOutcome.HOLD_PROMISE,
-                                            reason=f"Payment promised via Quo SMS for {p_date}: \"{ai_res.raw_text}\" — reminder held",
-                                            details={
-                                                "intent": "PROMISE_MADE",
-                                                "promise_date": p_date,
-                                                "extracted_date": p_date,
-                                                "raw_text": ai_res.raw_text,
-                                                "channel": "SMS"
-                                            },
-                                            timestamp=datetime.utcnow().isoformat(),
-                                            run_id="quo_sync"
-                                        )
-                                        db.save_decision(hold_dec)
-                                        logger.info(f"[Quo Promise] Payment commitment recorded for {t.full_name}: pay by {p_date}")
-
-                except _ue.HTTPError as he:
-                    logger.warning(f"[Quo] HTTP {he.code} fetching messages for {e164}: {he}")
-                    quo_api_status = f"HTTP {he.code}"
-                    quo_api_error = str(he)
-                    if he.code in (401, 403):
-                        logger.warning("[Quo] Token expired or unauthorized; skipping remaining queries.")
-                        break
+                        return (p10, t, e164, msg_data.get("data", []) or [])
                 except Exception as e:
-                    logger.warning(f"[Quo] Failed to fetch messages for {e164}: {e}")
-                    quo_api_status = "ERROR"
-                    quo_api_error = str(e)
+                    return (p10, t, e164, [])
+
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                fetch_results = list(executor.map(_fetch_phone_msgs, list(overdue_phones)))
+
+            for p10, t, e164, raw_msgs in fetch_results:
+                if not raw_msgs:
+                    continue
+                matched_overdue_convs += 1
+                t_name = t.full_name if t else "Tenant"
+                prop_unit = f"{t.property_name} {t.unit_number}".strip() if t else ""
+
+                comm_msgs = []
+                for m in raw_msgs:
+                    txt = m.get("text", m.get("body", ""))
+                    is_inbound = (m.get("direction") == "incoming")
+                    created_ts = m.get("createdAt", m.get("deliveredAt", ""))
+                    msg_status = m.get("status", "delivered").upper()
+
+                    c_msg = CommunicationMessage(
+                        id=m.get("id", ""),
+                        tenant_id=t.id if t else f"phone_{p10}",
+                        channel=Channel.SMS,
+                        direction=MessageDirection.INBOUND if is_inbound else MessageDirection.OUTBOUND,
+                        sender=m.get("from", ""),
+                        recipient=(m.get("to") or [""])[0] if m.get("to") else "",
+                        content=txt,
+                        timestamp=created_ts,
+                        status=msg_status
+                    )
+                    comm_msgs.append(c_msg)
+                    db.save_message(c_msg)
+
+                    openphone_messages.append({
+                        "id": m.get("id", ""),
+                        "conversation_id": m.get("conversationId", ""),
+                        "direction": "INBOUND" if is_inbound else "OUTBOUND",
+                        "content": txt,
+                        "timestamp": created_ts,
+                        "status": "RECEIVED" if is_inbound else msg_status,
+                        "tenant_name": t_name,
+                        "phone": e164,
+                        "tenant_id": t.id if t else "",
+                        "property_unit": prop_unit,
+                        "source": "openphone_live",
+                        "line": selected_line,
+                        "inbox": inbox_name
+                    })
+
+                # Check tenant communications for payment promise
+                if t and comm_msgs:
+                    ai_res = classifier.classify_tenant_communications(comm_msgs, reference_date=datetime.utcnow())
+                    if ai_res.intent == IntentType.PROMISE_MADE:
+                        from datetime import timedelta as _td
+                        p_date = ai_res.extracted_date or (datetime.utcnow().date() + _td(days=3)).strftime("%Y-%m-%d")
+                        today_str = datetime.utcnow().strftime("%Y-%m-%d")
+                        if p_date >= today_str:
+                            rv_bal = db.get_rentvine_record(t.id)
+                            bal_val = float(rv_bal.balance) if rv_bal else 0.0
+                            hold_dec = WorkflowDecision(
+                                tenant_id=t.id,
+                                tenant_name=t.full_name,
+                                property_unit=prop_unit,
+                                balance=bal_val,
+                                outcome=DecisionOutcome.HOLD_PROMISE,
+                                reason=f"Payment promised via Quo SMS for {p_date}: \"{ai_res.raw_text}\" — reminder held",
+                                details={
+                                    "intent": "PROMISE_MADE",
+                                    "promise_date": p_date,
+                                    "extracted_date": p_date,
+                                    "raw_text": ai_res.raw_text,
+                                    "channel": "SMS"
+                                },
+                                timestamp=datetime.utcnow().isoformat(),
+                                run_id="quo_sync"
+                            )
+                            db.save_decision(hold_dec)
+                            logger.info(f"[Quo Promise] Payment commitment recorded for {t.full_name}: pay by {p_date}")
 
         # ─── 2. Build reminders queue from REAL workflow decisions only ───
         # Strictly associated with Tenants & Vendors line ((980) 300-7559)
@@ -929,9 +924,19 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
             if not t.phone or t.phone.startswith("+1-415-555"):
                 continue
 
-            clean_prop = (t.property_name or d.property_unit or "").strip()
+            clean_prop = clean_property_address(t.property_name or d.property_unit or "")
             unit_val = (t.unit_number or "").strip()
-            prop_display = f"{clean_prop} {unit_val}".strip() if unit_val and unit_val not in clean_prop else clean_prop
+            clean_unit = clean_property_address(unit_val)
+            if (
+                unit_val
+                and unit_val != clean_prop
+                and clean_unit != clean_prop
+                and unit_val not in clean_prop
+                and not unit_val.startswith("NONE_")
+            ):
+                prop_display = f"{clean_prop} {unit_val}".strip()
+            else:
+                prop_display = clean_prop
             fu_text = getattr(rv, "follow_up_notes", "") or ""
 
             # ── 1. Manual Review / Disputes: reminders disabled per Follow-Up Notes or AI dispute ──
@@ -1015,8 +1020,9 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
 
             # Build SMS preview with proper paragraph spacing (WhatsApp / Quo SMS format)
             portal = rv.portal_link if rv else "https://redbricksproperties.rentvine.com/portal/pay"
-            due = rv.due_date if rv else "2026-10-01"
-            clean_prop = (t.property_name or d.property_unit or "").strip()
+            due = rv.due_date if rv and rv.due_date else "November 1, 2026"
+            raw_prop = (t.property_name or d.property_unit or "").strip()
+            clean_prop = clean_property_address(raw_prop)
             effective_bal = float(d.balance if d.balance is not None else (rv.balance if rv else 0.0))
 
             try:
@@ -1032,14 +1038,22 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                 sms_text = (
                     f"Hi {t.first_name},\n\n"
                     f"Friendly reminder from Red Bricks Property Management:\n\n"
-                    f"Your rent of ${effective_bal:,.2f} was due on {due}.\n\n"
-                    f"Please pay via your RentVine portal ({portal}) or reply here if you've already sent it.\n\n"
-                    f"Thank you!"
+                    f"Your rent of ${effective_bal:,.2f} for {clean_prop} was due on {due}. The grace period ends today, November 5. Please submit your payment by tonight to avoid late fees beginning tomorrow, November 6.\n\n"
+                    f"You can pay through your RentVine portal ({portal}). If you've already submitted your payment, please reply here so we can check its status.\n\n"
+                    f"Thank you!\n"
+                    f"RBPM bot"
                 )
 
             # Deduplicate property_unit display for HITL table
             unit_val = (t.unit_number or "").strip()
-            if unit_val and unit_val != clean_prop and unit_val not in clean_prop:
+            clean_unit = clean_property_address(unit_val)
+            if (
+                unit_val
+                and unit_val != clean_prop
+                and clean_unit != clean_prop
+                and unit_val not in clean_prop
+                and not unit_val.startswith("NONE_")
+            ):
                 prop_display = f"{clean_prop} {unit_val}".strip()
             else:
                 prop_display = clean_prop
@@ -1053,6 +1067,7 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                 "tenant_id": d.tenant_id,
                 "tenant_name": d.tenant_name or t.full_name,
                 "property_unit": prop_display,
+                "due_date": due,
                 "phone": t.phone,
                 "balance": effective_bal,
                 "status": "AWAITING_HITL_APPROVAL",
@@ -1683,7 +1698,7 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
             self.wfile.write(f"500 Internal Server Error: {e}".encode("utf-8"))
 
 def start_server(host: str = "127.0.0.1", port: int = 8000):
-    server = HTTPServer((host, port), RedBrickAPIHandler)
+    server = ThreadingHTTPServer((host, port), RedBrickAPIHandler)
     print(f"================================================================")
     print(f" RED BRICKS PROPERTY MANAGEMENT - AI AUTOMATION CONTROL CENTER")
     print(f" Serving at: http://{host}:{port}/")

@@ -139,7 +139,8 @@ class AIIntentClassifier:
                     else ("Groq" if self.provider == "groq" else "OpenAI")
                 )
                 err_str = str(e)
-                if any(x in err_str for x in ["401", "403", "Forbidden", "Unauthorized", "invalid x-api-key"]):
+                if any(x in err_str for x in ["401", "403", "404", "Forbidden", "Unauthorized", "invalid x-api-key", "Not Found"]):
+                    AIIntentClassifier._llm_disabled = True
                     logger.warning(
                         f"{provider_display} API auth error ({e}). Please verify API key in .env. "
                         "Falling back to built-in semantic NLP engine."

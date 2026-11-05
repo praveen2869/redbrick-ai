@@ -89,13 +89,30 @@ def normalize_ai_model(provider: str, model_name: Optional[str]) -> str:
 class ReminderTemplate(str):
     """
     Structured SMS Reminder Template supporting multi-paragraph formatting with blank lines,
-    clean spacing, and property/unit deduplication.
+    clean spacing, property/unit deduplication, and dynamic grace-period / late-fee date resolution.
     """
     def format(self, *args, **kwargs):
         prop = str(kwargs.get("property_name", "") or kwargs.get("property_unit", "")).strip()
         unit = str(kwargs.get("unit_number", "")).strip()
+
+        # Clean internal NONE_ or portfolio prefixes from property name if separated by _
+        if "_" in prop:
+            candidate = prop.split("_")[-1].strip()
+            if any(c.isdigit() for c in candidate):
+                prop = candidate
+
+        clean_unit = unit.split("_")[-1].strip() if "_" in unit else unit
+
         if unit:
-            if unit in prop or prop.endswith(unit):
+            if (
+                unit == prop
+                or clean_unit == prop
+                or prop in unit
+                or unit in prop
+                or unit.startswith("NONE_")
+                or prop.endswith(unit)
+                or ("unit" in unit.lower() and any(k in prop.lower() for k in ["court", "street", "drive", "lane", "road", "way", "dr", "st", "ln", "ct", "rd", "cir"]))
+            ):
                 unit_fmt = ""
             elif not unit.startswith(" "):
                 unit_fmt = f" {unit}"
@@ -104,6 +121,51 @@ class ReminderTemplate(str):
         else:
             unit_fmt = ""
 
+        # Resolve due date, grace period end date, and late fee start date
+        due_val = str(kwargs.get("due_date", "") or "").strip()
+        month_name = None
+        due_day = 1
+
+        # Check ISO format: YYYY-MM-DD
+        iso_m = re.search(r'(\d{4})-(\d{1,2})-(\d{1,2})', due_val)
+        if iso_m:
+            try:
+                from datetime import datetime as _dt
+                d_obj = _dt(int(iso_m.group(1)), int(iso_m.group(2)), int(iso_m.group(3)))
+                month_name = d_obj.strftime('%B')
+                due_day = d_obj.day
+            except Exception:
+                pass
+        else:
+            # Check Month Day: e.g. "November 1" or "November 1, 2026"
+            month_m = re.findall(
+                r'\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})\b',
+                due_val, re.IGNORECASE
+            )
+            if month_m:
+                last_m = month_m[-1]
+                month_name = last_m[0].capitalize()
+                due_day = int(last_m[1])
+
+        if not month_name:
+            from datetime import datetime as _dt
+            now = _dt.utcnow()
+            month_name = now.strftime('%B')
+            due_day = 1
+
+        # Default in NC / Red Bricks: Grace period ends on 5th (or due_day + 4), late fees begin on 6th
+        grace_day = 5 if due_day == 1 else (due_day + 4)
+        late_fee_day = grace_day + 1
+
+        # Formatted due date: "Month Day" (e.g. "November 1") unless multi-month
+        if not ("and" in due_val and "(" in due_val):
+            formatted_due = f"{month_name} {due_day}"
+        else:
+            formatted_due = due_val
+
+        kwargs["due_date"] = kwargs.get("due_date_override") or formatted_due
+        kwargs["grace_period_end_date"] = kwargs.get("grace_period_end_date") or f"{month_name} {grace_day}"
+        kwargs["late_fee_start_date"] = kwargs.get("late_fee_start_date") or f"{month_name} {late_fee_day}"
         kwargs["unit_number"] = unit_fmt
         kwargs["property_name"] = prop
         kwargs["property_unit"] = f"{prop}{unit_fmt}".strip()
@@ -244,9 +306,10 @@ class Settings:
     REMINDER_TEMPLATE: ReminderTemplate = ReminderTemplate(
         "Hi {tenant_name},\n\n"
         "Friendly reminder from Red Bricks Property Management:\n\n"
-        "Your rent of ${balance:,.2f} for {property_name}{unit_number} was due on {due_date}.\n\n"
-        "Please pay via your RentVine portal ({portal_link}) or reply here if you've already sent it.\n\n"
-        "Thank you!"
+        "Your rent of ${balance:,.2f} for {property_name}{unit_number} was due on {due_date}. The grace period ends today, {grace_period_end_date}. Please submit your payment by tonight to avoid late fees beginning tomorrow, {late_fee_start_date}.\n\n"
+        "You can pay through your RentVine portal ({portal_link}). If you've already submitted your payment, please reply here so we can check its status.\n\n"
+        "Thank you!\n"
+        "RBPM bot"
     )
 
 settings = Settings()

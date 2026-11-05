@@ -76,8 +76,8 @@ class TestWorkflow(unittest.TestCase):
         reminded_names = [d.tenant_name for d in summary.decisions if d.outcome == DecisionOutcome.SEND_REMINDER]
         self.assertIn("Christopher Pittman", reminded_names)
         self.assertIn("Ke'Juana Ford", reminded_names)
-        # Even $1.00 tenants are included
-        self.assertIn("Ashley Oliver", reminded_names)
+        # Even small balance and current month tenants are included
+        self.assertIn("Joshua Lewis", reminded_names)
         self.assertIn("Francis Matuvanga", reminded_names)
         self.assertIn("Yuliya Chernyshov", reminded_names)
 
@@ -143,9 +143,9 @@ class TestWorkflow(unittest.TestCase):
         expected_kukunoor = (
             "Hi Kukunoor,\n\n"
             "Friendly reminder from Red Bricks Property Management:\n\n"
-            "Your rent of $1,000.00 for 8620 Fairgreen Avenue was due on 2026-10-01.\n\n"
-            "Please pay via your RentVine portal (https://redbricksproperties.rentvine.com/portal/pay) or reply here if you've already sent it.\n\n"
-            "Thank you!"
+            "Your rent of $1,000.00 for 8620 Fairgreen Avenue was due on October 1. The grace period ends today, October 5. Please submit your payment by tonight to avoid late fees beginning tomorrow, October 6.\n\n"
+            "You can pay through your RentVine portal (https://redbricksproperties.rentvine.com/portal/pay). If you've already submitted your payment, please reply here so we can check its status.\n\n"
+            "Thank you!\nRBPM bot"
         )
         self.assertEqual(sms_kukunoor, expected_kukunoor)
 
@@ -158,8 +158,9 @@ class TestWorkflow(unittest.TestCase):
             due_date="2026-10-01",
             portal_link="https://redbricksproperties.rentvine.com/portal/pay"
         )
-        self.assertIn("Your rent of $2,209.00 for Brookdale Village_5601 Stafford Road was due on 2026-10-01.", sms_tao)
+        self.assertIn("Your rent of $2,209.00 for 5601 Stafford Road was due on October 1. The grace period ends today, October 5. Please submit your payment by tonight to avoid late fees beginning tomorrow, October 6.", sms_tao)
         self.assertNotIn("Brookdale Village_5601 Stafford Road Brookdale Village_5601 Stafford Road", sms_tao)
+        self.assertIn("RBPM bot", sms_tao)
         self.assertEqual(sms_tao.count("\n\n"), 4)
 
     def test_current_month_grace_period_and_previous_month_overdue_workflow(self):
@@ -546,6 +547,106 @@ class TestWorkflow(unittest.TestCase):
 
         dec = self.orchestrator._process_tenant(t, run_id="run_test_general", is_dry_run=True, current_time=datetime(2026, 10, 20))
         self.assertEqual(dec.outcome, DecisionOutcome.SEND_REMINDER)
+
+
+    def test_joshua_lewis_november_due_date_and_clean_property(self):
+        """
+        Validates Joshua Lewis rent reminder:
+        1. Correctly calculates November 1, 2026 due date (not outdated October 1).
+        2. Cleans NONE_5100 @ Central_ prefix to '4124 Salient Street'.
+        3. Formats exact expected text requested by PM.
+        """
+        from src.config import settings
+        sms_joshua = settings.REMINDER_TEMPLATE.format(
+            tenant_name="Joshua",
+            balance=1895.0,
+            property_name="NONE_5100 @ Central_4124 Salient Street",
+            unit_number="NONE_5100 @ Central_4124 Salient Street",
+            due_date="November 1, 2026",
+            portal_link="https://redbricksproperties.rentvine.com/portal/pay"
+        )
+        self.assertIn("Your rent of $1,895.00 for 4124 Salient Street was due on November 1. The grace period ends today, November 5. Please submit your payment by tonight to avoid late fees beginning tomorrow, November 6.", sms_joshua)
+        self.assertNotIn("NONE_5100 @ Central", sms_joshua)
+        self.assertIn("RBPM bot", sms_joshua)
+
+    def test_multi_month_billing_period_and_historical_due_dates(self):
+        """
+        Validates that when multiple months are outstanding:
+        1. Each billing period is identified and distinguished (not assigned one date to total).
+        2. Historical due dates are retained (e.g. October 1, 2026 and November 1, 2026).
+        3. Custom lease due dates (e.g. October 9th) retain their lease-specific date.
+        """
+        from src.config import settings
+        from src.clients.rentvine_mcp import RentVineMCPClient, format_friendly_due_date
+
+        client = RentVineMCPClient()
+        mock_txs = [
+            {
+                "transaction": {
+                    "transactionTypeID": "1",
+                    "description": "Rent Income (10-2026)",
+                    "datePosted": "2026-10-09",
+                    "amount": "2100.00",
+                    "amountPaid": "0.00"
+                }
+            },
+            {
+                "transaction": {
+                    "transactionTypeID": "1",
+                    "description": "Rent Income (11-2026)",
+                    "datePosted": "2026-11-01",
+                    "amount": "2100.00",
+                    "amountPaid": "0.00"
+                }
+            }
+        ]
+        details = client.extract_unpaid_rent_details(mock_txs, total_balance=4200.0)
+        self.assertEqual(len(details["billing_periods"]), 2)
+        self.assertIn("October 2026", details["billing_periods"])
+        self.assertIn("November 2026", details["billing_periods"])
+        self.assertIn("October 9, 2026 (October 2026) and November 1, 2026 (November 2026)", details["due_date"])
+
+        # Formatted into SMS
+        sms = settings.REMINDER_TEMPLATE.format(
+            tenant_name="Tao",
+            balance=4200.0,
+            property_name="5601 Stafford Road",
+            unit_number="",
+            due_date=details["due_date"],
+            portal_link="https://redbricksproperties.rentvine.com/portal/pay"
+        )
+        self.assertIn("Your rent of $4,200.00 for 5601 Stafford Road was due on October 9, 2026 (October 2026) and November 1, 2026 (November 2026).", sms)
+
+    def test_tamica_bagley_reference_template_format(self):
+        """
+        Validates the exact reference template requested by PM:
+        Tenant: Tamica
+        Rent: $2,795.00
+        Property: Winding Walk - 439 Sweet Shrub Court Northwest, Concord, NC 28027
+        Due: November 1
+        Grace: November 5
+        Late fees: November 6
+        """
+        from src.config import settings
+        sms_tamica = settings.REMINDER_TEMPLATE.format(
+            tenant_name="Tamica",
+            balance=2795.0,
+            property_name="Winding Walk - 439 Sweet Shrub Court Northwest, Concord, NC 28027",
+            unit_number="",
+            due_date="November 1",
+            grace_period_end_date="November 5",
+            late_fee_start_date="November 6",
+            portal_link="https://redbricksproperties.rentvine.com/portal/pay"
+        )
+        expected = (
+            "Hi Tamica,\n\n"
+            "Friendly reminder from Red Bricks Property Management:\n\n"
+            "Your rent of $2,795.00 for Winding Walk - 439 Sweet Shrub Court Northwest, Concord, NC 28027 was due on November 1. The grace period ends today, November 5. Please submit your payment by tonight to avoid late fees beginning tomorrow, November 6.\n\n"
+            "You can pay through your RentVine portal (https://redbricksproperties.rentvine.com/portal/pay). If you've already submitted your payment, please reply here so we can check its status.\n\n"
+            "Thank you!\n"
+            "RBPM bot"
+        )
+        self.assertEqual(sms_tamica, expected)
 
 if __name__ == "__main__":
     unittest.main()
