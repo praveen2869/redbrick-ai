@@ -92,6 +92,9 @@ class ReminderTemplate(str):
     clean spacing, property/unit deduplication, and dynamic grace-period / late-fee date resolution.
     """
     def format(self, *args, **kwargs):
+        # Accept tenant_names (group SMS) as alias for tenant_name
+        if "tenant_names" in kwargs and "tenant_name" not in kwargs:
+            kwargs["tenant_name"] = kwargs["tenant_names"]
         prop = str(kwargs.get("property_name", "") or kwargs.get("property_unit", "")).strip()
         unit = str(kwargs.get("unit_number", "")).strip()
 
@@ -310,6 +313,17 @@ class Settings:
         "You can pay through your RentVine portal ({portal_link}). If you've already submitted your payment, please reply here so we can check its status.\n\n"
         "Thank you!\n"
         "RBPM bot"
+    )
+
+    # Group SMS template used when a lease has multiple co-tenants.
+    # {tenant_names} receives a formatted list like "Joshua, Tenant 2, and Tenant 3"
+    GROUP_REMINDER_TEMPLATE: ReminderTemplate = ReminderTemplate(
+        "Hi {tenant_names},\n\n"
+        "Friendly reminder from Red Bricks Property Management:\n\n"
+        "Your rent of ${balance:,.2f} for {property_name}{unit_number} was due on {due_date}. The grace period ends today, {grace_period_end_date}. Please submit your payment by tonight to avoid late fees beginning tomorrow, {late_fee_start_date}.\n\n"
+        "You can pay through your RentVine portal ({portal_link}). If you've already submitted your payment, please reply here so we can check its status.\n\n"
+        "Thank you!\n"
+        "RBPM BOT"
     )
 
 settings = Settings()

@@ -139,14 +139,22 @@ class PortfolioSyncManager:
                     real_phone = ""
                     real_email = f"{first_name.lower()}@rentvine.demo"
 
+                # Use canonical rv_lease_{lid} so it matches Report 72 sync and prevents duplicate primary rows
+                canonical_tid = f"rv_lease_{lid}"
+                existing = db.get_tenant_by_id(canonical_tid) or db.get_tenant_by_id(f"RV-{lid}")
+                if not existing and real_phone:
+                    existing = db.get_tenant_by_phone(real_phone)
+                final_tid = existing.id if existing else canonical_tid
+
                 tenant = Tenant(
-                    id=f"RV-{lid}",
+                    id=final_tid,
                     first_name=first_name,
                     last_name=last_name,
                     phone=real_phone,
                     email=real_email,
                     property_name=prop_name,
-                    unit_number=unit_num
+                    unit_number=unit_num,
+                    lease_id=str(lid)
                 )
 
                 entry = {
@@ -197,7 +205,7 @@ class PortfolioSyncManager:
                     bal, due = 0.0, "2026-01-01"
 
                 rv_record = RentVineRecord(
-                    tenant_id=f"RV-{lid}",
+                    tenant_id=final_tid,
                     balance=bal,
                     monthly_rent=rent_val,
                     due_date=due,

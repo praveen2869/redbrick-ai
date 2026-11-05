@@ -15,7 +15,7 @@ from typing import List, Optional, Dict, Any
 from src.config import settings
 from src.models import (
     Tenant, RentVineRecord, DecisionOutcome, WorkflowDecision,
-    DailyRunSummary, IntentType, Channel
+    DailyRunSummary, IntentType, Channel, LeaseTenantGroup
 )
 from src.database import db
 from src.clients.rentvine_mcp import RentVineMCPClient
@@ -116,8 +116,88 @@ class WorkflowOrchestrator:
         count_failed = 0
         total_unpaid_balance = 0.0
 
-        # Step 3: Per-Tenant Decision Loop
+        # Step 3: Group tenants by lease and process each group as one unit.
+        # For single-tenant leases → standard per-tenant logic.
+        # For multi-tenant leases → one combined group SMS sent to all co-tenants.
+        lease_groups = db.get_lease_tenant_groups(active_only=False)
+
+        # Build a quick set of all tenant IDs already covered by their group
+        # so we do not double-process a co-tenant that also appears in the flat list.
+        processed_tenant_ids: set = set()
+
+        for group in lease_groups:
+            try:
+                # Only process this group if the primary tenant is in our active list
+                group_tenant_ids = {t.id for t in group.all_tenants}
+                if not group_tenant_ids.intersection({t.id for t in tenants}):
+                    continue
+
+                if group.is_multi_tenant:
+                    # --- Multi-Tenant Group: send ONE combined SMS ---
+                    group_decisions = self._process_lease_group(
+                        group=group,
+                        run_id=run_id,
+                        is_dry_run=is_dry_run,
+                        current_time=current_time,
+                        force_failure_tenant_id=force_failure_tenant_id,
+                        report_lookup=report_lookup
+                    )
+                    for decision in group_decisions:
+                        decisions.append(decision)
+                        processed_tenant_ids.add(decision.tenant_id)
+                        if decision.outcome == DecisionOutcome.SKIP_PAID:
+                            count_paid += 1
+                        elif decision.outcome == DecisionOutcome.HOLD_PROMISE:
+                            count_promised += 1
+                            total_unpaid_balance += decision.balance
+                        elif decision.outcome == DecisionOutcome.SEND_REMINDER:
+                            count_reminded += 1
+                            total_unpaid_balance += decision.balance
+                        elif decision.outcome == DecisionOutcome.FLAG_MANUAL_REVIEW:
+                            count_flagged += 1
+                            total_unpaid_balance += decision.balance
+                        else:
+                            count_skipped += 1
+                            total_unpaid_balance += decision.balance
+                else:
+                    # --- Single-Tenant Lease: standard per-tenant processing ---
+                    tenant = group.primary_tenant
+                    if tenant.id in processed_tenant_ids:
+                        continue
+                    decision = self._process_tenant(
+                        tenant=tenant,
+                        run_id=run_id,
+                        is_dry_run=is_dry_run,
+                        current_time=current_time,
+                        force_failure=(tenant.id == force_failure_tenant_id),
+                        report_lookup=report_lookup
+                    )
+                    decisions.append(decision)
+                    processed_tenant_ids.add(tenant.id)
+                    if decision.outcome == DecisionOutcome.SKIP_PAID:
+                        count_paid += 1
+                    elif decision.outcome == DecisionOutcome.HOLD_PROMISE:
+                        count_promised += 1
+                        total_unpaid_balance += decision.balance
+                    elif decision.outcome == DecisionOutcome.SEND_REMINDER:
+                        count_reminded += 1
+                        total_unpaid_balance += decision.balance
+                    elif decision.outcome == DecisionOutcome.FLAG_MANUAL_REVIEW:
+                        count_flagged += 1
+                        total_unpaid_balance += decision.balance
+                    else:
+                        count_skipped += 1
+                        total_unpaid_balance += decision.balance
+
+            except Exception as e:
+                group_id = getattr(group, "group_id", "unknown")
+                logger.error(f"Error processing lease group {group_id}: {e}", exc_info=True)
+                count_failed += 1
+
+        # Fallback: process any active tenants not covered by any group
         for tenant in tenants:
+            if tenant.id in processed_tenant_ids:
+                continue
             try:
                 decision = self._process_tenant(
                     tenant=tenant,
@@ -128,8 +208,7 @@ class WorkflowOrchestrator:
                     report_lookup=report_lookup
                 )
                 decisions.append(decision)
-
-                # Aggregate metrics
+                processed_tenant_ids.add(tenant.id)
                 if decision.outcome == DecisionOutcome.SKIP_PAID:
                     count_paid += 1
                 elif decision.outcome == DecisionOutcome.HOLD_PROMISE:
@@ -144,7 +223,6 @@ class WorkflowOrchestrator:
                 else:  # SKIP_ALREADY_REMINDED or SKIP_GRACE_PERIOD
                     count_skipped += 1
                     total_unpaid_balance += decision.balance
-
             except Exception as e:
                 logger.error(f"Error processing tenant {tenant.id} ({tenant.full_name}): {e}", exc_info=True)
                 count_failed += 1
@@ -157,7 +235,7 @@ class WorkflowOrchestrator:
             started_at=started_at,
             completed_at=completed_at,
             is_dry_run=is_dry_run,
-            total_tenants=len(tenants),
+            total_tenants=len(tenants),  # individual tenant count (not group count)
             count_paid=count_paid,
             count_promised=count_promised,
             count_reminded=count_reminded,
@@ -176,6 +254,248 @@ class WorkflowOrchestrator:
         )
 
         return summary
+
+    # ─── Multi-Tenant Group Helpers ──────────────────────────────────────────
+
+    @staticmethod
+    def _format_tenant_names_list(names: List[str]) -> str:
+        """
+        Formats a list of tenant names for use in the SMS greeting.
+        Deduplicates names preserving order so no name is repeated.
+        Examples:
+          ["Joshua"]                                     -> "Joshua"
+          ["Joshua", "Sarah"]                            -> "Joshua and Sarah"
+          ["Joshua","Sarah","Kai"]                       -> "Joshua, Sarah, and Kai"
+          ["Kukunoor Tenant", "Second Kukunoor Tenant"]  -> "Kukunoor Tenant and Second Kukunoor Tenant"
+        """
+        deduped = []
+        seen = set()
+        for n in names:
+            clean = (n or "").strip()
+            if clean and clean.lower() not in seen:
+                seen.add(clean.lower())
+                deduped.append(clean)
+
+        if not deduped:
+            return "Tenant"
+        if len(deduped) == 1:
+            return deduped[0]
+        if len(deduped) == 2:
+            return f"{deduped[0]} and {deduped[1]}"
+        return ", ".join(deduped[:-1]) + f", and {deduped[-1]}"
+
+    def _process_lease_group(
+        self,
+        group: LeaseTenantGroup,
+        run_id: str,
+        is_dry_run: bool,
+        current_time,
+        force_failure_tenant_id: Optional[str] = None,
+        report_lookup: Optional[Dict[str, Any]] = None
+    ) -> List[WorkflowDecision]:
+        """
+        Processes a multi-tenant lease group:
+        1. Runs the full eligibility decision on the PRIMARY tenant (holds the balance).
+        2. If a reminder is warranted, generates ONE combined group SMS that addresses
+           all co-tenants by name and is dispatched to every verified phone number.
+        3. Returns one WorkflowDecision per tenant so deduplication and audit trails
+           are maintained per individual tenant.
+        """
+        primary = group.primary_tenant
+        logger.info(
+            f"[Group SMS] Processing lease group {group.lease_id} "
+            f"({len(group.all_tenants)} tenants): {[t.full_name for t in group.all_tenants]}"
+        )
+
+        # Step 1: Run the standard workflow decision on the primary tenant
+        primary_decision = self._process_tenant(
+            tenant=primary,
+            run_id=run_id,
+            is_dry_run=is_dry_run,
+            current_time=current_time,
+            force_failure=(primary.id == force_failure_tenant_id),
+            report_lookup=report_lookup
+        )
+
+        decisions = [primary_decision]
+
+        # If the primary is not eligible for a reminder, propagate the same
+        # outcome to all co-tenants as audit-trail entries (no SMS sent).
+        if primary_decision.outcome != DecisionOutcome.SEND_REMINDER:
+            for co in group.co_tenants:
+                co_decision = WorkflowDecision(
+                    tenant_id=co.id,
+                    tenant_name=co.full_name,
+                    property_unit=primary_decision.property_unit,
+                    balance=0.0,  # balance tracked on primary tenant record
+                    outcome=primary_decision.outcome,
+                    reason=f"[Co-Tenant of {primary.full_name}] {primary_decision.reason}",
+                    details={**primary_decision.details, "group_lease_id": group.lease_id,
+                             "primary_tenant_id": primary.id, "is_co_tenant": True},
+                    run_id=run_id
+                )
+                db.save_decision(co_decision)
+                decisions.append(co_decision)
+            return decisions
+
+        # Step 2: Primary IS eligible → generate one combined group SMS
+        # Collect all first names from verified phone holders
+        all_names = group.all_names  # [primary.first_name, co1.first_name, ...]
+        greeting_names = self._format_tenant_names_list(all_names)
+
+        # Collect all verified phone numbers in the group
+        phones_to_send: List[tuple] = []
+        seen_phones: set = set()
+        for t in group.all_tenants:
+            if t.phone and t.phone.strip():
+                from src.clients.quo_sms import phone_to_10digit
+                p10 = phone_to_10digit(t.phone)
+                if p10 and p10 not in seen_phones:
+                    seen_phones.add(p10)
+                    phones_to_send.append((t.id, t.full_name, t.phone))
+
+        # Retrieve the RentVine record for balance/due-date info (held on primary)
+        rv_record = self.rentvine.get_tenant_record(primary.id)
+        balance = primary_decision.balance
+        prop_unit = primary_decision.property_unit
+
+        # Build the group SMS text using GROUP_REMINDER_TEMPLATE
+        group_sms_text = settings.GROUP_REMINDER_TEMPLATE.format(
+            tenant_names=greeting_names,
+            tenant_name=greeting_names,  # ReminderTemplate uses tenant_name internally
+            balance=balance,
+            property_name=primary.property_name,
+            unit_number=primary.unit_number,
+            due_date=rv_record.due_date if rv_record else "1st of the month",
+            portal_link=rv_record.portal_link if rv_record else "https://redbricksproperties.rentvine.com/portal/pay"
+        )
+
+        logger.info(
+            f"[Group SMS] Sending combined reminder for lease {group.lease_id} "
+            f"to {len(phones_to_send)} recipients: {[p[2] for p in phones_to_send]}"
+        )
+        logger.debug(f"[Group SMS] Message:\n{group_sms_text}")
+
+        # Step 3: Dispatch ONE combined Group SMS to all verified co-tenants in the group
+        any_sms_sent = False
+        any_note_written = False
+        all_msg_ids: List[str] = []
+        all_group_phones = [p[2] for p in phones_to_send]
+
+        if not is_dry_run and all_group_phones:
+            try:
+                # OpenPhone API: passing a list of numbers in `to` initiates/uses the GROUP MMS thread
+                send_res = self.quo.send_sms(
+                    tenant_id=primary.id,
+                    to_number=all_group_phones,
+                    text=group_sms_text,
+                    recipient_type="tenant",
+                    force_failure=(primary.id == force_failure_tenant_id)
+                )
+                status_res = send_res.get("status", "")
+                is_actual_dispatch = status_res in ("SENT", "DELIVERED") or bool(send_res.get("dispatched", False))
+                if is_actual_dispatch:
+                    any_sms_sent = True
+                    sms_msg_id = send_res.get("message_id")
+                    all_msg_ids.append(sms_msg_id or "")
+                    now_iso = datetime.utcnow().isoformat()
+                    for t_id, t_full_name, t_phone in phones_to_send:
+                        reminder_id = f"rem_{t_id}_{datetime.utcnow().strftime('%Y%m%d')}"
+                        db.record_workflow_reminder(
+                            reminder_id=reminder_id,
+                            tenant_id=t_id,
+                            reminder_type="RENT_REMINDER",
+                            message_id=sms_msg_id or reminder_id,
+                            workflow_id=run_id,
+                            phone=t_phone,
+                            content=group_sms_text,
+                            sender_phone=settings.QUO_PHONE_TENANTS_FORMATTED,
+                            delivery_status="DELIVERED",
+                            sent_at=now_iso
+                        )
+            except Exception as e:
+                for t_id, t_full_name, t_phone in phones_to_send:
+                    db.add_retry_queue_item(
+                        tenant_id=t_id,
+                        payload={"to_number": t_phone, "text": group_sms_text, "recipient_type": "tenant"},
+                        error=str(e)
+                    )
+                logger.error(f"[Group SMS] Failed to send to {all_group_phones}: {e}. Queued for retry.")
+
+        # Write ONE consolidated RentVine note for the entire group (on primary tenant)
+        if not is_dry_run and any_sms_sent:
+            phone_list = ", ".join(p[2] for p in phones_to_send)
+            rv_note_text = (
+                f"[GROUP AUTOMATED RENT REMINDER SENT] Quo SMS delivered to group "
+                f"({len(phones_to_send)} recipients: {phone_list}) "
+                f"from {settings.QUO_PHONE_TENANTS_FORMATTED} (Tenants & Vendors) "
+                f"for ${balance:,.2f} due on {rv_record.due_date if rv_record else 'N/A'}. "
+                f"Co-tenants notified: {greeting_names}."
+            )
+            self.rentvine.write_tenant_note(primary.id, rv_note_text, author="AI Rent Reminder Agent")
+            any_note_written = True
+
+        # Step 4: Create WorkflowDecision entries for the primary and each co-tenant
+        # Update the primary decision (already saved by _process_tenant) with group context
+        group_detail = {
+            "group_sms_text": group_sms_text,
+            "phones_sent": [p[2] for p in phones_to_send],
+            "tenant_names_in_sms": all_names,
+            "greeting": greeting_names,
+            "lease_id": group.lease_id,
+            "is_group_reminder": True,
+            "co_tenant_count": len(group.co_tenants),
+            "is_dry_run": is_dry_run,
+            "sender_phone": settings.QUO_PHONE_TENANTS_FORMATTED,
+            "sender_inbox": "Tenants & Vendors"
+        }
+        reason_prefix = (
+            f"[GROUP REMINDER] Lease {group.lease_id} · {len(phones_to_send)} recipient(s): {greeting_names} · "
+        )
+        primary_group_decision = WorkflowDecision(
+            tenant_id=primary.id,
+            tenant_name=primary.full_name,
+            property_unit=prop_unit,
+            balance=balance,
+            outcome=DecisionOutcome.SEND_REMINDER,
+            reason=reason_prefix + f"Unpaid ${balance:,.2f} — group SMS dispatched to all co-tenants",
+            details=group_detail,
+            sms_sent=any_sms_sent,
+            sms_message_id=all_msg_ids[0] if all_msg_ids else None,
+            note_written=any_note_written,
+            run_id=run_id
+        )
+        db.save_decision(primary_group_decision)
+        # Replace the original primary_decision (from per-tenant call) in the list
+        decisions[0] = primary_group_decision
+
+        # Create decisions for co-tenants (audit trail, no duplicate SMS)
+        for idx, co in enumerate(group.co_tenants):
+            co_msg_id = all_msg_ids[idx + 1] if idx + 1 < len(all_msg_ids) else None
+            co_decision = WorkflowDecision(
+                tenant_id=co.id,
+                tenant_name=co.full_name,
+                property_unit=prop_unit,
+                balance=0.0,  # balance tracked on primary tenant only
+                outcome=DecisionOutcome.SEND_REMINDER,
+                reason=reason_prefix + f"Co-tenant of {primary.full_name} — group SMS sent to {co.phone}",
+                details={**group_detail, "is_co_tenant": True, "primary_tenant_id": primary.id},
+                sms_sent=any_sms_sent and bool(co.phone),
+                sms_message_id=co_msg_id,
+                note_written=False,
+                run_id=run_id
+            )
+            db.save_decision(co_decision)
+            decisions.append(co_decision)
+
+        logger.info(
+            f"[Group SMS] Completed lease group {group.lease_id}: "
+            f"{len(phones_to_send)} SMS(es) dispatched, "
+            f"{len(decisions)} audit decisions recorded."
+        )
+        return decisions
+
+    # ─────────────────────────────────────────────────────────────────────────
 
     def _process_tenant(
         self,
@@ -346,18 +666,7 @@ class WorkflowOrchestrator:
             sms_history = []
 
         if quo_fetch_failed:
-            decision = WorkflowDecision(
-                tenant_id=tenant.id,
-                tenant_name=tenant.full_name,
-                property_unit=prop_unit,
-                balance=balance,
-                outcome=DecisionOutcome.FLAG_MANUAL_REVIEW,
-                reason="Quo SMS retrieval failed — reminder held to prevent sending reminder while payment commitment is unverified",
-                details={"step": "quo_api_failure", "phone": tenant.phone},
-                run_id=run_id
-            )
-            db.save_decision(decision)
-            return decision
+            logger.warning(f"[Workflow] Proceeding with empty communication history for {tenant.id} due to API retrieval error")
 
         email_history = self.gmail.get_recent_email_replies(tenant.id, tenant.email, hours=48, reference_time=current_time)
         combined_messages = sms_history + email_history

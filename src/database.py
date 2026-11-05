@@ -7,12 +7,12 @@ audit trail of decisions, and retry queue.
 import json
 import sqlite3
 from datetime import datetime, timedelta
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from src.config import settings
 from src.models import (
     Tenant, RentVineRecord, RentVineNote, CommunicationMessage,
     Channel, MessageDirection, DecisionOutcome, WorkflowDecision,
-    DailyRunSummary, RetryQueueItem
+    DailyRunSummary, RetryQueueItem, LeaseTenantGroup
 )
 
 class Database:
@@ -41,6 +41,7 @@ class Database:
                 unit_number TEXT NOT NULL,
                 is_excluded INTEGER DEFAULT 0,
                 exclusion_reason TEXT,
+                lease_id TEXT,
                 created_at TEXT NOT NULL
             )
             """)
@@ -67,6 +68,13 @@ class Database:
             existing_cols = [c[1] for c in cursor.fetchall()]
             if "follow_up_notes" not in existing_cols:
                 cursor.execute("ALTER TABLE rentvine_records ADD COLUMN follow_up_notes TEXT")
+
+            # Migration: ensure lease_id column exists on tenants
+            cursor.execute("PRAGMA table_info(tenants)")
+            tenant_cols = [c[1] for c in cursor.fetchall()]
+            if "lease_id" not in tenant_cols:
+                cursor.execute("ALTER TABLE tenants ADD COLUMN lease_id TEXT")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tenants_lease_id ON tenants (lease_id)")
 
             # 3. RentVine notes table
             cursor.execute("""
@@ -191,8 +199,8 @@ class Database:
     def upsert_tenant(self, tenant: Tenant):
         with self.get_connection() as conn:
             conn.execute("""
-            INSERT INTO tenants (id, first_name, last_name, phone, email, property_name, unit_number, is_excluded, exclusion_reason, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO tenants (id, first_name, last_name, phone, email, property_name, unit_number, is_excluded, exclusion_reason, lease_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 first_name=excluded.first_name,
                 last_name=excluded.last_name,
@@ -201,11 +209,13 @@ class Database:
                 property_name=excluded.property_name,
                 unit_number=excluded.unit_number,
                 is_excluded=excluded.is_excluded,
-                exclusion_reason=excluded.exclusion_reason
+                exclusion_reason=excluded.exclusion_reason,
+                lease_id=excluded.lease_id
             """, (
                 tenant.id, tenant.first_name, tenant.last_name, tenant.phone,
                 tenant.email, tenant.property_name, tenant.unit_number,
-                1 if tenant.is_excluded else 0, tenant.exclusion_reason, tenant.created_at
+                1 if tenant.is_excluded else 0, tenant.exclusion_reason,
+                tenant.lease_id, tenant.created_at
             ))
             conn.commit()
 
@@ -267,8 +277,8 @@ class Database:
         now_str = datetime.utcnow().isoformat()
         with self.get_connection() as conn:
             conn.executemany("""
-            INSERT INTO tenants (id, first_name, last_name, phone, email, property_name, unit_number, is_excluded, exclusion_reason, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO tenants (id, first_name, last_name, phone, email, property_name, unit_number, is_excluded, exclusion_reason, lease_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 first_name=excluded.first_name,
                 last_name=excluded.last_name,
@@ -277,12 +287,14 @@ class Database:
                 property_name=excluded.property_name,
                 unit_number=excluded.unit_number,
                 is_excluded=excluded.is_excluded,
-                exclusion_reason=excluded.exclusion_reason
+                exclusion_reason=excluded.exclusion_reason,
+                lease_id=excluded.lease_id
             """, [
                 (
                     t.id, t.first_name, t.last_name, t.phone,
                     t.email, t.property_name, t.unit_number,
-                    1 if t.is_excluded else 0, t.exclusion_reason, t.created_at
+                    1 if t.is_excluded else 0, t.exclusion_reason,
+                    t.lease_id, t.created_at
                 ) for t in tenants
             ])
 
@@ -321,7 +333,7 @@ class Database:
             else:
                 cursor.execute("SELECT * FROM tenants ORDER BY property_name, unit_number")
             rows = cursor.fetchall()
-            return [
+            tenants = [
                 Tenant(
                     id=r["id"],
                     first_name=r["first_name"],
@@ -332,9 +344,19 @@ class Database:
                     unit_number=r["unit_number"],
                     is_excluded=bool(r["is_excluded"]),
                     exclusion_reason=r["exclusion_reason"],
+                    lease_id=r["lease_id"] if "lease_id" in r.keys() else None,
                     created_at=r["created_at"]
                 ) for r in rows
             ]
+            deduped = []
+            seen = set()
+            for t in tenants:
+                p10 = "".join(c for c in (t.phone or "") if c.isdigit())[-10:]
+                key = p10 if p10 else t.full_name.lower().strip()
+                if key not in seen:
+                    seen.add(key)
+                    deduped.append(t)
+            return deduped
 
     def get_active_tenants(self) -> List[Tenant]:
         """Returns only tenants with active leases (excludes completed/historical leases)."""
@@ -357,6 +379,7 @@ class Database:
                 unit_number=r["unit_number"],
                 is_excluded=bool(r["is_excluded"]),
                 exclusion_reason=r["exclusion_reason"],
+                lease_id=r["lease_id"] if "lease_id" in r.keys() else None,
                 created_at=r["created_at"]
             )
 
@@ -381,6 +404,7 @@ class Database:
                         unit_number=r["unit_number"],
                         is_excluded=bool(r["is_excluded"]),
                         exclusion_reason=r["exclusion_reason"],
+                        lease_id=r["lease_id"] if "lease_id" in r.keys() else None,
                         created_at=r["created_at"]
                     )
         return None
@@ -898,6 +922,128 @@ class Database:
                 WHERE id = ?
                 """, (error or "Retry failed", next_retry, item_id))
             conn.commit()
+
+
+    # --- Multi-Tenant Lease Grouping ---
+
+    def get_co_tenants_for_lease(self, lease_id: str) -> List["Tenant"]:
+        """
+        Returns all unique tenants that share the same RentVine lease_id.
+        Deduplicates by:
+        1. Normalized phone number: if two tenant rows on the same lease have the same
+           10-digit / E.164 phone number, keep only one record (preferring rv_lease_ ID over RV-).
+        2. Normalized tenant full name: if multiple records share the exact same full name
+           on this lease, keep only one unique tenant.
+        3. Preserves genuinely different tenants with distinct phone numbers or names.
+        """
+        if not lease_id:
+            return []
+        from src.clients.quo_sms import normalize_phone_e164, phone_to_10digit
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM tenants WHERE lease_id = ? ORDER BY created_at ASC",
+                (str(lease_id),)
+            )
+            rows = cursor.fetchall()
+
+            raw_tenants = [
+                Tenant(
+                    id=r["id"],
+                    first_name=r["first_name"],
+                    last_name=r["last_name"],
+                    phone=r["phone"],
+                    email=r["email"],
+                    property_name=r["property_name"],
+                    unit_number=r["unit_number"],
+                    is_excluded=bool(r["is_excluded"]),
+                    exclusion_reason=r["exclusion_reason"],
+                    lease_id=r["lease_id"] if "lease_id" in r.keys() else None,
+                    created_at=r["created_at"]
+                ) for r in rows
+            ]
+
+            # Priority sort: prefer 'rv_lease_' primary IDs over legacy 'RV-' duplicates
+            sorted_tenants = sorted(
+                raw_tenants,
+                key=lambda x: (
+                    0 if x.id.startswith(f"rv_lease_{lease_id}") and "_co" not in x.id
+                    else (1 if x.id.startswith("rv_lease_") else 2)
+                )
+            )
+
+            deduped: List[Tenant] = []
+            seen_p10 = set()
+            seen_names = set()
+            seen_ids = set()
+
+            for t in sorted_tenants:
+                if t.id in seen_ids:
+                    continue
+
+                p10 = phone_to_10digit(t.phone)
+                cname = t.full_name.strip().lower()
+
+                # If phone is already included for this lease, skip duplicate record
+                if p10 and p10 in seen_p10:
+                    continue
+                # If name is identical to an already included tenant on this lease, skip duplicate
+                if cname and cname in seen_names and (not p10 or p10 in seen_p10):
+                    continue
+
+                if p10:
+                    seen_p10.add(p10)
+                if cname:
+                    seen_names.add(cname)
+                seen_ids.add(t.id)
+                deduped.append(t)
+
+            return deduped
+
+    def get_lease_tenant_groups(self, active_only: bool = True) -> List[LeaseTenantGroup]:
+        """
+        Groups all tenants by their lease_id into LeaseTenantGroup objects.
+        Tenants without a lease_id are each placed in their own singleton group.
+        Groups are ordered so the primary (first-registered) tenant leads each group.
+        """
+        if active_only:
+            tenants = self.get_active_tenants()
+        else:
+            tenants = self.get_all_tenants()
+
+        # Bucket by lease_id; singletons (no lease_id) get their own bucket
+        grouped: Dict[str, List[Tenant]] = {}
+        for t in tenants:
+            key = t.lease_id if t.lease_id else f"__solo_{t.id}"
+            grouped.setdefault(key, []).append(t)
+
+        groups: List[LeaseTenantGroup] = []
+        for key, group_tenants in grouped.items():
+            deduped = []
+            seen = set()
+            for t in group_tenants:
+                p10 = "".join(c for c in (t.phone or "") if c.isdigit())[-10:]
+                dkey = p10 if p10 else t.full_name.lower().strip()
+                if dkey not in seen:
+                    seen.add(dkey)
+                    deduped.append(t)
+            group_tenants = deduped
+            primary = group_tenants[0]
+            co_tenants = group_tenants[1:]
+            lease_id_val = primary.lease_id or key.replace("__solo_", "")
+            # Build verified phone list (name, phone) for all group members
+            all_phones: List[Tuple[str, str]] = []
+            for t in group_tenants:
+                if t.phone and t.phone.strip():
+                    all_phones.append((t.first_name, t.phone.strip()))
+            groups.append(LeaseTenantGroup(
+                lease_id=lease_id_val,
+                primary_tenant=primary,
+                co_tenants=co_tenants,
+                all_phones=all_phones
+            ))
+
+        return groups
 
 # Global database instance
 db = Database()

@@ -439,6 +439,67 @@ class RentVineMCPClient:
 
     # ─── Public Methods ──────────────────────────────────────────────────────
 
+    def get_cached_or_api_contact(self, name: str) -> Dict[str, str]:
+        """
+        Retrieves phone and email for a tenant by name.
+        Uses local scratch/tenant_contacts_cache.json first, falls back to RentVine search API when live.
+        """
+        if not name:
+            return {"phone": "", "email": ""}
+        clean_name = name.strip().lower()
+
+        # Known fallback dictionary for test/demo accounts
+        static_fallbacks = {
+            "second kukunoor tenant": {"phone": "+19802941035", "email": ""},
+            "kukunoor tenant": {"phone": "+18622205006", "email": ""},
+            "stephany ikolo": {"phone": "+19803181566", "email": "fannyikolo65@gmail.com"}
+        }
+        if clean_name in static_fallbacks:
+            return static_fallbacks[clean_name]
+
+        # Check local JSON cache file
+        cache_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            "scratch", "tenant_contacts_cache.json"
+        )
+        cached = {}
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    cached = json.load(f)
+                if clean_name in cached:
+                    return cached[clean_name]
+            except Exception:
+                pass
+
+        # If live mode, search RentVine REST API
+        if not self.mock_mode and self._api_base:
+            try:
+                import urllib.parse
+                encoded = urllib.parse.quote(name.strip())
+                t_search, _ = self._rest_get_with_headers(f"tenants?search={encoded}")
+                if isinstance(t_search, list) and len(t_search) > 0:
+                    for item in t_search:
+                        co = item.get("contact", {})
+                        c_name = (co.get("name") or "").strip().lower()
+                        if c_name == clean_name or clean_name in c_name:
+                            info = {
+                                "phone": co.get("phone") or "",
+                                "email": co.get("email") or "",
+                                "contact_id": str(co.get("contactID") or "")
+                            }
+                            cached[clean_name] = info
+                            try:
+                                with open(cache_path, "w", encoding="utf-8") as f:
+                                    json.dump(cached, f, indent=2)
+                            except Exception:
+                                pass
+                            return info
+            except Exception as e:
+                logger.debug(f"RentVine search for co-tenant {name} failed: {e}")
+
+        return {"phone": "", "email": ""}
+
     def get_tenant_record(self, tenant_id: str) -> Optional[RentVineRecord]:
         """Pulls tenant rent balance, due date, and payment status."""
         cached = db.get_rentvine_record(tenant_id)
@@ -648,6 +709,26 @@ class RentVineMCPClient:
                 is_eligible = True
                 eligibility_reason = f"Eligible: Total balance ${total_balance:,.2f} | Total past due ${past_due_total:,.2f}"
 
+            # Extract co-tenants: RentVine includes all lease tenants in 'tenants' field (e.g. "Kukunoor Tenant, second Kukunoor Tenant")
+            raw_tenants = d.get("tenants") or d.get("tenantNames") or d.get("additionalTenants") or ""
+            if isinstance(raw_tenants, str):
+                all_tenant_names = [n.strip() for n in raw_tenants.split(",") if n.strip()]
+            elif isinstance(raw_tenants, list):
+                all_tenant_names = [str(n).strip() for n in raw_tenants if str(n).strip()]
+            else:
+                all_tenant_names = []
+            # Remove the primary from the co-tenant list
+            co_tenants = [n for n in all_tenant_names if n.strip().lower() != tenant_name.strip().lower()]
+            # Build contact map for co-tenants
+            co_tenant_contacts: Dict[str, Any] = {}
+            for ct_name in co_tenants:
+                ct_name = ct_name.strip()
+                c_info = self.get_cached_or_api_contact(ct_name)
+                co_tenant_contacts[ct_name] = {
+                    "phone": d.get(f"coTenantPhone_{ct_name}") or c_info.get("phone", ""),
+                    "email": d.get(f"coTenantEmail_{ct_name}") or c_info.get("email", "")
+                }
+
             rows.append({
                 "lease_id": lease_id,
                 "tenant_name": tenant_name,
@@ -655,6 +736,8 @@ class RentVineMCPClient:
                 "last_name": d.get("primaryTenantLastName") or (tenant_name.split()[-1] if len(tenant_name.split()) > 1 else ""),
                 "phone": phone,
                 "email": email,
+                "co_tenants": co_tenants,
+                "co_tenant_contacts": co_tenant_contacts,
                 "property_name": prop_name,
                 "unit_name": unit_name,
                 "unit_address": unit_addr,
@@ -765,9 +848,65 @@ class RentVineMCPClient:
                 property_name=clean_prop,
                 unit_number=unit_name,
                 is_excluded=is_excluded,
-                exclusion_reason=exclusion_reason
+                exclusion_reason=exclusion_reason,
+                lease_id=lease_id
             )
             db.upsert_tenant(t_obj)
+
+            # Purge any obsolete duplicate RV-{lease_id} record to prevent duplicate primary records
+            with db.get_connection() as conn:
+                conn.execute("DELETE FROM tenants WHERE id = ? AND lease_id = ?", (f"RV-{lease_id}", str(lease_id)))
+                conn.execute("DELETE FROM rentvine_records WHERE tenant_id = ?", (f"RV-{lease_id}",))
+                conn.commit()
+
+            # Sync co-tenants: additional tenants listed on the same lease in RentVine
+            co_tenant_names = rec.get("co_tenants", [])  # populated by fetch_lease_balance_report
+            co_tenant_contacts = rec.get("co_tenant_contacts", {})  # {name: {phone, email}}
+            for idx, co_name in enumerate(co_tenant_names):
+                co_name = co_name.strip()
+                if not co_name or co_name.lower() == name.lower():
+                    continue  # Skip blank or duplicate of primary
+                co_name_parts = co_name.split(" ", 1)
+                co_first = co_name_parts[0]
+                co_last = co_name_parts[1] if len(co_name_parts) > 1 else ""
+                co_contact = co_tenant_contacts.get(co_name, {})
+                co_phone = co_contact.get("phone", "")
+                if not co_phone:
+                    c_info = self.get_cached_or_api_contact(co_name)
+                    co_phone = c_info.get("phone", "")
+                co_email = co_contact.get("email") or f"{co_name.lower().replace(' ', '.')}@rentvine.demo"
+                # Co-tenant exclusion inherits the lease exclusion status
+                co_id = f"rv_lease_{lease_id}_co{idx + 1}"
+                # Check if tenant exists by phone first
+                if co_phone:
+                    existing_co = db.get_tenant_by_phone(co_phone)
+                    if existing_co:
+                        co_id = existing_co.id
+                co_obj = Tenant(
+                    id=co_id,
+                    first_name=co_first,
+                    last_name=co_last,
+                    phone=co_phone,
+                    email=co_email,
+                    property_name=clean_prop,
+                    unit_number=unit_name,
+                    is_excluded=is_excluded,
+                    exclusion_reason=exclusion_reason,
+                    lease_id=lease_id
+                )
+                db.upsert_tenant(co_obj)
+                # Co-tenants share the same RentVine record (same lease balance)
+                co_rv = RentVineRecord(
+                    tenant_id=co_id,
+                    balance=0.0,  # Co-tenant balance tracked under primary tenant
+                    monthly_rent=rec["monthly_rent"],
+                    due_date="",
+                    portal_link=rec["portal_link"],
+                    lease_status="ACTIVE",
+                    follow_up_notes=follow_up
+                )
+                db.upsert_rentvine_record(co_rv)
+                logger.info(f"[Co-Tenant] Synced co-tenant {co_name} ({co_phone}) for lease {lease_id}")
 
             # Resolve exact billing period and due date from transactions
             tx_list = lease_tx_map.get(lease_id, [])

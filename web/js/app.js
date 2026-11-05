@@ -1012,7 +1012,11 @@ class AppController {
 
       return `
         <tr id="hitl-row-${safeId}">
-          <td><strong>${r.tenant_name}</strong><br><small style="color:#64748b;">${r.tenant_id}</small></td>
+          <td>
+            <strong>${r.tenant_name}</strong>
+            ${r.is_group ? '<span class="badge" style="background:rgba(99,102,241,0.2);color:#818cf8;border:1px solid rgba(99,102,241,0.4);font-size:10px;padding:2px 6px;border-radius:4px;margin-left:6px;vertical-align:middle;">👥 Group SMS</span>' : ''}
+            <br><small style="color:#64748b;">${r.tenant_id}</small>
+          </td>
           <td>${r.property_unit}</td>
           <td><code>${r.phone}</code></td>
           <td><strong style="color:#f87171;">$${Number(r.balance).toLocaleString('en-US', {minimumFractionDigits: 2})}</strong></td>
@@ -1086,7 +1090,7 @@ class AppController {
     try {
       this._initQuoControls();
 
-      const res = await fetch(`/api/quo-live?line=${encodeURIComponent(lineKey)}`);
+      const res = await fetch(`/api/quo-live?line=${encodeURIComponent(lineKey)}&_t=${Date.now()}`);
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Failed to load Quo data");
 
@@ -1287,6 +1291,7 @@ class AppController {
           workflow_id: item.workflow_id || "hitl_queue",
           tenant_id: tenantId, 
           phone: item.phone, 
+          phones: item.phones || [item.phone],
           text: item.sms_preview, 
           recipient_type: "tenant",
           sender_phone_id: item.sender_phone_id || "PNnMjdTFVO",

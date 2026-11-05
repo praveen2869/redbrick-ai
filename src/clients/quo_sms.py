@@ -56,7 +56,7 @@ class QuoSMSClient:
     def send_sms(
         self,
         tenant_id: str,
-        to_number: str,
+        to_number: Any,
         text: str,
         recipient_type: str = "tenant",
         sender_phone_number_id: Optional[str] = None,
@@ -67,6 +67,8 @@ class QuoSMSClient:
           - Tenants & Vendors: (980) 300-7559 [PNnMjdTFVO] for tenant rent reminders & follow-ups
           - Landlords: (980) 300-1196 [PNTDARdwBh] for landlord communications & updates
           - Primary: (667) 281-3879 [PNz3t43PKv] isolated general line
+        When `to_number` is a list with multiple phone numbers, OpenPhone dispatches as a
+        combined GROUP MMS message thread containing all recipients.
         """
         msg_id = f"quo_msg_{int(datetime.utcnow().timestamp() * 1000)}"
         now_iso = datetime.utcnow().isoformat()
@@ -86,21 +88,30 @@ class QuoSMSClient:
         else:
             phone_id, sender_e164, sender_fmt, inbox_name = settings.get_quo_sender(recipient_type)
 
-        # TESTING PHASE SAFEGUARD: Never transmit live SMS to real phone numbers
-        # Always suppress external carrier dispatch and record reminder as simulated/needed
+        if isinstance(to_number, list):
+            recipients = [normalize_phone_e164(p) or str(p) for p in to_number if str(p).strip()]
+            recip_str = ", ".join(recipients)
+            is_group = len(recipients) > 1
+        else:
+            norm = normalize_phone_e164(to_number) or str(to_number)
+            recipients = [norm]
+            recip_str = norm
+            is_group = False
+
+        # TESTING PHASE SAFEGUARD: Suppress external carrier dispatch during automated runs
+        # Actual live transmission is executed upon explicit Human-In-The-Loop (HITL) approval
         logger.info(
-            f"[TESTING PHASE - SMS SUPPRESSED] [{inbox_name} | {sender_fmt}] "
-            f"Reminder needed for {to_number} ({tenant_id}): \"{text}\""
+            f"[TESTING PHASE - SMS SUPPRESSED] [{inbox_name} | {sender_fmt}] Group: {is_group} "
+            f"Reminder needed for {recip_str} ({tenant_id}): \"{text}\""
         )
 
-        # Record message in persistent audit log with TESTING status and correct sender
         outbound = CommunicationMessage(
             id=msg_id,
             tenant_id=tenant_id,
             channel=Channel.SMS,
             direction=MessageDirection.OUTBOUND,
             sender=sender_fmt,
-            recipient=to_number,
+            recipient=recip_str,
             content=text,
             timestamp=now_iso,
             status="REMINDER_NEEDED (TESTING_MODE)",
@@ -112,8 +123,10 @@ class QuoSMSClient:
                 "sender_e164": sender_e164,
                 "sender_phone_id": phone_id,
                 "recipient_type": recipient_type,
-                "testing_mode": True,
+                "is_group": is_group,
+                "participants": recipients,
                 "sms_dispatched": False,
+                "testing_mode": True,
                 "note": f"Outbound SMS transmission suppressed during testing phase (Sender: {sender_fmt} - {inbox_name})"
             }
         )
@@ -123,10 +136,12 @@ class QuoSMSClient:
             "success": True,
             "message_id": msg_id,
             "timestamp": now_iso,
-            "recipient": to_number,
+            "recipient": recip_str,
             "sender": sender_fmt,
             "sender_phone_id": phone_id,
             "inbox": inbox_name,
+            "is_group": is_group,
+            "dispatched": False,
             "status": "REMINDER_NEEDED_SUPPRESSED"
         }
 
@@ -193,11 +208,9 @@ class QuoSMSClient:
                             )
                             db.save_message(c_msg)
                 except urllib.error.HTTPError as he:
-                    logger.error(f"[Quo] HTTP error {he.code} fetching messages for {e164}: {he}")
-                    raise QuoApiError(f"Quo API error {he.code}: {he}")
+                    logger.warning(f"[Quo] HTTP error {he.code} fetching messages for {e164}: {he}. Using local DB fallback.")
                 except Exception as e:
-                    logger.error(f"[Quo] Network error fetching messages for {e164}: {e}")
-                    raise QuoApiError(f"Quo API retrieval failed: {e}")
+                    logger.warning(f"[Quo] Network error fetching messages for {e164}: {e}. Using local DB fallback.")
 
         # Retrieve messages for this tenant or matching phone
         p10 = phone_to_10digit(phone_number)

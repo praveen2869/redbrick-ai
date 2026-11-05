@@ -6,7 +6,7 @@ Defines all data structures for RentVine, Quo SMS, Gmail, AI decisions, and work
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from enum import Enum
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 class Channel(str, Enum):
     SMS = "SMS"
@@ -64,11 +64,66 @@ class Tenant:
     unit_number: str
     is_excluded: bool = False
     exclusion_reason: Optional[str] = None
+    lease_id: Optional[str] = None          # RentVine lease ID — used for multi-tenant grouping
     created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
 
     @property
     def full_name(self) -> str:
-        return f"{self.first_name} {self.last_name}"
+        return f"{self.first_name} {self.last_name}".strip()
+
+    @property
+    def greeting_name(self) -> str:
+        """
+        Returns the friendly name to use in greetings.
+        Examples:
+          Joshua Lewis -> Joshua
+          Tenant 2 -> Tenant 2
+          Tenant 3 -> Tenant 3
+          Kukunoor Tenant -> Kukunoor Tenant
+          second Kukunoor Tenant -> Second Kukunoor Tenant
+          Stephany Ikolo -> Stephany
+        """
+        fn = (self.first_name or "").strip()
+        ln = (self.last_name or "").strip()
+        full = self.full_name.strip()
+
+        # If last name is 'Tenant' or first name is a label like 'second', 'third', 'tenant', 'co'
+        # Return title-cased full name: 'Kukunoor Tenant', 'Second Kukunoor Tenant'
+        if ln.lower() == "tenant" or fn.lower() in ("second", "third", "fourth", "tenant", "co", "co-tenant"):
+            return full.title()
+        if fn:
+            return fn.title()
+        return full.title() or "Tenant"
+
+
+@dataclass
+class LeaseTenantGroup:
+    """
+    Represents all tenants co-located on the same RentVine lease.
+    Used as the unit of work for multi-tenant group SMS reminders.
+    """
+    lease_id: str
+    primary_tenant: "Tenant"               # Row-primary (first listed) tenant
+    co_tenants: List["Tenant"] = field(default_factory=list)  # Additional co-tenants
+    # Combined co-tenant phone numbers (primary + co-tenants with valid phones)
+    all_phones: List[Tuple[str, str]] = field(default_factory=list)  # [(name, phone), ...]
+
+    @property
+    def all_tenants(self) -> List["Tenant"]:
+        return [self.primary_tenant] + self.co_tenants
+
+    @property
+    def all_names(self) -> List[str]:
+        return [t.greeting_name for t in self.all_tenants]
+
+    @property
+    def is_multi_tenant(self) -> bool:
+        return len(self.co_tenants) > 0
+
+    @property
+    def group_id(self) -> str:
+        """Stable group identifier based on lease ID."""
+        return f"lease_{self.lease_id}"
 
 @dataclass
 class CommunicationMessage:

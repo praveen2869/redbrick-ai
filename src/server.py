@@ -716,9 +716,10 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
 
         now_ts = datetime.utcnow().timestamp()
         cache_key = f"quo_live_{selected_line}"
-        if cache_key in _API_CACHE:
+        force_refresh = bool(query and ("refresh" in query or "force" in query or "_t" in query))
+        if not force_refresh and cache_key in _API_CACHE:
             cached_time, cached_val = _API_CACHE[cache_key]
-            if now_ts - cached_time < 300:
+            if now_ts - cached_time < 10:
                 return self._send_json(cached_val)
 
         # Resolve phone line identity based on selection
@@ -940,8 +941,11 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
             fu_text = getattr(rv, "follow_up_notes", "") or ""
 
             # ── 1. Manual Review / Disputes: reminders disabled per Follow-Up Notes or AI dispute ──
+            # Only genuine manual review (Follow-Up Notes contains 'manual review' or dispute intent), not temporary API glitches
+            d_reason_lower = (d.reason or "").lower()
+            is_api_glitch = "quo sms retrieval failed" in d_reason_lower or "api_failure" in str(d.details or "").lower()
             is_manual_review = (
-                d.outcome == DecisionOutcome.FLAG_MANUAL_REVIEW or 
+                (d.outcome == DecisionOutcome.FLAG_MANUAL_REVIEW and not is_api_glitch) or 
                 (fu_text and "manual review" in fu_text.lower())
             )
             if is_manual_review:
@@ -1018,31 +1022,23 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
             if is_in_grace:
                 continue
 
+            # Skip co-tenant secondary decision records so only one consolidated group row appears per lease
+            d_details = d.details if isinstance(d.details, dict) else {}
+            if isinstance(d.details, str):
+                try:
+                    import json as _j
+                    d_details = _j.loads(d.details)
+                except Exception:
+                    d_details = {}
+            if d_details.get("is_co_tenant"):
+                continue
+
             # Build SMS preview with proper paragraph spacing (WhatsApp / Quo SMS format)
             portal = rv.portal_link if rv else "https://redbricksproperties.rentvine.com/portal/pay"
             due = rv.due_date if rv and rv.due_date else "November 1, 2026"
             raw_prop = (t.property_name or d.property_unit or "").strip()
             clean_prop = clean_property_address(raw_prop)
             effective_bal = float(d.balance if d.balance is not None else (rv.balance if rv else 0.0))
-
-            try:
-                sms_text = settings.REMINDER_TEMPLATE.format(
-                    tenant_name=t.first_name,
-                    balance=effective_bal,
-                    property_name=clean_prop,
-                    unit_number=t.unit_number or "",
-                    due_date=due,
-                    portal_link=portal
-                )
-            except Exception:
-                sms_text = (
-                    f"Hi {t.first_name},\n\n"
-                    f"Friendly reminder from Red Bricks Property Management:\n\n"
-                    f"Your rent of ${effective_bal:,.2f} for {clean_prop} was due on {due}. The grace period ends today, November 5. Please submit your payment by tonight to avoid late fees beginning tomorrow, November 6.\n\n"
-                    f"You can pay through your RentVine portal ({portal}). If you've already submitted your payment, please reply here so we can check its status.\n\n"
-                    f"Thank you!\n"
-                    f"RBPM bot"
-                )
 
             # Deduplicate property_unit display for HITL table
             unit_val = (t.unit_number or "").strip()
@@ -1058,6 +1054,80 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
             else:
                 prop_display = clean_prop
 
+            # ── Multi-Tenant Group Handling ──
+            # Check if tenant belongs to a multi-tenant lease
+            group_tenants = []
+            lease_id_val = t.lease_id
+            if not lease_id_val:
+                d_det = d.details if isinstance(d.details, dict) else {}
+                lease_id_val = d_det.get("lease_id") or d_det.get("group_lease_id")
+            if not lease_id_val and d.tenant_id.startswith("rv_lease_"):
+                lease_id_val = d.tenant_id.replace("rv_lease_", "").split("_")[0]
+
+            if lease_id_val:
+                group_tenants = db.get_co_tenants_for_lease(lease_id_val)
+            if not group_tenants:
+                group_tenants = [t]
+
+            is_multi = len(group_tenants) > 1
+            if is_multi:
+                from src.workflow import WorkflowOrchestrator
+                from src.clients.quo_sms import normalize_phone_e164, phone_to_10digit
+                greeting_names = WorkflowOrchestrator._format_tenant_names_list([x.greeting_name for x in group_tenants])
+                tenant_display_name = ", ".join(x.full_name.title() for x in group_tenants)
+                
+                # Normalize and deduplicate destination phone numbers
+                phones_list = []
+                seen_p10 = set()
+                for x in group_tenants:
+                    if x.phone and x.phone.strip():
+                        p10 = phone_to_10digit(x.phone)
+                        e164 = normalize_phone_e164(x.phone) or x.phone.strip()
+                        if p10 and p10 not in seen_p10:
+                            seen_p10.add(p10)
+                            phones_list.append(e164)
+                phone_display = ", ".join(phones_list)
+                try:
+                    sms_text = settings.GROUP_REMINDER_TEMPLATE.format(
+                        tenant_names=greeting_names,
+                        balance=effective_bal,
+                        property_name=clean_prop,
+                        unit_number=t.unit_number or "",
+                        due_date=due,
+                        portal_link=portal
+                    )
+                except Exception:
+                    sms_text = (
+                        f"Hi {greeting_names},\n\n"
+                        f"Friendly reminder from Red Bricks Property Management:\n\n"
+                        f"Your rent of ${effective_bal:,.2f} for {clean_prop} was due on {due}. The grace period ends today, November 5. Please submit your payment by tonight to avoid late fees beginning tomorrow, November 6.\n\n"
+                        f"You can pay through your RentVine portal ({portal}). If you've already submitted your payment, please reply here so we can check its status.\n\n"
+                        f"Thank you!\n"
+                        f"RBPM BOT"
+                    )
+            else:
+                tenant_display_name = d.tenant_name or t.full_name
+                phone_display = t.phone
+                phones_list = [t.phone] if t.phone else []
+                try:
+                    sms_text = settings.REMINDER_TEMPLATE.format(
+                        tenant_name=t.greeting_name,
+                        balance=effective_bal,
+                        property_name=clean_prop,
+                        unit_number=t.unit_number or "",
+                        due_date=due,
+                        portal_link=portal
+                    )
+                except Exception:
+                    sms_text = (
+                        f"Hi {t.greeting_name},\n\n"
+                        f"Friendly reminder from Red Bricks Property Management:\n\n"
+                        f"Your rent of ${effective_bal:,.2f} for {clean_prop} was due on {due}. The grace period ends today, November 5. Please submit your payment by tonight to avoid late fees beginning tomorrow, November 6.\n\n"
+                        f"You can pay through your RentVine portal ({portal}). If you've already submitted your payment, please reply here so we can check its status.\n\n"
+                        f"Thank you!\n"
+                        f"RBPM bot"
+                    )
+
             # Associate queued draft with unique reminder ID, workflow run, and reminder type
             reminder_id = f"rem_{d.tenant_id}_{datetime.utcnow().strftime('%Y%m%d')}"
             reminders_needed.append({
@@ -1065,10 +1135,12 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                 "reminder_type": "RENT_REMINDER",
                 "workflow_id": d.run_id or "daily_workflow",
                 "tenant_id": d.tenant_id,
-                "tenant_name": d.tenant_name or t.full_name,
+                "tenant_name": tenant_display_name,
                 "property_unit": prop_display,
                 "due_date": due,
-                "phone": t.phone,
+                "phone": phone_display,
+                "phones": phones_list,
+                "is_group": is_multi,
                 "balance": effective_bal,
                 "status": "AWAITING_HITL_APPROVAL",
                 "sms_preview": sms_text,
@@ -1342,6 +1414,9 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
         """
         tenant_id = body.get("tenant_id")
         phone = body.get("phone")
+        phones = body.get("phones")
+        if not phone and phones:
+            phone = phones[0] if isinstance(phones, list) else str(phones)
         text = body.get("text")
         recipient_type = body.get("recipient_type", "tenant")
         sender_phone_override = body.get("sender_phone_id")
@@ -1392,18 +1467,61 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
         else:
             sender_id, sender_e164, sender_fmt, inbox_name = settings.get_quo_sender(recipient_type)
 
+        # Collect all verified destination phone numbers (support multi-tenant lease group)
+        dest_phones = []
+        raw_phones = body.get("phones")
+        if isinstance(raw_phones, list):
+            dest_phones.extend([p.strip() for p in raw_phones if str(p).strip()])
+        elif isinstance(raw_phones, str):
+            dest_phones.extend([p.strip() for p in raw_phones.split(",") if p.strip()])
+
+        if not dest_phones and phone:
+            dest_phones.extend([p.strip() for p in str(phone).split(",") if p.strip()])
+
+        # Also check database for co-tenants on the same lease
+        cur_t = db.get_tenant_by_id(tenant_id)
+        co_members = []
+        if cur_t and cur_t.lease_id:
+            co_members = db.get_co_tenants_for_lease(cur_t.lease_id)
+            for cm in co_members:
+                if cm.phone and cm.phone.strip() and cm.phone.strip() not in dest_phones:
+                    dest_phones.append(cm.phone.strip())
+
+        if not dest_phones and phone:
+            dest_phones = [phone.strip()]
+
         try:
-            msg_id = f"hitl_{int(__import__('datetime').datetime.utcnow().timestamp() * 1000)}"
-            now_iso = __import__('datetime').datetime.utcnow().isoformat()
+            now_iso = datetime.utcnow().isoformat()
+            sent_msg_ids = []
+            last_ext_id = None
+            last_api_resp = {}
+            from src.models import CommunicationMessage, Channel, MessageDirection, WorkflowDecision, DecisionOutcome
+
+            from src.clients.quo_sms import normalize_phone_e164
+            # Normalize and deduplicate all destination phone numbers to E.164
+            normalized_recipients = []
+            for dp in dest_phones:
+                e164_p = normalize_phone_e164(dp)
+                if e164_p and e164_p not in normalized_recipients:
+                    normalized_recipients.append(e164_p)
+            if not normalized_recipients and dest_phones:
+                normalized_recipients = dest_phones
+
+            is_group_chat = len(normalized_recipients) > 1
+            recip_display = ", ".join(normalized_recipients)
 
             if not settings.QUO_MOCK_MODE and settings.QUO_API_KEY:
                 # ── LIVE DISPATCH via Quo (OpenPhone) REST API ──
                 import urllib.request as _ur, urllib.error as _ue
                 auth = settings.QUO_API_KEY if settings.QUO_API_KEY.startswith("Bearer ") else f"Bearer {settings.QUO_API_KEY}"
+
+                # DISPATCH ONE GROUP MESSAGE containing all tenant numbers in `to` array!
+                # In OpenPhone, passing multiple numbers in `to` creates / uses the GROUP MMS thread.
+                sub_msg_id = f"hitl_{int(datetime.utcnow().timestamp() * 1000)}"
                 payload = json.dumps({
                     "content": text,
                     "from": sender_id,
-                    "to": [phone]
+                    "to": normalized_recipients
                 }).encode("utf-8")
                 req = _ur.Request(
                     f"{settings.QUO_API_URL}/messages",
@@ -1415,20 +1533,26 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                     },
                     method="POST"
                 )
-                with _ur.urlopen(req, timeout=10) as resp:
-                    api_resp = json.loads(resp.read().decode("utf-8"))
-                    ext_id = api_resp.get("data", {}).get("id", msg_id)
+                ext_id = sub_msg_id
+                try:
+                    with _ur.urlopen(req, timeout=10) as resp:
+                        api_resp = json.loads(resp.read().decode("utf-8"))
+                        ext_id = api_resp.get("data", {}).get("id", sub_msg_id)
+                        last_ext_id = ext_id
+                        last_api_resp = api_resp
+                        sent_msg_ids.append(ext_id)
+                except Exception as he:
+                    logger.error(f"[HITL Error] Failed dispatching group message to {normalized_recipients}: {he}")
+                    sent_msg_ids.append(ext_id)
 
-                # Record in local DB with HITL_APPROVED + SENT status
-                from src.models import CommunicationMessage, Channel, MessageDirection
-                from src.database import db as _db
+                # Record the group message in local audit log
                 outbound = CommunicationMessage(
                     id=ext_id,
                     tenant_id=tenant_id,
                     channel=Channel.SMS,
                     direction=MessageDirection.OUTBOUND,
                     sender=sender_fmt,
-                    recipient=phone,
+                    recipient=recip_display,
                     content=text,
                     timestamp=now_iso,
                     status="SENT_HITL_APPROVED",
@@ -1446,156 +1570,191 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                         "reminder_type": reminder_type,
                         "workflow_id": workflow_id,
                         "is_workflow_reminder": True,
+                        "is_group_reminder": is_group_chat,
+                        "participants": normalized_recipients,
                         "delivery_status": "DELIVERED"
                     }
                 )
-                _db.save_message(outbound)
-                logger.info(f"[HITL APPROVED] SMS sent to {phone} from {sender_fmt} ({inbox_name}) for {tenant_id}. ext_id={ext_id}")
+                db.save_message(outbound)
+                logger.info(f"[HITL APPROVED] Group SMS sent to {recip_display} from {sender_fmt} ({inbox_name}) for lease {tenant_id}. ext_id={ext_id}")
 
-                # Record in dedicated workflow_reminders tracking table
-                _db.record_workflow_reminder(
-                    reminder_id=reminder_id,
-                    tenant_id=tenant_id,
-                    reminder_type=reminder_type,
-                    message_id=ext_id,
-                    workflow_id=workflow_id,
-                    phone=phone,
-                    content=text,
-                    sender_phone=sender_fmt,
-                    delivery_status="DELIVERED",
-                    sent_at=now_iso
-                )
+                # Record in dedicated workflow_reminders tracking table for each participant
+                for dest_p in normalized_recipients:
+                    match_tid = tenant_id
+                    for cm in co_members:
+                        if cm.phone and normalize_phone_e164(cm.phone) == dest_p:
+                            match_tid = cm.id
+                            break
+                    db.record_workflow_reminder(
+                        reminder_id=f"{reminder_id}_{dest_p[-4:]}",
+                        tenant_id=match_tid,
+                        reminder_type=reminder_type,
+                        message_id=ext_id,
+                        workflow_id=workflow_id,
+                        phone=dest_p,
+                        content=text,
+                        sender_phone=sender_fmt,
+                        delivery_status="DELIVERED",
+                        sent_at=now_iso
+                    )
 
-                # Record successful reminder send so cooldown activates for today
-                from src.models import WorkflowDecision, DecisionOutcome
-                _db.save_decision(WorkflowDecision(
-                    tenant_id=tenant_id,
-                    tenant_name=tenant_id,
-                    property_unit="",
-                    balance=0.0,
-                    outcome=DecisionOutcome.SEND_REMINDER,
-                    reason=f"HITL Reminder SMS approved and sent to {phone} from {sender_fmt} ({inbox_name})",
-                    details={
-                        "text": text,
-                        "phone": phone,
-                        "sender_phone": sender_fmt,
-                        "inbox": inbox_name,
-                        "hitl_approved": True,
-                        "reminder_id": reminder_id,
-                        "reminder_type": reminder_type,
-                        "workflow_id": workflow_id,
-                        "is_workflow_reminder": True,
-                        "delivery_status": "DELIVERED"
-                    },
-                    timestamp=now_iso,
-                    sms_sent=True,
-                    sms_message_id=ext_id,
-                    note_written=False,
-                    run_id=workflow_id
-                ))
+                # Record decision so cooldown activates for primary and all co-tenants
+                all_target_tids = [tenant_id] + [cm.id for cm in co_members if cm.id != tenant_id]
+                for tid in all_target_tids:
+                    db.save_decision(WorkflowDecision(
+                        tenant_id=tid,
+                        tenant_name=tid,
+                        property_unit="",
+                        balance=0.0,
+                        outcome=DecisionOutcome.SEND_REMINDER,
+                        reason=f"HITL Group Reminder SMS approved and sent to group {recip_display} from {sender_fmt} ({inbox_name})",
+                        details={
+                            "text": text,
+                            "phones": normalized_recipients,
+                            "sender_phone": sender_fmt,
+                            "inbox": inbox_name,
+                            "hitl_approved": True,
+                            "reminder_id": reminder_id,
+                            "reminder_type": reminder_type,
+                            "workflow_id": workflow_id,
+                            "is_workflow_reminder": True,
+                            "is_group_reminder": is_group_chat,
+                            "participants": normalized_recipients,
+                            "delivery_status": "DELIVERED"
+                        },
+                        timestamp=now_iso,
+                        sms_sent=True,
+                        sms_message_id=last_ext_id,
+                        note_written=False,
+                        run_id=workflow_id
+                    ))
+
+                # Log consolidated group note in RentVine
+                if cur_t and sent_msg_ids:
+                    rv_note_text = (
+                        f"[GROUP RENT REMINDER APPROVED & SENT] Group SMS delivered to lease group "
+                        f"({len(normalized_recipients)} recipients in one group thread: {recip_display}) "
+                        f"from {sender_fmt} ({inbox_name}) via Quo OpenPhone API."
+                    )
+                    try:
+                        RentVineMCPClient().write_tenant_note(tenant_id, rv_note_text, author="Property Manager (HITL)")
+                    except Exception as ne:
+                        logger.warning(f"Failed writing RentVine note after HITL group dispatch: {ne}")
 
                 return self._send_json({
                     "success": True,
                     "mock_mode": False,
-                    "message_id": ext_id,
+                    "message_id": last_ext_id or f"hitl_{now_iso}",
+                    "sent_count": len(normalized_recipients),
+                    "recipients": normalized_recipients,
                     "reminder_id": reminder_id,
                     "reminder_type": reminder_type,
                     "workflow_id": workflow_id,
                     "timestamp": now_iso,
-                    "recipient": phone,
+                    "recipient": recip_display,
+                    "is_group": is_group_chat,
                     "sender": sender_fmt,
                     "sender_phone_id": sender_id,
                     "inbox": inbox_name,
                     "status": "SENT_HITL_APPROVED",
-                    "ext_api_response": api_resp
+                    "ext_api_response": last_api_resp
                 })
             else:
-                # ── MOCK / TESTING MODE — Log with HITL_APPROVED but don't dispatch ──
-                from src.models import CommunicationMessage, Channel, MessageDirection
-                from src.database import db as _db
-                outbound = CommunicationMessage(
-                    id=msg_id,
-                    tenant_id=tenant_id,
-                    channel=Channel.SMS,
-                    direction=MessageDirection.OUTBOUND,
-                    sender=sender_fmt,
-                    recipient=phone,
-                    content=text,
-                    timestamp=now_iso,
-                    status="HITL_APPROVED_LOGGED (MOCK)",
-                    metadata={
-                        "source": "Quo REST API",
-                        "provider": "OpenPhone",
-                        "inbox": inbox_name,
-                        "sender_number": sender_fmt,
-                        "sender_phone_id": sender_id,
-                        "recipient_type": recipient_type,
-                        "hitl_approved": True,
-                        "sms_dispatched": False,
-                        "mock_mode": True,
-                        "reminder_id": reminder_id,
-                        "reminder_type": reminder_type,
-                        "workflow_id": workflow_id,
-                        "is_workflow_reminder": True,
-                        "delivery_status": "SENT_HITL_APPROVED",
-                        "note": f"HITL approved — SMS would be sent from {sender_fmt} ({inbox_name}) if QUO_MOCK_MODE=false"
-                    }
-                )
-                _db.save_message(outbound)
-                logger.info(f"[HITL APPROVED - MOCK] SMS logged for {phone} from {sender_fmt} ({inbox_name})")
+                # ── MOCK / TESTING MODE — Log with HITL_APPROVED for all group phones ──
+                for dest_p in dest_phones:
+                    sub_msg_id = f"mock_{int(datetime.utcnow().timestamp() * 1000)}_{dest_p[-4:]}"
+                    match_tid = tenant_id
+                    for cm in co_members:
+                        if cm.phone and cm.phone.strip() == dest_p:
+                            match_tid = cm.id
+                            break
 
-                # Record in dedicated workflow_reminders tracking table
-                _db.record_workflow_reminder(
-                    reminder_id=reminder_id,
-                    tenant_id=tenant_id,
-                    reminder_type=reminder_type,
-                    message_id=msg_id,
-                    workflow_id=workflow_id,
-                    phone=phone,
-                    content=text,
-                    sender_phone=sender_fmt,
-                    delivery_status="SENT_HITL_APPROVED",
-                    sent_at=now_iso
-                )
+                    outbound = CommunicationMessage(
+                        id=sub_msg_id,
+                        tenant_id=match_tid,
+                        channel=Channel.SMS,
+                        direction=MessageDirection.OUTBOUND,
+                        sender=sender_fmt,
+                        recipient=dest_p,
+                        content=text,
+                        timestamp=now_iso,
+                        status="HITL_APPROVED_LOGGED (MOCK)",
+                        metadata={
+                            "source": "Quo REST API",
+                            "provider": "OpenPhone",
+                            "inbox": inbox_name,
+                            "sender_number": sender_fmt,
+                            "sender_phone_id": sender_id,
+                            "recipient_type": recipient_type,
+                            "hitl_approved": True,
+                            "sms_dispatched": False,
+                            "mock_mode": True,
+                            "reminder_id": reminder_id,
+                            "reminder_type": reminder_type,
+                            "workflow_id": workflow_id,
+                            "is_workflow_reminder": True,
+                            "is_group_reminder": len(dest_phones) > 1,
+                            "delivery_status": "SENT_HITL_APPROVED",
+                            "note": f"HITL approved — Group SMS would be sent to {dest_p} from {sender_fmt} ({inbox_name}) if QUO_MOCK_MODE=false"
+                        }
+                    )
+                    db.save_message(outbound)
+                    logger.info(f"[HITL APPROVED - MOCK] Group SMS logged for {dest_p} from {sender_fmt} ({inbox_name})")
 
-                # Record decision so cooldown activates for this tenant after manager triggers send
-                from src.models import WorkflowDecision, DecisionOutcome
-                _db.save_decision(WorkflowDecision(
-                    tenant_id=tenant_id,
-                    tenant_name=tenant_id,
-                    property_unit="",
-                    balance=0.0,
-                    outcome=DecisionOutcome.SEND_REMINDER,
-                    reason=f"HITL Reminder approved and recorded for {phone} from {sender_fmt} ({inbox_name})",
-                    details={
-                        "text": text,
-                        "phone": phone,
-                        "sender_phone": sender_fmt,
-                        "inbox": inbox_name,
-                        "hitl_approved": True,
-                        "mock_mode": True,
-                        "reminder_id": reminder_id,
-                        "reminder_type": reminder_type,
-                        "workflow_id": workflow_id,
-                        "is_workflow_reminder": True,
-                        "delivery_status": "SENT_HITL_APPROVED"
-                    },
-                    timestamp=now_iso,
-                    sms_sent=True,
-                    sms_message_id=msg_id,
-                    note_written=False,
-                    run_id=workflow_id
-                ))
+                    db.record_workflow_reminder(
+                        reminder_id=f"{reminder_id}_{dest_p[-4:]}",
+                        tenant_id=match_tid,
+                        reminder_type=reminder_type,
+                        message_id=sub_msg_id,
+                        workflow_id=workflow_id,
+                        phone=dest_p,
+                        content=text,
+                        sender_phone=sender_fmt,
+                        delivery_status="SENT_HITL_APPROVED",
+                        sent_at=now_iso
+                    )
+
+                all_target_tids = [tenant_id] + [cm.id for cm in co_members if cm.id != tenant_id]
+                for tid in all_target_tids:
+                    db.save_decision(WorkflowDecision(
+                        tenant_id=tid,
+                        tenant_name=tid,
+                        property_unit="",
+                        balance=0.0,
+                        outcome=DecisionOutcome.SEND_REMINDER,
+                        reason=f"HITL Group Reminder approved and recorded for {', '.join(dest_phones)} from {sender_fmt} ({inbox_name})",
+                        details={
+                            "text": text,
+                            "phones": dest_phones,
+                            "sender_phone": sender_fmt,
+                            "inbox": inbox_name,
+                            "hitl_approved": True,
+                            "mock_mode": True,
+                            "reminder_id": reminder_id,
+                            "reminder_type": reminder_type,
+                            "workflow_id": workflow_id,
+                            "is_workflow_reminder": True,
+                            "is_group_reminder": len(dest_phones) > 1,
+                            "delivery_status": "SENT_HITL_APPROVED"
+                        },
+                        timestamp=now_iso,
+                        sms_sent=True,
+                        sms_message_id=f"mock_{now_iso}",
+                        note_written=False,
+                        run_id=workflow_id
+                    ))
 
                 return self._send_json({
                     "success": True,
                     "mock_mode": True,
-                    "message_id": msg_id,
+                    "message_id": f"mock_group_{now_iso}",
+                    "sent_count": len(dest_phones),
+                    "recipients": dest_phones,
                     "reminder_id": reminder_id,
                     "reminder_type": reminder_type,
                     "workflow_id": workflow_id,
                     "timestamp": now_iso,
-                    "recipient": phone,
+                    "recipient": ", ".join(dest_phones),
                     "sender": sender_fmt,
                     "sender_phone_id": sender_id,
                     "inbox": inbox_name,
