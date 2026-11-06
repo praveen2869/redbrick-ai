@@ -605,6 +605,12 @@
         </div>
 
         <div class="kpi-card">
+          <div class="kpi-header"><span class="kpi-title">IN COOLDOWN / GRACE</span><span class="kpi-icon">🚫</span></div>
+          <div class="kpi-value highlight-cyan" id="quo-count-cooldown">--</div>
+          <div class="kpi-subtext">24h deduplication active</div>
+        </div>
+
+        <div class="kpi-card">
           <div class="kpi-header"><span class="kpi-title">INBOUND TENANT REPLIES</span><span class="kpi-icon">💬</span></div>
           <div class="kpi-value highlight-cyan" id="quo-count-inbound">--</div>
           <div class="kpi-subtext">Promises & messages received</div>
@@ -716,6 +722,34 @@
             </tr>
           </thead>
           <tbody id="quo-manual-review-tbody">
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Table 2c: In Cooldown / Grace (24h Deduplication Window) -->
+      <div class="table-container" id="quo-cooldown-container" style="margin-bottom: 24px;display:none;">
+        <div class="table-header" style="padding:16px 20px;border-bottom:1px solid #334155;display:flex;justify-content:space-between;align-items:center;">
+          <div>
+            <h3 style="margin:0;font-size:16px;color:#38bdf8;">🚫 In Cooldown / Grace — Reminders Suppressed</h3>
+            <p style="margin:4px 0 0;font-size:12px;color:#94a3b8;">Tenants who received a reminder within the last 24 hours or are within the 5-day grace period. Automatically reactivated once cooldown expires.</p>
+          </div>
+          <span class="badge" style="background:rgba(56,189,248,0.12);color:#38bdf8;border:1px solid rgba(56,189,248,0.4);padding:6px 10px;border-radius:12px;font-size:11px;">
+            ⏳ 24h Deduplication Window
+          </span>
+        </div>
+        <table class="data-table" id="quo-cooldown-table">
+          <thead>
+            <tr>
+              <th>Tenant</th>
+              <th>Property / Unit</th>
+              <th>Phone</th>
+              <th>Overdue Balance</th>
+              <th>Reminder Sent</th>
+              <th>Cooldown Remaining</th>
+              <th>Status / Reason</th>
+            </tr>
+          </thead>
+          <tbody id="quo-cooldown-tbody">
           </tbody>
         </table>
       </div>

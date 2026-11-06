@@ -9,7 +9,7 @@ import logging
 import mimetypes
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from typing import Dict, Any, Optional
@@ -208,7 +208,7 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
             if active_only:
                 cursor.execute("""
                     SELECT 
-                        t.id, t.first_name, t.last_name, t.phone, t.email,
+                        t.id, t.lease_id, t.first_name, t.last_name, t.phone, t.email,
                         t.property_name, t.unit_number, t.is_excluded, t.exclusion_reason,
                         r.balance, r.monthly_rent, r.due_date, r.last_payment_date,
                         r.last_payment_amount, r.portal_link, r.lease_status, r.follow_up_notes
@@ -220,7 +220,7 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
             else:
                 cursor.execute("""
                     SELECT 
-                        t.id, t.first_name, t.last_name, t.phone, t.email,
+                        t.id, t.lease_id, t.first_name, t.last_name, t.phone, t.email,
                         t.property_name, t.unit_number, t.is_excluded, t.exclusion_reason,
                         r.balance, r.monthly_rent, r.due_date, r.last_payment_date,
                         r.last_payment_amount, r.portal_link, r.lease_status, r.follow_up_notes
@@ -240,23 +240,81 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                     "timestamp": d.timestamp,
                     "sms_sent": d.sms_sent,
                     "note_written": d.note_written
-                }
+                }        # Build lease balances and notes mapping so co-tenants accurately inherit lease state
+        lease_balances = {}
+        lease_notes = {}
+        for r in tenant_rows:
+            lid = r["lease_id"] if "lease_id" in r.keys() else None
+            bal = float(r["balance"] or 0.0)
+            notes = r["follow_up_notes"] or ""
+            if lid:
+                lease_balances[lid] = max(lease_balances.get(lid, 0.0), bal)
+                if notes:
+                    lease_notes[lid] = notes
 
-        current_month_first = datetime.utcnow().strftime("%Y-%m-01")
+        now = datetime.utcnow()
+        current_month_first = now.strftime("%Y-%m-01")
         results = []
         for r in tenant_rows:
             tid = r["id"]
+            lid = r["lease_id"] if "lease_id" in r.keys() else None
             bal = float(r["balance"] or 0.0)
+            eff_bal = bal if bal > 0 else (lease_balances.get(lid, 0.0) if lid else bal)
+            notes = (r["follow_up_notes"] or (lease_notes.get(lid, "") if lid else "")) or ""
             raw_due = r["due_date"]
-            # If tenant is fully paid ($0 balance) and recorded due date is in prior month,
-            # display current active billing cycle (1st of current month)
-            if bal <= 0.0 and raw_due and raw_due < current_month_first:
+            if eff_bal <= 0.0 and raw_due and raw_due < current_month_first:
                 effective_due = current_month_first
             else:
                 effective_due = raw_due or current_month_first
 
+            is_cool, last_rem, h_elapsed, h_rem, exp_at = db.get_cooldown_status(tid, current_time=now, cooldown_hours=24.0)
+
+            # Strict 5-state dynamic classification
+            if is_cool and last_rem:
+                disp_exp = exp_at.strftime('%Y-%m-%d %I:%M %p') if exp_at else "in 24h"
+                t_dec = {
+                    "outcome": "SKIP_ALREADY_REMINDED",
+                    "reason": f"Workflow rent reminder sent {h_elapsed:.1f}h ago. Cooldown active for {h_rem:.1f}h remaining (expires {disp_exp}).",
+                    "timestamp": last_rem.timestamp,
+                    "sms_sent": True,
+                    "note_written": False
+                }
+            elif eff_bal <= 0.0:
+                t_dec = {
+                    "outcome": "SKIP_PAID",
+                    "reason": "Tenant balance $0.00 — rent paid/cleared",
+                    "timestamp": now.isoformat(),
+                    "sms_sent": False,
+                    "note_written": False
+                }
+            elif any(k in notes.lower() for k in ["manual review", "dispute", "attorney", "eviction"]):
+                t_dec = {
+                    "outcome": "FLAG_MANUAL_REVIEW",
+                    "reason": f"Flagged for manual review: {notes}",
+                    "timestamp": now.isoformat(),
+                    "sms_sent": False,
+                    "note_written": False
+                }
+            elif latest_decision_by_tenant.get(tid) and latest_decision_by_tenant[tid].get("outcome") == "HOLD_PROMISE":
+                t_dec = {
+                    "outcome": "HOLD_PROMISE",
+                    "reason": latest_decision_by_tenant[tid].get("reason", "Payment promise on file"),
+                    "timestamp": latest_decision_by_tenant[tid].get("timestamp", now.isoformat()),
+                    "sms_sent": False,
+                    "note_written": False
+                }
+            else:
+                t_dec = {
+                    "outcome": "SEND_REMINDER",
+                    "reason": f"Unpaid balance ${eff_bal:,.2f} past grace period — reminder needed",
+                    "timestamp": now.isoformat(),
+                    "sms_sent": False,
+                    "note_written": False
+                }
+
             results.append({
                 "id": tid,
+                "lease_id": lid,
                 "first_name": r["first_name"],
                 "last_name": r["last_name"],
                 "full_name": f"{r['first_name']} {r['last_name']}".strip(),
@@ -266,14 +324,14 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                 "unit_number": r["unit_number"],
                 "is_excluded": bool(r["is_excluded"]),
                 "exclusion_reason": r["exclusion_reason"],
-                "balance": bal,
+                "balance": eff_bal,
                 "monthly_rent": float(r["monthly_rent"] or 0.0),
                 "due_date": effective_due,
                 "last_payment_date": r["last_payment_date"],
                 "last_payment_amount": float(r["last_payment_amount"] or 0.0),
                 "lease_status": r["lease_status"] or "ACTIVE",
-                "follow_up_notes": r["follow_up_notes"] if "follow_up_notes" in r.keys() else None,
-                "latest_decision": latest_decision_by_tenant.get(tid),
+                "follow_up_notes": notes,
+                "latest_decision": t_dec,
                 "latest_message": None,
                 "message_count": 0,
                 "notes_count": 0
@@ -800,63 +858,137 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
             }
 
             classifier = AIIntentClassifier()
+            from src.clients.quo_sms import normalize_phone_e164, phone_to_10digit
 
-            # Query OpenPhone /messages in parallel for overdue tenant phones
-            def _fetch_phone_msgs(p10):
-                t = report_phone_to_tenant.get(p10)
-                e164 = f"+1{p10}"
-                encoded_p = _up.quote(e164)
-                msg_url = f"{settings.QUO_API_URL}/messages?phoneNumberId={phone_id}&participants[]={encoded_p}&maxResults=10"
+            # Build lease-to-tenants mapping to support multi-tenant group conversations
+            lease_to_tenants = {}
+            for cur_t in all_tenants:
+                cur_lid = cur_t.lease_id or cur_t.id
+                lease_to_tenants.setdefault(cur_lid, []).append(cur_t)
+
+            # Determine all target overdue leases
+            target_leases = set()
+            for cur_tid in overdue_tenant_ids:
+                cur_t = tenant_map.get(cur_tid)
+                if cur_t:
+                    target_leases.add(cur_t.lease_id or cur_t.id)
+
+            # Build fetch targets: (lid, list_of_tenants, list_of_e164_phones)
+            fetch_targets = []
+            seen_target_keys = set()
+            for lid in target_leases:
+                ts = lease_to_tenants.get(lid, [])
+                if not ts:
+                    continue
+                phones = []
+                seen_p = set()
+                for t_item in ts:
+                    e164_val = normalize_phone_e164(t_item.phone)
+                    if e164_val and e164_val not in seen_p:
+                        seen_p.add(e164_val)
+                        phones.append(e164_val)
+                if phones:
+                    target_key = f"{lid}_{'_'.join(sorted(phones))}"
+                    if target_key not in seen_target_keys:
+                        seen_target_keys.add(target_key)
+                        fetch_targets.append((lid, ts, phones))
+
+            # Query OpenPhone /messages in parallel for all overdue lease groups
+            def _fetch_lease_msgs(target):
+                lid, ts, phones = target
+                query_parts = "&".join(f"participants[]={_up.quote(p)}" for p in phones)
+                msg_url = f"{settings.QUO_API_URL}/messages?phoneNumberId={phone_id}&{query_parts}&maxResults=10"
                 try:
                     req = _ur.Request(msg_url, headers=headers)
                     with _ur.urlopen(req, timeout=5) as resp:
                         msg_data = json.loads(resp.read().decode("utf-8"))
-                        return (p10, t, e164, msg_data.get("data", []) or [])
+                        return (lid, ts, phones, msg_data.get("data", []) or [])
                 except Exception as e:
-                    return (p10, t, e164, [])
+                    return (lid, ts, phones, [])
 
             from concurrent.futures import ThreadPoolExecutor
             with ThreadPoolExecutor(max_workers=10) as executor:
-                fetch_results = list(executor.map(_fetch_phone_msgs, list(overdue_phones)))
+                fetch_results = list(executor.map(_fetch_lease_msgs, fetch_targets))
 
-            for p10, t, e164, raw_msgs in fetch_results:
+            seen_msg_ids = set()
+            for lid, ts, phones, raw_msgs in fetch_results:
                 if not raw_msgs:
                     continue
                 matched_overdue_convs += 1
-                t_name = t.full_name if t else "Tenant"
-                prop_unit = f"{t.property_name} {t.unit_number}".strip() if t else ""
+                primary_t = ts[0] if ts else None
+                t_name = ", ".join([x.full_name for x in ts]) if len(ts) > 1 else (primary_t.full_name if primary_t else "Tenant")
+                prop_unit = f"{primary_t.property_name} {primary_t.unit_number}".strip() if primary_t else ""
+                phones_disp = ", ".join(phones)
 
                 comm_msgs = []
                 for m in raw_msgs:
+                    mid = m.get("id", "")
+                    if mid and mid in seen_msg_ids:
+                        continue
+                    if mid:
+                        seen_msg_ids.add(mid)
+
                     txt = m.get("text", m.get("body", ""))
                     is_inbound = (m.get("direction") == "incoming")
                     created_ts = m.get("createdAt", m.get("deliveredAt", ""))
                     msg_status = m.get("status", "delivered").upper()
 
+                    # Detect if outbound message is an RBPM rent reminder
+                    is_rent_reminder = False
+                    if not is_inbound and ("Friendly reminder from Red Bricks" in txt or "RBPM BOT" in txt or "Your rent of" in txt or "rent was due" in txt):
+                        is_rent_reminder = True
+
+                    meta_dict = {
+                        "source": "OpenPhone",
+                        "inbox": inbox_name,
+                        "is_workflow_reminder": is_rent_reminder,
+                        "reminder_type": "RENT_REMINDER" if is_rent_reminder else None,
+                        "is_group": len(phones) > 1,
+                        "participants": phones
+                    }
+
                     c_msg = CommunicationMessage(
-                        id=m.get("id", ""),
-                        tenant_id=t.id if t else f"phone_{p10}",
+                        id=mid,
+                        tenant_id=primary_t.id if primary_t else f"lease_{lid}",
                         channel=Channel.SMS,
                         direction=MessageDirection.INBOUND if is_inbound else MessageDirection.OUTBOUND,
                         sender=m.get("from", ""),
-                        recipient=(m.get("to") or [""])[0] if m.get("to") else "",
+                        recipient=phones_disp,
                         content=txt,
                         timestamp=created_ts,
-                        status=msg_status
+                        status="SENT_HITL_APPROVED" if is_rent_reminder else msg_status,
+                        metadata=meta_dict
                     )
                     comm_msgs.append(c_msg)
                     db.save_message(c_msg)
 
+                    # Sync to workflow_reminders for ALL tenants on this lease so 24-hr cooldown is active
+                    if is_rent_reminder:
+                        for cur_t in ts:
+                            cur_p = normalize_phone_e164(cur_t.phone) or (phones[0] if phones else "")
+                            db.record_workflow_reminder(
+                                reminder_id=f"quo_{mid}_{cur_t.id[-4:]}",
+                                tenant_id=cur_t.id,
+                                reminder_type="RENT_REMINDER",
+                                message_id=mid,
+                                workflow_id="openphone_sync",
+                                phone=cur_p,
+                                content=txt,
+                                sender_phone=m.get("from", ""),
+                                delivery_status="DELIVERED",
+                                sent_at=created_ts
+                            )
+
                     openphone_messages.append({
-                        "id": m.get("id", ""),
+                        "id": mid,
                         "conversation_id": m.get("conversationId", ""),
                         "direction": "INBOUND" if is_inbound else "OUTBOUND",
                         "content": txt,
                         "timestamp": created_ts,
                         "status": "RECEIVED" if is_inbound else msg_status,
                         "tenant_name": t_name,
-                        "phone": e164,
-                        "tenant_id": t.id if t else "",
+                        "phone": phones_disp,
+                        "tenant_id": primary_t.id if primary_t else "",
                         "property_unit": prop_unit,
                         "source": "openphone_live",
                         "line": selected_line,
@@ -864,45 +996,69 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                     })
 
                 # Check tenant communications for payment promise
-                if t and comm_msgs:
+                if primary_t and comm_msgs:
                     ai_res = classifier.classify_tenant_communications(comm_msgs, reference_date=datetime.utcnow())
                     if ai_res.intent == IntentType.PROMISE_MADE:
                         from datetime import timedelta as _td
                         p_date = ai_res.extracted_date or (datetime.utcnow().date() + _td(days=3)).strftime("%Y-%m-%d")
                         today_str = datetime.utcnow().strftime("%Y-%m-%d")
                         if p_date >= today_str:
-                            rv_bal = db.get_rentvine_record(t.id)
+                            rv_bal = db.get_rentvine_record(primary_t.id)
                             bal_val = float(rv_bal.balance) if rv_bal else 0.0
-                            hold_dec = WorkflowDecision(
-                                tenant_id=t.id,
-                                tenant_name=t.full_name,
-                                property_unit=prop_unit,
-                                balance=bal_val,
-                                outcome=DecisionOutcome.HOLD_PROMISE,
-                                reason=f"Payment promised via Quo SMS for {p_date}: \"{ai_res.raw_text}\" — reminder held",
-                                details={
-                                    "intent": "PROMISE_MADE",
-                                    "promise_date": p_date,
-                                    "extracted_date": p_date,
-                                    "raw_text": ai_res.raw_text,
-                                    "channel": "SMS"
-                                },
-                                timestamp=datetime.utcnow().isoformat(),
-                                run_id="quo_sync"
-                            )
-                            db.save_decision(hold_dec)
-                            logger.info(f"[Quo Promise] Payment commitment recorded for {t.full_name}: pay by {p_date}")
+                            for cur_t in ts:
+                                hold_dec = WorkflowDecision(
+                                    tenant_id=cur_t.id,
+                                    tenant_name=cur_t.full_name,
+                                    property_unit=prop_unit,
+                                    balance=bal_val,
+                                    outcome=DecisionOutcome.HOLD_PROMISE,
+                                    reason=f"Payment promised via Quo SMS for {p_date}: \"{ai_res.raw_text}\" — reminder held",
+                                    details={
+                                        "intent": "PROMISE_MADE",
+                                        "promise_date": p_date,
+                                        "extracted_date": p_date,
+                                        "raw_text": ai_res.raw_text,
+                                        "channel": "SMS"
+                                    },
+                                    timestamp=datetime.utcnow().isoformat(),
+                                    run_id="quo_sync"
+                                )
+                                db.save_decision(hold_dec)
+                            logger.info(f"[Quo Promise] Payment commitment recorded for {t_name}: pay by {p_date}")
 
-        # ─── 2. Build reminders queue from REAL workflow decisions only ───
+        # ─── 2. Build reminders queue from REAL workflow decisions and live overdue accounts ───
         # Strictly associated with Tenants & Vendors line ((980) 300-7559)
         # Also includes HOLD_PROMISE tenants so they remain visible with their promise status
         latest_decisions = db.get_latest_decisions(limit=2000)
+        seen_decision_tids = {d.tenant_id for d in latest_decisions}
+        all_eval_items = list(latest_decisions)
+
+        # Ensure all overdue tenants are evaluated even if no daily batch run was saved
+        for t_obj in all_tenants:
+            if t_obj.id not in seen_decision_tids:
+                rv_rec = db.get_rentvine_record(t_obj.id)
+                b_val = float(rv_rec.balance) if rv_rec else 0.0
+                if b_val > 0.0:
+                    all_eval_items.append(WorkflowDecision(
+                        tenant_id=t_obj.id,
+                        tenant_name=t_obj.full_name,
+                        property_unit=f"{t_obj.property_name} {t_obj.unit_number}".strip(),
+                        balance=b_val,
+                        outcome=DecisionOutcome.SEND_REMINDER,
+                        reason="Unpaid balance past grace period",
+                        details={},
+                        timestamp=datetime.utcnow().isoformat(),
+                        run_id="live_evaluation"
+                    ))
+                    seen_decision_tids.add(t_obj.id)
+
         reminders_needed = []
         promises_on_hold = []
         manual_review_tenants = []
+        cooldown_tenants = []
         seen_tenants = set()
 
-        for d in latest_decisions:
+        for d in all_eval_items:
             if d.tenant_id in seen_tenants:
                 continue
             seen_tenants.add(d.tenant_id)
@@ -910,6 +1066,17 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
             t = tenant_map.get(d.tenant_id)
             if not t:
                 continue  # skip orphaned decision records
+
+            # Skip co-tenant secondary decision records so only one consolidated group row appears per lease
+            d_details = d.details if isinstance(d.details, dict) else {}
+            if isinstance(d.details, str):
+                try:
+                    import json as _j
+                    d_details = _j.loads(d.details)
+                except Exception:
+                    d_details = {}
+            if d_details.get("is_co_tenant"):
+                continue
 
             # Only include tenants from the overdue whitelist (when available)
             if overdue_tenant_ids and d.tenant_id not in overdue_tenant_ids:
@@ -940,8 +1107,44 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                 prop_display = clean_prop
             fu_text = getattr(rv, "follow_up_notes", "") or ""
 
+            # ── Multi-Tenant Group Handling ──
+            group_tenants = []
+            lease_id_val = t.lease_id
+            if not lease_id_val:
+                lease_id_val = d_details.get("lease_id") or d_details.get("group_lease_id")
+            if not lease_id_val and d.tenant_id.startswith("rv_lease_"):
+                lease_id_val = d.tenant_id.replace("rv_lease_", "").split("_")[0]
+
+            if lease_id_val:
+                group_tenants = db.get_co_tenants_for_lease(lease_id_val)
+            if not group_tenants:
+                group_tenants = [t]
+
+            is_multi = len(group_tenants) > 1
+            if is_multi:
+                from src.workflow import WorkflowOrchestrator
+                from src.clients.quo_sms import normalize_phone_e164, phone_to_10digit
+                greeting_names = WorkflowOrchestrator._format_tenant_names_list([x.greeting_name for x in group_tenants])
+                tenant_display_name = ", ".join(x.full_name.title() for x in group_tenants)
+                
+                # Normalize and deduplicate destination phone numbers
+                phones_list = []
+                seen_p10 = set()
+                for x in group_tenants:
+                    if x.phone and x.phone.strip():
+                        p10 = phone_to_10digit(x.phone)
+                        e164 = normalize_phone_e164(x.phone) or x.phone.strip()
+                        if p10 and p10 not in seen_p10:
+                            seen_p10.add(p10)
+                            phones_list.append(e164)
+                phone_display = ", ".join(phones_list)
+            else:
+                greeting_names = t.greeting_name
+                tenant_display_name = d.tenant_name or t.full_name
+                phone_display = t.phone
+                phones_list = [t.phone] if t.phone else []
+
             # ── 1. Manual Review / Disputes: reminders disabled per Follow-Up Notes or AI dispute ──
-            # Only genuine manual review (Follow-Up Notes contains 'manual review' or dispute intent), not temporary API glitches
             d_reason_lower = (d.reason or "").lower()
             is_api_glitch = "quo sms retrieval failed" in d_reason_lower or "api_failure" in str(d.details or "").lower()
             is_manual_review = (
@@ -951,9 +1154,11 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
             if is_manual_review:
                 manual_review_tenants.append({
                     "tenant_id": d.tenant_id,
-                    "tenant_name": d.tenant_name or t.full_name,
+                    "tenant_name": tenant_display_name,
                     "property_unit": prop_display,
-                    "phone": t.phone,
+                    "phone": phone_display,
+                    "phones": phones_list,
+                    "is_group": is_multi,
                     "balance": effective_balance,
                     "status": "MANUAL_REVIEW_DISABLED",
                     "reason": d.reason if d.outcome == DecisionOutcome.FLAG_MANUAL_REVIEW else "RentVine Follow-Up Notes: Manual Review",
@@ -986,9 +1191,11 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
 
                 promises_on_hold.append({
                     "tenant_id": d.tenant_id,
-                    "tenant_name": d.tenant_name or t.full_name,
+                    "tenant_name": tenant_display_name,
                     "property_unit": prop_display,
-                    "phone": t.phone,
+                    "phone": phone_display,
+                    "phones": phones_list,
+                    "is_group": is_multi,
                     "balance": effective_balance,
                     "status": "ON_HOLD_PAYMENT_PROMISED",
                     "hold_reason": d.reason,
@@ -1000,93 +1207,78 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                 })
                 continue  # Don't add to send queue
 
-            if d.outcome != DecisionOutcome.SEND_REMINDER:
-                continue  # Most recent evaluation was SKIP_PAID, SKIP_GRACE_PERIOD, etc.
-
-            # Cooldown check: if workflow-generated rent reminder was sent today, skip it (in cooldown for remainder of day)
-            last_rem = db.get_last_successful_reminder(d.tenant_id)
-            if last_rem and last_rem.sms_sent:
+            # ── 3. 24-Hour Deduplication Cooldown Check ──
+            # When a reminder was dispatched within the last 24 hours, tenant is in cooldown
+            is_cooldown, last_rem, hours_elapsed, hours_remaining, expires_at = db.get_cooldown_status(
+                d.tenant_id, current_time=datetime.utcnow(), cooldown_hours=24.0
+            )
+            if is_cooldown and last_rem:
+                dispatch_ts = last_rem.timestamp
                 try:
-                    last_ts = datetime.fromisoformat(last_rem.timestamp.replace("Z", "+00:00"))
-                    if last_ts.tzinfo is not None:
-                        last_ts = last_ts.replace(tzinfo=None)
-                    if last_ts.date() == datetime.utcnow().date():
-                        continue
+                    dt_obj = datetime.fromisoformat(dispatch_ts.replace("Z", "+00:00"))
+                    disp_fmt = dt_obj.strftime("%Y-%m-%d %I:%M %p")
                 except Exception:
-                    pass
+                    disp_fmt = dispatch_ts
+                exp_fmt = expires_at.strftime("%Y-%m-%d %I:%M %p") if expires_at else "In 24 hours"
+                last_txt = (last_rem.details or {}).get("text") or (last_rem.details or {}).get("content") or ""
 
-            # Automatic Grace Period evaluation: suppress current-month rent during days 1–4
+                cooldown_tenants.append({
+                    "tenant_id": d.tenant_id,
+                    "tenant_name": tenant_display_name,
+                    "property_unit": prop_display,
+                    "due_date": rv.due_date if rv and rv.due_date else "November 1, 2026",
+                    "phone": phone_display,
+                    "phones": phones_list,
+                    "is_group": is_multi,
+                    "balance": effective_balance,
+                    "status": "IN_COOLDOWN",
+                    "dispatch_time": dispatch_ts,
+                    "dispatch_time_display": disp_fmt,
+                    "hours_elapsed": hours_elapsed,
+                    "hours_remaining": hours_remaining,
+                    "expires_at": expires_at.isoformat() if expires_at else "",
+                    "expires_at_display": exp_fmt,
+                    "reason": f"Reminder sent {hours_elapsed:.1f}h ago ({disp_fmt}). In 24h deduplication cooldown ({hours_remaining:.1f}h remaining until {exp_fmt}).",
+                    "last_message": last_txt,
+                    "sender_phone": settings.QUO_PHONE_TENANTS_FORMATTED,
+                    "sender_inbox": "Tenants & Vendors"
+                })
+                continue
+
+            # ── 4. Automatic Grace Period evaluation (Days 1–4 of month) ──
             from src.engine.rules import BusinessRulesEngine
             rules = BusinessRulesEngine()
-            is_in_grace, _ = rules.check_grace_period(rv, datetime.utcnow())
-            if is_in_grace:
+            is_in_grace, grace_msg = rules.check_grace_period(rv, datetime.utcnow())
+            if is_in_grace or d.outcome == DecisionOutcome.SKIP_GRACE_PERIOD:
+                cooldown_tenants.append({
+                    "tenant_id": d.tenant_id,
+                    "tenant_name": tenant_display_name,
+                    "property_unit": prop_display,
+                    "due_date": rv.due_date if rv and rv.due_date else "November 1, 2026",
+                    "phone": phone_display,
+                    "phones": phones_list,
+                    "is_group": is_multi,
+                    "balance": effective_balance,
+                    "status": "IN_GRACE_PERIOD",
+                    "dispatch_time": None,
+                    "dispatch_time_display": "—",
+                    "hours_elapsed": 0.0,
+                    "hours_remaining": 0.0,
+                    "expires_at": "",
+                    "expires_at_display": "Day 5 of month",
+                    "reason": grace_msg or "Within 5-day grace period (Days 1–4 of billing cycle)",
+                    "last_message": "",
+                    "sender_phone": settings.QUO_PHONE_TENANTS_FORMATTED,
+                    "sender_inbox": "Tenants & Vendors"
+                })
                 continue
 
-            # Skip co-tenant secondary decision records so only one consolidated group row appears per lease
-            d_details = d.details if isinstance(d.details, dict) else {}
-            if isinstance(d.details, str):
-                try:
-                    import json as _j
-                    d_details = _j.loads(d.details)
-                except Exception:
-                    d_details = {}
-            if d_details.get("is_co_tenant"):
-                continue
-
-            # Build SMS preview with proper paragraph spacing (WhatsApp / Quo SMS format)
+            # ── 5. Reminders Needed: Eligible tenants who have not received a reminder in 24 hours ──
             portal = rv.portal_link if rv else "https://redbricksproperties.rentvine.com/portal/pay"
             due = rv.due_date if rv and rv.due_date else "November 1, 2026"
-            raw_prop = (t.property_name or d.property_unit or "").strip()
-            clean_prop = clean_property_address(raw_prop)
             effective_bal = float(d.balance if d.balance is not None else (rv.balance if rv else 0.0))
 
-            # Deduplicate property_unit display for HITL table
-            unit_val = (t.unit_number or "").strip()
-            clean_unit = clean_property_address(unit_val)
-            if (
-                unit_val
-                and unit_val != clean_prop
-                and clean_unit != clean_prop
-                and unit_val not in clean_prop
-                and not unit_val.startswith("NONE_")
-            ):
-                prop_display = f"{clean_prop} {unit_val}".strip()
-            else:
-                prop_display = clean_prop
-
-            # ── Multi-Tenant Group Handling ──
-            # Check if tenant belongs to a multi-tenant lease
-            group_tenants = []
-            lease_id_val = t.lease_id
-            if not lease_id_val:
-                d_det = d.details if isinstance(d.details, dict) else {}
-                lease_id_val = d_det.get("lease_id") or d_det.get("group_lease_id")
-            if not lease_id_val and d.tenant_id.startswith("rv_lease_"):
-                lease_id_val = d.tenant_id.replace("rv_lease_", "").split("_")[0]
-
-            if lease_id_val:
-                group_tenants = db.get_co_tenants_for_lease(lease_id_val)
-            if not group_tenants:
-                group_tenants = [t]
-
-            is_multi = len(group_tenants) > 1
             if is_multi:
-                from src.workflow import WorkflowOrchestrator
-                from src.clients.quo_sms import normalize_phone_e164, phone_to_10digit
-                greeting_names = WorkflowOrchestrator._format_tenant_names_list([x.greeting_name for x in group_tenants])
-                tenant_display_name = ", ".join(x.full_name.title() for x in group_tenants)
-                
-                # Normalize and deduplicate destination phone numbers
-                phones_list = []
-                seen_p10 = set()
-                for x in group_tenants:
-                    if x.phone and x.phone.strip():
-                        p10 = phone_to_10digit(x.phone)
-                        e164 = normalize_phone_e164(x.phone) or x.phone.strip()
-                        if p10 and p10 not in seen_p10:
-                            seen_p10.add(p10)
-                            phones_list.append(e164)
-                phone_display = ", ".join(phones_list)
                 try:
                     sms_text = settings.GROUP_REMINDER_TEMPLATE.format(
                         tenant_names=greeting_names,
@@ -1106,9 +1298,6 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                         f"RBPM BOT"
                     )
             else:
-                tenant_display_name = d.tenant_name or t.full_name
-                phone_display = t.phone
-                phones_list = [t.phone] if t.phone else []
                 try:
                     sms_text = settings.REMINDER_TEMPLATE.format(
                         tenant_name=t.greeting_name,
@@ -1128,7 +1317,6 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                         f"RBPM bot"
                     )
 
-            # Associate queued draft with unique reminder ID, workflow run, and reminder type
             reminder_id = f"rem_{d.tenant_id}_{datetime.utcnow().strftime('%Y%m%d')}"
             reminders_needed.append({
                 "reminder_id": reminder_id,
@@ -1256,6 +1444,7 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                 "reminders_needed": len(reminders_needed),
                 "promises_on_hold": len(promises_on_hold),
                 "manual_review": len(manual_review_tenants),
+                "in_cooldown": len(cooldown_tenants),
                 "sms_messages": len(deduped),
                 "inbound_replies": inbound_count,
                 "hitl_approved_sent": hitl_sent
@@ -1263,6 +1452,7 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
             "reminders_needed": reminders_needed,
             "promises_on_hold": promises_on_hold,
             "manual_review_tenants": manual_review_tenants,
+            "cooldown_tenants": cooldown_tenants,
             "messages": deduped,
             "probe": quo_probe
         }
@@ -1480,6 +1670,15 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
 
         # Also check database for co-tenants on the same lease
         cur_t = db.get_tenant_by_id(tenant_id)
+        prop_display = ""
+        if cur_t:
+            clean_p = clean_property_address(cur_t.property_name or "")
+            unit_v = (cur_t.unit_number or "").strip()
+            clean_u = clean_property_address(unit_v)
+            if unit_v and unit_v != clean_p and clean_u != clean_p and unit_v not in clean_p and not unit_v.startswith("NONE_"):
+                prop_display = f"{clean_p} {unit_v}".strip()
+            else:
+                prop_display = clean_p
         co_members = []
         if cur_t and cur_t.lease_id:
             co_members = db.get_co_tenants_for_lease(cur_t.lease_id)
@@ -1543,7 +1742,10 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                         sent_msg_ids.append(ext_id)
                 except Exception as he:
                     logger.error(f"[HITL Error] Failed dispatching group message to {normalized_recipients}: {he}")
-                    sent_msg_ids.append(ext_id)
+                    return self._send_json({
+                        "error": f"Failed to dispatch SMS via Quo OpenPhone API: {he}",
+                        "status": "DISPATCH_FAILED"
+                    }, 502)
 
                 # Record the group message in local audit log
                 outbound = CommunicationMessage(
@@ -1599,14 +1801,18 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                     )
 
                 # Record decision so cooldown activates for primary and all co-tenants
+                expires_at = datetime.utcnow() + timedelta(hours=24)
                 all_target_tids = [tenant_id] + [cm.id for cm in co_members if cm.id != tenant_id]
                 for tid in all_target_tids:
+                    t_obj = db.get_tenant_by_id(tid)
+                    t_name = t_obj.full_name if t_obj else tid
+                    t_bal = float(rv_rec.balance or 0.0) if rv_rec else 0.0
                     db.save_decision(WorkflowDecision(
                         tenant_id=tid,
-                        tenant_name=tid,
-                        property_unit="",
-                        balance=0.0,
-                        outcome=DecisionOutcome.SEND_REMINDER,
+                        tenant_name=t_name,
+                        property_unit=prop_display,
+                        balance=t_bal,
+                        outcome=DecisionOutcome.SKIP_ALREADY_REMINDED,
                         reason=f"HITL Group Reminder SMS approved and sent to group {recip_display} from {sender_fmt} ({inbox_name})",
                         details={
                             "text": text,
@@ -1714,14 +1920,18 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                         sent_at=now_iso
                     )
 
+                expires_at = datetime.utcnow() + timedelta(hours=24)
                 all_target_tids = [tenant_id] + [cm.id for cm in co_members if cm.id != tenant_id]
                 for tid in all_target_tids:
+                    t_obj = db.get_tenant_by_id(tid)
+                    t_name = t_obj.full_name if t_obj else tid
+                    t_bal = float(rv_rec.balance or 0.0) if rv_rec else 0.0
                     db.save_decision(WorkflowDecision(
                         tenant_id=tid,
-                        tenant_name=tid,
-                        property_unit="",
-                        balance=0.0,
-                        outcome=DecisionOutcome.SEND_REMINDER,
+                        tenant_name=t_name,
+                        property_unit=prop_display,
+                        balance=t_bal,
+                        outcome=DecisionOutcome.SKIP_ALREADY_REMINDED,
                         reason=f"HITL Group Reminder approved and recorded for {', '.join(dest_phones)} from {sender_fmt} ({inbox_name})",
                         details={
                             "text": text,

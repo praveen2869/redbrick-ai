@@ -626,22 +626,37 @@ class Database:
 
     def get_last_successful_reminder(self, tenant_id: str) -> Optional[WorkflowDecision]:
         """
-        Finds the most recent workflow-generated rent reminder sent to this tenant.
+        Finds the most recent workflow-generated rent reminder sent to this tenant or their lease group.
         Cooldown is triggered EXCLUSIVELY by workflow-generated rent-reminder messages.
         Normal conversations ("Hi", "Hello"), manually typed messages, greetings, maintenance
         updates, or unrelated SMS communications must NOT trigger cooldown.
         """
+        related_ids = [tenant_id]
         with self.get_connection() as conn:
             cursor = conn.cursor()
+            # Also include all co-tenants on the same lease so group dispatches put all members in cooldown
+            try:
+                cursor.execute("SELECT lease_id FROM tenants WHERE id = ?", (tenant_id,))
+                t_row = cursor.fetchone()
+                if t_row and t_row["lease_id"]:
+                    cursor.execute("SELECT id FROM tenants WHERE lease_id = ?", (t_row["lease_id"],))
+                    for r in cursor.fetchall():
+                        if r["id"] not in related_ids:
+                            related_ids.append(r["id"])
+            except Exception:
+                pass
+
+            placeholders = ",".join("?" for _ in related_ids)
+
             # 1. Primary source: explicitly tracked workflow_reminders table
-            cursor.execute("""
+            cursor.execute(f"""
             SELECT * FROM workflow_reminders
-            WHERE tenant_id = ?
+            WHERE tenant_id IN ({placeholders})
               AND reminder_type = 'RENT_REMINDER'
               AND delivery_status IN ('SENT_HITL_APPROVED', 'DELIVERED', 'SENT')
             ORDER BY sent_at DESC
             LIMIT 1
-            """, (tenant_id,))
+            """, related_ids)
             w_row = cursor.fetchone()
             if w_row:
                 return WorkflowDecision(
@@ -668,16 +683,18 @@ class Database:
                     run_id=w_row["workflow_id"] or "workflow_dispatch"
                 )
 
-            # 2. Check communication_messages ONLY if metadata specifically identifies it as a workflow reminder
-            cursor.execute("""
+            # 2. Check communication_messages if metadata specifically identifies it as a workflow reminder or content matches reminder pattern
+            cursor.execute(f"""
             SELECT * FROM communication_messages
-            WHERE tenant_id = ? AND direction = 'OUTBOUND' 
+            WHERE tenant_id IN ({placeholders}) AND direction = 'OUTBOUND' 
               AND status IN ('SENT_HITL_APPROVED', 'DELIVERED', 'SENT')
               AND (metadata_json LIKE '%"is_workflow_reminder": true%' 
-                   OR metadata_json LIKE '%"reminder_type": "RENT_REMINDER"%')
+                   OR metadata_json LIKE '%"reminder_type": "RENT_REMINDER"%'
+                   OR content LIKE '%Friendly reminder from Red Bricks%'
+                   OR content LIKE '%RBPM BOT%')
             ORDER BY timestamp DESC
             LIMIT 1
-            """, (tenant_id,))
+            """, related_ids)
             msg_row = cursor.fetchone()
             if msg_row:
                 meta = json.loads(msg_row["metadata_json"]) if msg_row["metadata_json"] else {}
@@ -697,10 +714,10 @@ class Database:
                 )
 
             # 3. Fallback: check workflow_decisions with sms_sent=1 from actual workflow runs or HITL
-            # (exclude legacy 'actual_dispatch' pseudo-decisions created from arbitrary chats)
-            cursor.execute("""
+            cursor.execute(f"""
             SELECT * FROM workflow_decisions
-            WHERE tenant_id = ? AND sms_sent = 1 AND outcome = 'SEND_REMINDER'
+            WHERE tenant_id IN ({placeholders}) AND sms_sent = 1 
+              AND outcome IN ('SEND_REMINDER', 'SKIP_ALREADY_REMINDED')
               AND run_id != 'actual_dispatch'
               AND (details_json LIKE '%is_workflow_reminder%' 
                    OR details_json LIKE '%RENT_REMINDER%'
@@ -708,7 +725,7 @@ class Database:
                    OR run_id LIKE 'hitl_%')
             ORDER BY timestamp DESC
             LIMIT 1
-            """, (tenant_id,))
+            """, related_ids)
             dec_row = cursor.fetchone()
             if dec_row:
                 details = json.loads(dec_row["details_json"]) if dec_row["details_json"] else {}
@@ -729,10 +746,47 @@ class Database:
 
             return None
 
+    def get_cooldown_status(
+        self, tenant_id: str, current_time: Optional[datetime] = None, cooldown_hours: float = 24.0
+    ) -> Tuple[bool, Optional[WorkflowDecision], float, float, Optional[datetime]]:
+        """
+        Evaluates whether a tenant (or their lease group) is actively in the deduplication cooldown.
+        Cooldown duration is strictly 24 hours from actual dispatch timestamp.
+        Returns:
+            (is_in_cooldown: bool, last_reminder: Optional[WorkflowDecision],
+             hours_elapsed: float, hours_remaining: float, expires_at: Optional[datetime])
+        """
+        now = current_time or datetime.utcnow()
+        if now.tzinfo is not None:
+            now = now.replace(tzinfo=None)
+
+        last_reminder = self.get_last_successful_reminder(tenant_id)
+        if not last_reminder:
+            return (False, None, 0.0, 0.0, None)
+
+        try:
+            last_ts = datetime.fromisoformat(last_reminder.timestamp.replace("Z", "+00:00"))
+            if last_ts.tzinfo is not None:
+                last_ts = last_ts.replace(tzinfo=None)
+        except Exception:
+            return (False, None, 0.0, 0.0, None)
+
+        elapsed_seconds = (now - last_ts).total_seconds()
+        hours_elapsed = max(0.0, elapsed_seconds / 3600.0)
+
+        if 0.0 <= hours_elapsed < cooldown_hours:
+            hours_remaining = round(cooldown_hours - hours_elapsed, 1)
+            expires_at = last_ts + timedelta(hours=cooldown_hours)
+            return (True, last_reminder, round(hours_elapsed, 1), hours_remaining, expires_at)
+        else:
+            expires_at = last_ts + timedelta(hours=cooldown_hours)
+            return (False, last_reminder, round(hours_elapsed, 1), 0.0, expires_at)
+
     def cleanup_invalid_cooldown_decisions(self):
         """
         Removes any stale SKIP_ALREADY_REMINDED decisions from workflow_decisions
-        if the tenant has no actual workflow-generated rent reminders on record.
+        if the tenant has no actual workflow-generated rent reminders on record
+        OR if their 24-hour cooldown window has expired.
         """
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -742,9 +796,11 @@ class Database:
             """)
             rows = cursor.fetchall()
             stale_ids = []
+            now = datetime.utcnow()
             for r in rows:
                 tid = r["tenant_id"]
-                if self.get_last_successful_reminder(tid) is None:
+                is_cool, last_rem, _, _, _ = self.get_cooldown_status(tid, current_time=now, cooldown_hours=24.0)
+                if not is_cool or last_rem is None:
                     stale_ids.append(r["id"])
             if stale_ids:
                 placeholders = ",".join("?" for _ in stale_ids)

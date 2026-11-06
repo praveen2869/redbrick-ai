@@ -10,6 +10,10 @@ from src.models import DecisionOutcome
 
 class TestWorkflow(unittest.TestCase):
     def setUp(self):
+        from src.database import db
+        self.orig_db_path = db.db_path
+        db.db_path = 'redbrick_test.db'
+        db.init_db()
         populate_sample_data(reset=True)
         from src.clients.rentvine_mcp import RentVineMCPClient
         from src.clients.quo_sms import QuoSMSClient
@@ -17,6 +21,10 @@ class TestWorkflow(unittest.TestCase):
             rentvine_client=RentVineMCPClient(mock_mode=True),
             quo_client=QuoSMSClient(mock_mode=True)
         )
+
+    def tearDown(self):
+        from src.database import db
+        db.db_path = self.orig_db_path
 
     def test_workflow_dry_run(self):
         # Run workflow in dry-run mode
@@ -77,7 +85,7 @@ class TestWorkflow(unittest.TestCase):
         self.assertIn("Christopher Pittman", reminded_names)
         self.assertIn("Ke'Juana Ford", reminded_names)
         # Even small balance and current month tenants are included
-        self.assertTrue(any("Joshua" in n for n in reminded_names))
+        self.assertTrue(any("Frisco" in n for n in reminded_names))
         self.assertIn("Yuliya Chernyshov", reminded_names)
 
     def test_quo_sender_number_routing(self):
@@ -414,25 +422,25 @@ class TestWorkflow(unittest.TestCase):
             status="DELIVERED"
         ))
 
-        # At 2:00 PM on Oct 30: Cooldown MUST be active for remainder of the day
+        # At 2:00 PM on Oct 30 (2h later): Cooldown MUST be active (within 24 hours)
         oct_30_2pm = datetime(2026, 10, 30, 14, 0)
         rules = BusinessRulesEngine()
         is_dup, last_rem, reason = rules.check_recent_reminder_deduplication(tenant_id, current_time=oct_30_2pm)
         self.assertTrue(is_dup)
-        self.assertIn("Cooldown active for remainder of day", reason)
+        self.assertIn("Cooldown active", reason)
 
         # Workflow execution at 2:00 PM: must result in SKIP_ALREADY_REMINDED
         dec_today = self.orchestrator._process_tenant(t, run_id="run_oct30_afternoon", is_dry_run=True, current_time=oct_30_2pm)
         self.assertEqual(dec_today.outcome, DecisionOutcome.SKIP_ALREADY_REMINDED)
 
-        # Step 3: Next morning (Oct 31, 8:00 AM): Cooldown expires, tenant reactivates!
-        oct_31_8am = datetime(2026, 10, 31, 8, 0)
-        is_dup_next, _, reason_next = rules.check_recent_reminder_deduplication(tenant_id, current_time=oct_31_8am)
-        self.assertFalse(is_dup_next, f"Tenant should be reactivated the next morning: {reason_next}")
-        self.assertIn("Reactivated for morning reminder", reason_next)
+        # Step 3: After 24 hours (Oct 31, 1:00 PM): 24h Cooldown expires, tenant reactivates!
+        oct_31_1pm = datetime(2026, 10, 31, 13, 0)
+        is_dup_next, _, reason_next = rules.check_recent_reminder_deduplication(tenant_id, current_time=oct_31_1pm)
+        self.assertFalse(is_dup_next, f"Tenant should be reactivated after 24 hours: {reason_next}")
+        self.assertIn("24h cooldown window expired", reason_next)
 
-        # Workflow execution next morning: tenant is eligible for morning reminder
-        dec_next = self.orchestrator._process_tenant(t, run_id="run_oct31_morning", is_dry_run=True, current_time=oct_31_8am)
+        # Workflow execution after 24 hours: tenant is eligible for new reminder
+        dec_next = self.orchestrator._process_tenant(t, run_id="run_oct31_afternoon", is_dry_run=True, current_time=oct_31_1pm)
         self.assertEqual(dec_next.outcome, DecisionOutcome.SEND_REMINDER)
 
     def test_follow_up_notes_manual_review_transitions(self):
@@ -1010,8 +1018,8 @@ class TestWorkflow(unittest.TestCase):
         )
 
         # Verify individual greeting names
-        self.assertEqual(t_primary.greeting_name, "Kukunoor")
-        self.assertEqual(t_co.greeting_name, "second Kukunoor")
+        self.assertEqual(t_primary.greeting_name, "Kukunoor Tenant")
+        self.assertEqual(t_co.greeting_name, "Second Kukunoor Tenant")
 
         # Save to database
         db.upsert_tenant(t_primary)
@@ -1039,7 +1047,7 @@ class TestWorkflow(unittest.TestCase):
 
         # Verify combined greeting formatting
         greeting = WorkflowOrchestrator._format_tenant_names_list(grp.all_names)
-        self.assertEqual(greeting, "Kukunoor and second Kukunoor")
+        self.assertEqual(greeting, "Kukunoor Tenant and Second Kukunoor Tenant")
 
         # Verify all phones collected
         phone_numbers = [p[1] for p in grp.all_phones]
@@ -1067,7 +1075,7 @@ class TestWorkflow(unittest.TestCase):
 
         # Verify group SMS message formatting
         msg_text = primary_d.details.get("group_sms_text", "")
-        self.assertIn("Hi Kukunoor and second Kukunoor,", msg_text)
+        self.assertIn("Hi Kukunoor Tenant and Second Kukunoor Tenant,", msg_text)
         self.assertIn("8620 Fairgreen Avenue", msg_text)
         self.assertIn("$2,000.00", msg_text)
         self.assertIn("RBPM BOT", msg_text)

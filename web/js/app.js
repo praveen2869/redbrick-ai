@@ -387,31 +387,20 @@ class AppController {
     let countFlagged = 0;
     let countCooldown = 0;
 
-    if (latestRun && typeof latestRun.total_tenants === "number" && latestRun.total_tenants > 0) {
-      // Authoritative run summary from workflow execution
-      totalUnits = latestRun.total_tenants;
-      countPaid = latestRun.count_paid || 0;
-      countPromises = latestRun.count_promised || 0;
-      countSent = latestRun.count_reminded || 0;
-      countFlagged = latestRun.count_flagged || 0;
-      countCooldown = latestRun.count_skipped || 0;
-      totalBal = latestRun.total_balance_unpaid || 0;
-    } else {
-      // Filter out completed leases to only show active units
-      const activeTenants = this.tenants.filter(t => t.lease_status !== "COMPLETED");
-      totalUnits = activeTenants.length;
-      activeTenants.forEach(t => {
-        if (t.balance > 0) totalBal += t.balance;
-        const d = t.latest_decision;
-        if (d) {
-          if (d.outcome === "SKIP_PAID") countPaid++;
-          else if (d.outcome === "HOLD_PROMISE") countPromises++;
-          else if (d.outcome === "SEND_REMINDER") countSent++;
-          else if (d.outcome === "FLAG_MANUAL_REVIEW") countFlagged++;
-          else if (d.outcome === "SKIP_ALREADY_REMINDED" || d.outcome === "SKIP_GRACE_PERIOD") countCooldown++;
-        }
-      });
-    }
+    // Filter out completed leases to only show active units
+    const activeTenants = (this.tenants || []).filter(t => t.lease_status !== "COMPLETED");
+    totalUnits = activeTenants.length;
+
+    activeTenants.forEach(t => {
+      if (t.balance > 0) totalBal += t.balance;
+      const d = t.latest_decision;
+      const outcome = d ? d.outcome : (t.balance <= 0 ? "SKIP_PAID" : "SEND_REMINDER");
+      if (outcome === "SKIP_PAID") countPaid++;
+      else if (outcome === "HOLD_PROMISE") countPromises++;
+      else if (outcome === "SEND_REMINDER") countSent++;
+      else if (outcome === "FLAG_MANUAL_REVIEW") countFlagged++;
+      else if (outcome === "SKIP_ALREADY_REMINDED" || outcome === "SKIP_GRACE_PERIOD") countCooldown++;
+    });
 
     const valUnits = document.getElementById("val-total-units");
     const valOverdue = document.getElementById("val-overdue-balance");
@@ -437,7 +426,7 @@ class AppController {
     if (dPromise) dPromise.textContent = `${countPromises} units`;
     if (dUnpaid) dUnpaid.textContent = `${countSent} units`;
 
-    // Update filter pills with real dynamic counts
+    // Update filter pills with real dynamic counts that 100% match table filtering
     const pillAll = document.getElementById("pill-filter-all");
     const pillReminded = document.getElementById("pill-filter-reminded");
     const pillPromised = document.getElementById("pill-filter-promised");
@@ -461,7 +450,11 @@ class AppController {
       // 1. Pill Filter
       if (this.currentFilter !== "ALL") {
         const outcome = t.latest_decision ? t.latest_decision.outcome : "PENDING";
-        if (outcome !== this.currentFilter) return false;
+        if (this.currentFilter === "SKIP_ALREADY_REMINDED") {
+          if (outcome !== "SKIP_ALREADY_REMINDED" && outcome !== "SKIP_GRACE_PERIOD") return false;
+        } else if (outcome !== this.currentFilter) {
+          return false;
+        }
       }
       // 2. Property Filter
       if (this.selectedProperty !== "ALL" && t.property_name !== this.selectedProperty) {
@@ -576,7 +569,7 @@ class AppController {
     } else if (outcome === "HOLD_PROMISE") {
       return `<span class="badge badge-promise">🛡️ Promise (Hold)</span>`;
     } else if (outcome === "SEND_REMINDER") {
-      return `<span class="badge badge-sent">📩 Quo SMS Sent</span>`;
+      return `<span class="badge badge-sent">📩 Reminder Needed</span>`;
     } else if (outcome === "SKIP_ALREADY_REMINDED") {
       return `<span class="badge badge-dedup">🚫 In Cooldown</span>`;
     } else if (outcome === "SKIP_GRACE_PERIOD") {
@@ -1096,12 +1089,15 @@ class AppController {
 
       this._quoReminders = data.reminders_needed || [];
       this._quoPromises = data.promises_on_hold || [];
+      this._quoCooldown = data.cooldown_tenants || [];
 
       // Update KPI counters
       const countNeeded = document.getElementById("quo-count-needed");
+      const countCooldown = document.getElementById("quo-count-cooldown");
       const countInbound = document.getElementById("quo-count-inbound");
       const sentCounter = document.getElementById("quo-sent-counter");
       if (countNeeded && data.counts) countNeeded.textContent = `${data.counts.reminders_needed} units`;
+      if (countCooldown && data.counts) countCooldown.textContent = `${data.counts.in_cooldown || 0} units`;
       if (countInbound && data.counts) countInbound.textContent = `${data.counts.inbound_replies} replies`;
       if (sentCounter && data.counts && data.counts.hitl_approved_sent > 0) {
         sentCounter.textContent = data.counts.hitl_approved_sent + this._quoSentCount;
@@ -1205,6 +1201,45 @@ class AppController {
                 <td style="max-width:320px;font-size:12px;color:#cbd5e1;line-height:1.5;">
                   ${m.follow_up_notes ? `<div style="color:#fca5a5;font-weight:600;margin-bottom:2px;">Follow-Up Note: "${m.follow_up_notes}"</div>` : ''}
                   <div style="color:#94a3b8;font-size:11px;">${m.reason || 'Manual review required'}</div>
+                </td>
+              </tr>
+            `;
+          }).join("");
+        }
+      }
+
+      // ─── Render In Cooldown / Grace table ───
+      const cooldownContainer = document.getElementById("quo-cooldown-container");
+      const tbodyCooldown = document.getElementById("quo-cooldown-tbody");
+      if (cooldownContainer && tbodyCooldown) {
+        if (this._quoCooldown.length === 0) {
+          cooldownContainer.style.display = "none";
+        } else {
+          cooldownContainer.style.display = "block";
+          tbodyCooldown.innerHTML = this._quoCooldown.map(c => {
+            const isGrace = c.status === "IN_GRACE_PERIOD";
+            const sentLabel = c.dispatch_time_display && c.dispatch_time_display !== "—"
+              ? `<span style="color:#f8fafc;font-weight:600;">${c.dispatch_time_display}</span>`
+              : `<span style="color:#64748b;">Not dispatched</span>`;
+            const remBadge = isGrace
+              ? `<span class="badge badge-grace" style="font-size:11px;">🕒 In Grace Period</span>`
+              : `<span class="badge" style="background:rgba(56,189,248,0.15);color:#38bdf8;border:1px solid rgba(56,189,248,0.3);font-size:11px;padding:3px 8px;border-radius:8px;">
+                  ⏳ ${c.hours_remaining}h remaining
+                 </span><br><small style="color:#64748b;font-size:10px;">Expires: ${c.expires_at_display}</small>`;
+            const statusBadge = isGrace
+              ? `<span style="color:#06b6d4;font-size:12px;font-weight:600;">Grace Period Active</span>`
+              : `<span style="color:#38bdf8;font-size:12px;font-weight:600;">🚫 Cooldown Active</span>`;
+            return `
+              <tr style="background:rgba(56,189,248,0.03);border-left:3px solid #38bdf8;">
+                <td><strong>${c.tenant_name}</strong><br><small style="color:#64748b;">${c.tenant_id}${c.is_group ? ' <span class="badge" style="font-size:9px;background:#0284c7;color:#fff;">GROUP</span>' : ''}</small></td>
+                <td>${c.property_unit}</td>
+                <td><code>${c.phone}</code></td>
+                <td><strong style="color:#f87171;">$${Number(c.balance).toLocaleString('en-US', {minimumFractionDigits:2})}</strong></td>
+                <td>${sentLabel}</td>
+                <td>${remBadge}</td>
+                <td style="max-width:280px;font-size:12px;color:#cbd5e1;line-height:1.4;">
+                  <div>${statusBadge}</div>
+                  <div style="font-size:11px;color:#94a3b8;margin-top:2px;">${c.reason}</div>
                 </td>
               </tr>
             `;

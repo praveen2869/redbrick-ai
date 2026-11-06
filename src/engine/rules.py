@@ -172,49 +172,37 @@ class BusinessRulesEngine:
         """
         Rule 4: Deduplication & Cooldown Rule.
         Cooldown is triggered EXCLUSIVELY by workflow-generated rent reminders.
-        - When a workflow-generated rent reminder is sent today, put that tenant into cooldown
-          for the remainder of that day.
-        - The next morning (now.date() > reminder.date()), automatically reactivate the tenant
+        - When a workflow-generated rent reminder is sent, put that tenant into cooldown
+          for exactly 24 hours from actual dispatch timestamp.
+        - When 24 hours expire (hours_elapsed >= 24.0), automatically reactivate the tenant
           for reminder eligibility, provided they still have an outstanding balance.
         - If no workflow-generated reminder was sent, do not activate cooldown.
         """
         now = current_time or datetime.utcnow()
         if now.tzinfo is not None:
             now = now.replace(tzinfo=None)
-        last_reminder = db.get_last_successful_reminder(tenant_id)
+
+        is_in_cooldown, last_reminder, hours_elapsed, hours_remaining, expires_at = db.get_cooldown_status(
+            tenant_id, current_time=now, cooldown_hours=24.0
+        )
 
         if not last_reminder:
             return False, None, "No workflow-generated rent reminders on record"
 
-        try:
-            last_ts = datetime.fromisoformat(last_reminder.timestamp.replace("Z", "+00:00"))
-            if last_ts.tzinfo is not None:
-                last_ts = last_ts.replace(tzinfo=None)
-        except Exception:
-            return False, None, "Could not parse previous reminder timestamp"
-
-        # Check calendar day: Reminder was sent today?
-        if last_ts.date() == now.date():
-            elapsed = now - last_ts
-            hours_elapsed = max(0.0, elapsed.total_seconds() / 3600.0)
-            end_of_day = datetime(now.year, now.month, now.day, 23, 59, 59)
-            hours_remaining = max(0.0, (end_of_day - now).total_seconds() / 3600.0)
+        if is_in_cooldown and expires_at:
             return (
                 True,
                 last_reminder,
-                f"Workflow rent reminder sent today ({hours_elapsed:.1f}h ago at {last_ts.strftime('%I:%M %p')}). "
-                f"Cooldown active for remainder of day ({hours_remaining:.1f}h remaining until morning reactivation)"
+                f"Workflow rent reminder sent {hours_elapsed:.1f}h ago. "
+                f"Cooldown active ({hours_remaining:.1f}h remaining until {expires_at.strftime('%Y-%m-%d %I:%M %p')})"
             )
-        elif last_ts.date() < now.date():
-            # Sent on a previous day -> automatically reactivate the next morning
+        else:
             return (
                 False,
                 last_reminder,
-                f"Previous workflow reminder sent on {last_ts.strftime('%Y-%m-%d')} (Reactivated for morning reminder eligibility)"
+                f"Previous workflow reminder sent {hours_elapsed:.1f}h ago "
+                f"({last_reminder.timestamp[:16]}) — 24h cooldown window expired. Eligible for reminder."
             )
-        else:
-            # Future timestamp edge case
-            return True, last_reminder, "Workflow rent reminder sent today (Cooldown active)"
 
     def check_manual_review_in_notes(
         self, record: Optional[RentVineRecord], raw_text: Optional[str] = None
