@@ -270,21 +270,29 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
             is_cool, last_rem, h_elapsed, h_rem, exp_at = db.get_cooldown_status(tid, current_time=now, cooldown_hours=24.0)
 
             # Strict 5-state dynamic classification
-            if is_cool and last_rem:
+            if eff_bal <= 0.0:
+                t_dec = {
+                    "outcome": "SKIP_PAID",
+                    "reason": "Tenant balance $0.00 — rent paid/cleared",
+                    "timestamp": now.isoformat(),
+                    "sms_sent": False,
+                    "note_written": False
+                }
+            elif 0.0 < eff_bal < 200.0:
+                t_dec = {
+                    "outcome": "FLAG_MANUAL_REVIEW",
+                    "reason": f"Total outstanding balance (${eff_bal:,.2f}) is greater than $0 but less than $200 — moved to Manual Review / Disputes for staff verification.",
+                    "timestamp": now.isoformat(),
+                    "sms_sent": False,
+                    "note_written": False
+                }
+            elif is_cool and last_rem:
                 disp_exp = exp_at.strftime('%Y-%m-%d %I:%M %p') if exp_at else "in 24h"
                 t_dec = {
                     "outcome": "SKIP_ALREADY_REMINDED",
                     "reason": f"Workflow rent reminder sent {h_elapsed:.1f}h ago. Cooldown active for {h_rem:.1f}h remaining (expires {disp_exp}).",
                     "timestamp": last_rem.timestamp,
                     "sms_sent": True,
-                    "note_written": False
-                }
-            elif eff_bal <= 0.0:
-                t_dec = {
-                    "outcome": "SKIP_PAID",
-                    "reason": "Tenant balance $0.00 — rent paid/cleared",
-                    "timestamp": now.isoformat(),
-                    "sms_sent": False,
                     "note_written": False
                 }
             elif any(k in notes.lower() for k in ["manual review", "dispute", "attorney", "eviction"]):
@@ -382,7 +390,7 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                 "due_date": rv.due_date if rv else None,
                 "last_payment_date": rv.last_payment_date if rv else None,
                 "last_payment_amount": rv.last_payment_amount if rv else 0.0,
-                "portal_link": rv.portal_link if rv else "https://redbrick.rentvine.com/portal/pay",
+                "portal_link": rv.portal_link if rv else settings.RENTVINE_PORTAL_PAYMENT_URL,
                 "notes": [
                     {
                         "id": n.id,
@@ -807,16 +815,19 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                         continue
                     raw_phone = rec.get("phone") or ""
                     clean_p = "".join([c for c in raw_phone if c.isdigit()])
+                    rec_lid = str(rec.get("lease_id") or "")
                     if clean_p:
                         p10 = clean_p[-10:]
                         overdue_phones.add(p10)
-                        # Match to a local tenant object
-                        for t in all_tenants:
-                            t_clean = "".join([c for c in (t.phone or "") if c.isdigit()])
-                            if t_clean and t_clean[-10:] == p10:
-                                overdue_tenant_ids.add(t.id)
+                    else:
+                        p10 = ""
+                    # Match to a local tenant object by phone or lease_id
+                    for t in all_tenants:
+                        t_clean = "".join([c for c in (t.phone or "") if c.isdigit()])
+                        if (p10 and t_clean and t_clean[-10:] == p10) or (rec_lid and t.lease_id and str(t.lease_id) == rec_lid):
+                            overdue_tenant_ids.add(t.id)
+                            if p10 and p10 not in report_phone_to_tenant:
                                 report_phone_to_tenant[p10] = t
-                                break
                 logger.info(
                     f"[Quo - Overdue Filter] {len(overdue_phones)} overdue tenant phones from Report #72. "
                     f"Quo conversations will be restricted to these contacts."
@@ -1088,10 +1099,6 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
             if effective_balance <= 0.0:
                 continue  # Never display or queue reminders for $0 balance
 
-            # Only include tenants with a real phone number
-            if not t.phone or t.phone.startswith("+1-415-555"):
-                continue
-
             clean_prop = clean_property_address(t.property_name or d.property_unit or "")
             unit_val = (t.unit_number or "").strip()
             clean_unit = clean_property_address(unit_val)
@@ -1120,38 +1127,49 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
             if not group_tenants:
                 group_tenants = [t]
 
+            from src.clients.quo_sms import normalize_phone_e164, phone_to_10digit
+            # Normalize and deduplicate destination phone numbers across the lease
+            phones_list = []
+            seen_p10 = set()
+            for x in group_tenants:
+                if x.phone and x.phone.strip():
+                    p10 = phone_to_10digit(x.phone)
+                    e164 = normalize_phone_e164(x.phone) or x.phone.strip()
+                    if p10 and p10 not in seen_p10:
+                        seen_p10.add(p10)
+                        phones_list.append(e164)
+
+            # Skip only if lease has no valid phone at all
+            if not phones_list and (not t.phone or t.phone.startswith("+1-415-555")):
+                continue
+
+            phone_display = ", ".join(phones_list) if phones_list else t.phone
             is_multi = len(group_tenants) > 1
             if is_multi:
                 from src.workflow import WorkflowOrchestrator
-                from src.clients.quo_sms import normalize_phone_e164, phone_to_10digit
                 greeting_names = WorkflowOrchestrator._format_tenant_names_list([x.greeting_name for x in group_tenants])
                 tenant_display_name = ", ".join(x.full_name.title() for x in group_tenants)
-                
-                # Normalize and deduplicate destination phone numbers
-                phones_list = []
-                seen_p10 = set()
-                for x in group_tenants:
-                    if x.phone and x.phone.strip():
-                        p10 = phone_to_10digit(x.phone)
-                        e164 = normalize_phone_e164(x.phone) or x.phone.strip()
-                        if p10 and p10 not in seen_p10:
-                            seen_p10.add(p10)
-                            phones_list.append(e164)
-                phone_display = ", ".join(phones_list)
             else:
                 greeting_names = t.greeting_name
                 tenant_display_name = d.tenant_name or t.full_name
-                phone_display = t.phone
-                phones_list = [t.phone] if t.phone else []
 
-            # ── 1. Manual Review / Disputes: reminders disabled per Follow-Up Notes or AI dispute ──
+            # ── 1. Manual Review / Disputes: reminders disabled per Follow-Up Notes, AI dispute, or Low Balance ($0 < bal < $200) ──
             d_reason_lower = (d.reason or "").lower()
             is_api_glitch = "quo sms retrieval failed" in d_reason_lower or "api_failure" in str(d.details or "").lower()
+            is_low_balance = (0.0 < effective_balance < 200.0)
             is_manual_review = (
                 (d.outcome == DecisionOutcome.FLAG_MANUAL_REVIEW and not is_api_glitch) or 
-                (fu_text and "manual review" in fu_text.lower())
+                (fu_text and "manual review" in fu_text.lower()) or
+                is_low_balance
             )
             if is_manual_review:
+                if is_low_balance:
+                    mr_reason = f"Total outstanding balance (${effective_balance:,.2f}) is greater than $0 but less than $200 — moved to Manual Review / Disputes."
+                elif d.outcome == DecisionOutcome.FLAG_MANUAL_REVIEW:
+                    mr_reason = d.reason
+                else:
+                    mr_reason = "RentVine Follow-Up Notes: Manual Review"
+
                 manual_review_tenants.append({
                     "tenant_id": d.tenant_id,
                     "tenant_name": tenant_display_name,
@@ -1161,7 +1179,7 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                     "is_group": is_multi,
                     "balance": effective_balance,
                     "status": "MANUAL_REVIEW_DISABLED",
-                    "reason": d.reason if d.outcome == DecisionOutcome.FLAG_MANUAL_REVIEW else "RentVine Follow-Up Notes: Manual Review",
+                    "reason": mr_reason,
                     "follow_up_notes": fu_text,
                     "timestamp": d.timestamp,
                     "sender_phone": settings.QUO_PHONE_TENANTS_FORMATTED,
@@ -1274,53 +1292,78 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                 continue
 
             # ── 5. Reminders Needed: Eligible tenants who have not received a reminder in 24 hours ──
-            portal = rv.portal_link if rv else "https://redbricksproperties.rentvine.com/portal/pay"
+            current_pm_dt = rules.get_pm_datetime()
+            stage = rules.get_reminder_stage(current_pm_dt)
+            portal = settings.RENTVINE_PORTAL_PAYMENT_URL
             due = rv.due_date if rv and rv.due_date else "November 1, 2026"
             effective_bal = float(d.balance if d.balance is not None else (rv.balance if rv else 0.0))
 
-            if is_multi:
-                try:
+            if stage == "RENT_REMINDER_STAGE_2_ESCALATION":
+                # Day 6: Second-stage escalation reminder (10-day notice). Must NEVER fall back to standard template.
+                is_esc, esc_why = rules.check_escalation_eligibility(t, rv, current_pm_dt)
+                if not is_esc:
+                    logger.info("Escalation suppressed on Day 6 for %s: %s", t.id, esc_why)
+                    continue
+
+                if is_multi:
+                    deduped_esc_names = []
+                    for n in [x.greeting_name for x in group_tenants]:
+                        if n and n not in deduped_esc_names:
+                            deduped_esc_names.append(n)
+                    esc_names_str = ", ".join(deduped_esc_names)
+                    sms_text = settings.GROUP_ESCALATION_REMINDER_TEMPLATE.format(
+                        tenant_names=esc_names_str,
+                        balance=effective_bal,
+                        property_name=clean_prop,
+                        unit_number=t.unit_number or "",
+                        property_address=prop_display,
+                        due_date=due,
+                        portal_link=settings.RENTVINE_PORTAL_PAYMENT_URL
+                    )
+                else:
+                    sms_text = settings.ESCALATION_REMINDER_TEMPLATE.format(
+                        tenant_name=t.greeting_name,
+                        balance=effective_bal,
+                        property_name=clean_prop,
+                        unit_number=t.unit_number or "",
+                        property_address=prop_display,
+                        due_date=due,
+                        portal_link=settings.RENTVINE_PORTAL_PAYMENT_URL
+                    )
+                rem_type = "RENT_REMINDER_STAGE_2_ESCALATION"
+                stage_num = 2
+                stage_label = "STAGE 2 - ESCALATION (10-DAY NOTICE)"
+            else:
+                if is_multi:
                     sms_text = settings.GROUP_REMINDER_TEMPLATE.format(
                         tenant_names=greeting_names,
                         balance=effective_bal,
                         property_name=clean_prop,
                         unit_number=t.unit_number or "",
+                        property_address=prop_display,
                         due_date=due,
                         portal_link=portal
                     )
-                except Exception:
-                    sms_text = (
-                        f"Hi {greeting_names},\n\n"
-                        f"Friendly reminder from Red Bricks Property Management:\n\n"
-                        f"Your rent of ${effective_bal:,.2f} for {clean_prop} was due on {due}. The grace period ends today, November 5. Please submit your payment by tonight to avoid late fees beginning tomorrow, November 6.\n\n"
-                        f"You can pay through your RentVine portal ({portal}). If you've already submitted your payment, please reply here so we can check its status.\n\n"
-                        f"Thank you!\n"
-                        f"RBPM BOT"
-                    )
-            else:
-                try:
+                else:
                     sms_text = settings.REMINDER_TEMPLATE.format(
                         tenant_name=t.greeting_name,
                         balance=effective_bal,
                         property_name=clean_prop,
                         unit_number=t.unit_number or "",
+                        property_address=prop_display,
                         due_date=due,
                         portal_link=portal
                     )
-                except Exception:
-                    sms_text = (
-                        f"Hi {t.greeting_name},\n\n"
-                        f"Friendly reminder from Red Bricks Property Management:\n\n"
-                        f"Your rent of ${effective_bal:,.2f} for {clean_prop} was due on {due}. The grace period ends today, November 5. Please submit your payment by tonight to avoid late fees beginning tomorrow, November 6.\n\n"
-                        f"You can pay through your RentVine portal ({portal}). If you've already submitted your payment, please reply here so we can check its status.\n\n"
-                        f"Thank you!\n"
-                        f"RBPM bot"
-                    )
+                rem_type = "RENT_REMINDER_STAGE_1" if stage == "RENT_REMINDER_STAGE_1" else "RENT_REMINDER"
+                stage_num = 1
+                stage_label = "STAGE 1 - STANDARD REMINDER" if stage == "RENT_REMINDER_STAGE_1" else "STANDARD REMINDER"
 
             reminder_id = f"rem_{d.tenant_id}_{datetime.utcnow().strftime('%Y%m%d')}"
             reminders_needed.append({
                 "reminder_id": reminder_id,
-                "reminder_type": "RENT_REMINDER",
+                "reminder_type": rem_type,
+                "stage": stage_num,
+                "stage_label": stage_label,
                 "workflow_id": d.run_id or "daily_workflow",
                 "tenant_id": d.tenant_id,
                 "tenant_name": tenant_display_name,
@@ -1636,6 +1679,16 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                 "status": "FLAG_MANUAL_REVIEW"
             }, 400)
 
+        cur_t = db.get_tenant_by_id(tenant_id)
+
+        # Low-balance threshold verification: $0 < balance < $200 automatically moved to Manual Review / Disputes
+        check_bal = float(rv_rec.balance) if rv_rec else (float(cur_t.balance or 0.0) if hasattr(cur_t, 'balance') else 0.0)
+        if 0.0 < check_bal < 200.0:
+            return self._send_json({
+                "error": f"Cannot dispatch automated reminder: Tenant balance (${check_bal:,.2f}) is greater than $0 but less than $200 and belongs in Manual Review / Disputes.",
+                "status": "FLAG_MANUAL_REVIEW"
+            }, 400)
+
         # Automatic Grace Period verification for current-month rent dues
         from src.engine.rules import BusinessRulesEngine
         rules = BusinessRulesEngine()
@@ -1644,6 +1697,42 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
             return self._send_json({
                 "error": f"Cannot send reminder: {grace_msg}",
                 "status": "IN_GRACE_PERIOD"
+            }, 400)
+
+        # ── Stage 2 Escalation & Cooldown Verification ──
+        is_escalation = (
+            "STAGE_2" in reminder_type.upper()
+            or "ESCALATION" in reminder_type.upper()
+            or "10-day notice" in text.lower()
+        )
+        stage_val = 2 if is_escalation else 1
+
+        if is_escalation:
+            # 1. Verification: tenant received first-stage reminder, and dispatch was confirmed
+            now_dt = datetime.utcnow()
+            has_stage_1 = db.has_received_stage_1_reminder(tenant_id, now_dt.year, now_dt.month)
+            if not has_stage_1:
+                return self._send_json({
+                    "error": "Cannot dispatch escalation reminder: Tenant has not received a confirmed Stage 1 rent reminder for this billing cycle.",
+                    "status": "STAGE_1_REQUIRED"
+                }, 400)
+
+            # 2. Verification: On Day 6 specifically, prevent duplicate escalation messages on the same day
+            pm_dt = rules.get_pm_datetime()
+            if pm_dt.day == 6:
+                has_escalated = db.has_received_escalation_reminder(tenant_id, now_dt.year, now_dt.month)
+                if has_escalated:
+                    return self._send_json({
+                        "error": "Cannot dispatch escalation reminder: Stage 2 escalation has already been dispatched for this billing cycle.",
+                        "status": "DUPLICATE_ESCALATION"
+                    }, 400)
+
+        # Check 24-hour deduplication cooldown
+        is_cooldown, last_rem, cd_reason = rules.check_recent_reminder_deduplication(tenant_id, datetime.utcnow())
+        if is_cooldown:
+            return self._send_json({
+                "error": f"Cannot dispatch reminder: {cd_reason}",
+                "status": "IN_COOLDOWN"
             }, 400)
 
         # Resolve sender phone number and inbox based on recipient type
@@ -1797,7 +1886,8 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                         content=text,
                         sender_phone=sender_fmt,
                         delivery_status="DELIVERED",
-                        sent_at=now_iso
+                        sent_at=now_iso,
+                        stage=stage_val
                     )
 
                 # Record decision so cooldown activates for primary and all co-tenants
@@ -1917,7 +2007,8 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                         content=text,
                         sender_phone=sender_fmt,
                         delivery_status="SENT_HITL_APPROVED",
-                        sent_at=now_iso
+                        sent_at=now_iso,
+                        stage=stage_val
                     )
 
                 expires_at = datetime.utcnow() + timedelta(hours=24)

@@ -21,7 +21,7 @@ from src.database import db
 from src.clients.rentvine_mcp import RentVineMCPClient
 from src.clients.quo_sms import QuoSMSClient
 from src.clients.gmail_client import GmailClient
-from src.engine.rules import BusinessRulesEngine
+from src.engine.rules import BusinessRulesEngine, ReminderStage
 from src.engine.ai_classifier import AIIntentClassifier
 from src.engine.retry_manager import RetryManager
 from src.sync_manager import sync_manager
@@ -359,19 +359,55 @@ class WorkflowOrchestrator:
         balance = primary_decision.balance
         prop_unit = primary_decision.property_unit
 
-        # Build the group SMS text using GROUP_REMINDER_TEMPLATE
-        group_sms_text = settings.GROUP_REMINDER_TEMPLATE.format(
-            tenant_names=greeting_names,
-            tenant_name=greeting_names,  # ReminderTemplate uses tenant_name internally
-            balance=balance,
-            property_name=primary.property_name,
-            unit_number=primary.unit_number,
-            due_date=rv_record.due_date if rv_record else "1st of the month",
-            portal_link=rv_record.portal_link if rv_record else "https://redbricksproperties.rentvine.com/portal/pay"
+        # Check reminder stage (Day 5 Stage 1 vs Day 6 Escalation vs Day 7+ Rolling)
+        reminder_stage = self.rules.get_reminder_stage(current_time)
+        is_stage_2 = (
+            reminder_stage == ReminderStage.STAGE_2_ESCALATION.value
+            or primary_decision.details.get("stage") == 2
+            or primary_decision.details.get("reminder_type") == "RENT_REMINDER_STAGE_2_ESCALATION"
         )
 
+        if is_stage_2:
+            # Multi-tenant group escalation: greeting addresses all unique tenant names
+            deduped_names = []
+            for n in all_names:
+                clean_n = (n or "").strip()
+                if clean_n and clean_n not in deduped_names:
+                    deduped_names.append(clean_n)
+            greeting_names = ", ".join(deduped_names)
+
+            group_sms_text = settings.GROUP_ESCALATION_REMINDER_TEMPLATE.format(
+                tenant_names=greeting_names,
+                tenant_name=greeting_names,
+                balance=balance,
+                property_name=primary.property_name,
+                unit_number=primary.unit_number,
+                property_address=prop_unit,
+                due_date=rv_record.due_date if rv_record else "1st of the month",
+                portal_link=settings.RENTVINE_PORTAL_PAYMENT_URL
+            )
+            reminder_type = "RENT_REMINDER_STAGE_2_ESCALATION"
+            stage_num = 2
+            rv_note_title = "[GROUP AUTOMATED ESCALATION RENT REMINDER SENT]"
+            reason_label = "Unpaid balance ${balance:,.2f} — Stage 2 Escalation (10-day notice warning) group SMS dispatched to all co-tenants"
+        else:
+            group_sms_text = settings.GROUP_REMINDER_TEMPLATE.format(
+                tenant_names=greeting_names,
+                tenant_name=greeting_names,  # ReminderTemplate uses tenant_name internally
+                balance=balance,
+                property_name=primary.property_name,
+                unit_number=primary.unit_number,
+                property_address=prop_unit,
+                due_date=rv_record.due_date if rv_record else "1st of the month",
+                portal_link=settings.RENTVINE_PORTAL_PAYMENT_URL
+            )
+            reminder_type = "RENT_REMINDER_STAGE_1" if reminder_stage == ReminderStage.STAGE_1_STANDARD.value else "RENT_REMINDER"
+            stage_num = 1
+            rv_note_title = "[GROUP AUTOMATED RENT REMINDER SENT]"
+            reason_label = f"Unpaid ${balance:,.2f} — group SMS dispatched to all co-tenants"
+
         logger.info(
-            f"[Group SMS] Sending combined reminder for lease {group.lease_id} "
+            f"[Group SMS] Sending combined reminder (stage {stage_num}) for lease {group.lease_id} "
             f"to {len(phones_to_send)} recipients: {[p[2] for p in phones_to_send]}"
         )
         logger.debug(f"[Group SMS] Message:\n{group_sms_text}")
@@ -404,14 +440,15 @@ class WorkflowOrchestrator:
                         db.record_workflow_reminder(
                             reminder_id=reminder_id,
                             tenant_id=t_id,
-                            reminder_type="RENT_REMINDER",
+                            reminder_type=reminder_type,
                             message_id=sms_msg_id or reminder_id,
                             workflow_id=run_id,
                             phone=t_phone,
                             content=group_sms_text,
                             sender_phone=settings.QUO_PHONE_TENANTS_FORMATTED,
                             delivery_status="DELIVERED",
-                            sent_at=now_iso
+                            sent_at=now_iso,
+                            stage=stage_num
                         )
             except Exception as e:
                 for t_id, t_full_name, t_phone in phones_to_send:
@@ -426,7 +463,7 @@ class WorkflowOrchestrator:
         if not is_dry_run and any_sms_sent:
             phone_list = ", ".join(p[2] for p in phones_to_send)
             rv_note_text = (
-                f"[GROUP AUTOMATED RENT REMINDER SENT] Quo SMS delivered to group "
+                f"{rv_note_title} Quo SMS delivered to group "
                 f"({len(phones_to_send)} recipients: {phone_list}) "
                 f"from {settings.QUO_PHONE_TENANTS_FORMATTED} (Tenants & Vendors) "
                 f"for ${balance:,.2f} due on {rv_record.due_date if rv_record else 'N/A'}. "
@@ -444,6 +481,8 @@ class WorkflowOrchestrator:
             "greeting": greeting_names,
             "lease_id": group.lease_id,
             "is_group_reminder": True,
+            "stage": stage_num,
+            "reminder_type": reminder_type,
             "co_tenant_count": len(group.co_tenants),
             "is_dry_run": is_dry_run,
             "sender_phone": settings.QUO_PHONE_TENANTS_FORMATTED,
@@ -458,7 +497,7 @@ class WorkflowOrchestrator:
             property_unit=prop_unit,
             balance=balance,
             outcome=DecisionOutcome.SEND_REMINDER,
-            reason=reason_prefix + f"Unpaid ${balance:,.2f} — group SMS dispatched to all co-tenants",
+            reason=reason_prefix + reason_label.format(balance=balance),
             details=group_detail,
             sms_sent=any_sms_sent,
             sms_message_id=all_msg_ids[0] if all_msg_ids else None,
@@ -590,6 +629,22 @@ class WorkflowOrchestrator:
                 outcome=DecisionOutcome.SKIP_PAID,
                 reason=paid_reason,
                 details={"step": "paid_check", "status": "Paid — no action"},
+                run_id=run_id
+            )
+            db.save_decision(decision)
+            return decision
+
+        # Rule 1a: Low Balance Threshold Check ($0 < balance < $200 -> Manual Review / Disputes)
+        is_low_bal, low_bal_reason = self.rules.check_low_balance_threshold(balance)
+        if is_low_bal:
+            decision = WorkflowDecision(
+                tenant_id=tenant.id,
+                tenant_name=tenant.full_name,
+                property_unit=prop_unit,
+                balance=balance,
+                outcome=DecisionOutcome.FLAG_MANUAL_REVIEW,
+                reason=low_bal_reason,
+                details={"step": "low_balance_threshold", "action": "Manual Review / Disputes", "balance": balance, "threshold": "< $200"},
                 run_id=run_id
             )
             db.save_decision(decision)
@@ -832,15 +887,97 @@ class WorkflowOrchestrator:
             db.save_decision(decision)
             return decision
 
-        # Step 4: Unpaid & Eligible -> Dispatch Quo SMS Reminder
-        sms_text = settings.REMINDER_TEMPLATE.format(
-            tenant_name=tenant.first_name,
-            balance=balance,
-            property_name=tenant.property_name,
-            unit_number=tenant.unit_number,
-            due_date=rv_record.due_date if rv_record else "1st of the month",
-            portal_link=rv_record.portal_link if rv_record else "https://redbricksproperties.rentvine.com/portal/pay"
-        )
+        # Step 4: Determine Reminder Stage & Select Date-Based Template
+        reminder_stage = self.rules.get_reminder_stage(current_time)
+
+        if reminder_stage == ReminderStage.STAGE_2_ESCALATION.value:
+            # From Day 6 onward: Second-stage Escalation Reminder (10-day notice)
+            pm_dt = self.rules.get_pm_datetime(current_time)
+
+            if pm_dt.day == 6:
+                has_stage_1 = db.has_received_stage_1_reminder(tenant.id, pm_dt.year, pm_dt.month)
+                if not has_stage_1:
+                    decision = WorkflowDecision(
+                        tenant_id=tenant.id,
+                        tenant_name=tenant.full_name,
+                        property_unit=prop_unit,
+                        balance=balance,
+                        outcome=DecisionOutcome.SKIP_ALREADY_REMINDED,
+                        reason="Day 6 escalation suppressed: Stage 1 reminder was not confirmed as dispatched for this billing cycle",
+                        details={
+                            "step": "day_6_escalation_guard",
+                            "stage": 2,
+                            "reminder_stage": reminder_stage,
+                            "suppressed_reason": "Stage 1 not confirmed"
+                        },
+                        run_id=run_id
+                    )
+                    db.save_decision(decision)
+                    return decision
+
+                has_escalated = db.has_received_escalation_reminder(tenant.id, pm_dt.year, pm_dt.month)
+                if has_escalated:
+                    decision = WorkflowDecision(
+                        tenant_id=tenant.id,
+                        tenant_name=tenant.full_name,
+                        property_unit=prop_unit,
+                        balance=balance,
+                        outcome=DecisionOutcome.SKIP_ALREADY_REMINDED,
+                        reason=f"Stage 2 escalation reminder already dispatched for {pm_dt.strftime('%B %Y')} billing cycle",
+                        details={
+                            "step": "escalation_duplicate_guard",
+                            "stage": 2,
+                            "reminder_stage": reminder_stage
+                        },
+                        run_id=run_id
+                    )
+                    db.save_decision(decision)
+                    return decision
+
+            # Day 6+ reminder: Always uses the escalation template (10-day notice). Never falls back to Day 5 template.
+            sms_text = settings.ESCALATION_REMINDER_TEMPLATE.format(
+                tenant_name=tenant.greeting_name,
+                balance=balance,
+                property_name=tenant.property_name,
+                unit_number=tenant.unit_number,
+                property_address=prop_unit,
+                due_date=rv_record.due_date if rv_record else "1st of the month",
+                portal_link=settings.RENTVINE_PORTAL_PAYMENT_URL
+            )
+            reminder_type = "RENT_REMINDER_STAGE_2_ESCALATION"
+            stage_num = 2
+            rv_note_title = "[AUTOMATED ESCALATION RENT REMINDER SENT]"
+            decision_reason = (
+                f"Unpaid balance ${balance:,.2f} — Stage 2 Escalation reminder (10-day notice warning) "
+                f"dispatched" if not is_dry_run else f"[DRY-RUN] Would send Stage 2 Escalation reminder for ${balance:,.2f}"
+            )
+        else:
+            # Day 5 (Stage 1) or Day 7+ (Standard rolling)
+            sms_text = settings.REMINDER_TEMPLATE.format(
+                tenant_name=tenant.greeting_name,
+                balance=balance,
+                property_name=tenant.property_name,
+                unit_number=tenant.unit_number,
+                property_address=prop_unit,
+                due_date=rv_record.due_date if rv_record else "1st of the month",
+                portal_link=settings.RENTVINE_PORTAL_PAYMENT_URL
+            )
+            if reminder_stage == ReminderStage.STAGE_1_STANDARD.value:
+                reminder_type = "RENT_REMINDER_STAGE_1"
+                stage_num = 1
+                rv_note_title = "[AUTOMATED RENT REMINDER STAGE 1 SENT]"
+                decision_reason = (
+                    f"Unpaid balance ${balance:,.2f} past grace period — Stage 1 rent reminder dispatched"
+                    if not is_dry_run else f"[DRY-RUN] Would send Stage 1 reminder for ${balance:,.2f}"
+                )
+            else:
+                reminder_type = "RENT_REMINDER"
+                stage_num = 1
+                rv_note_title = "[AUTOMATED RENT REMINDER SENT]"
+                decision_reason = (
+                    f"Unpaid balance ${balance:,.2f} — standard rolling rent reminder dispatched"
+                    if not is_dry_run else f"[DRY-RUN] Would send standard rolling reminder for ${balance:,.2f}"
+                )
 
         sms_sent = False
         sms_msg_id = None
@@ -868,19 +1005,20 @@ class WorkflowOrchestrator:
                     db.record_workflow_reminder(
                         reminder_id=reminder_id,
                         tenant_id=tenant.id,
-                        reminder_type="RENT_REMINDER",
+                        reminder_type=reminder_type,
                         message_id=sms_msg_id or reminder_id,
                         workflow_id=run_id,
                         phone=tenant.phone,
                         content=sms_text,
                         sender_phone=settings.QUO_PHONE_TENANTS_FORMATTED,
                         delivery_status="DELIVERED",
-                        sent_at=now_iso_dispatch
+                        sent_at=now_iso_dispatch,
+                        stage=stage_num
                     )
 
                     # Log confirmation note to RentVine only when actually dispatched
                     rv_note_text = (
-                        f"[AUTOMATED RENT REMINDER SENT] Quo SMS delivered to {tenant.phone} "
+                        f"{rv_note_title} Quo SMS delivered to {tenant.phone} "
                         f"from {settings.QUO_PHONE_TENANTS_FORMATTED} (Tenants & Vendors) "
                         f"for ${balance:,.2f} due on {rv_record.due_date if rv_record else 'N/A'}."
                     )
@@ -902,7 +1040,7 @@ class WorkflowOrchestrator:
             property_unit=prop_unit,
             balance=balance,
             outcome=DecisionOutcome.SEND_REMINDER,
-            reason=f"Unpaid balance ${balance:,.2f} past grace period — [DEMO MODE] Reminder needs to be sent (Live SMS skipped for testing)" if not is_dry_run else f"[DRY-RUN] Would send Quo SMS reminder for ${balance:,.2f}",
+            reason=decision_reason,
             details={
                 "sms_text": sms_text,
                 "phone": tenant.phone,
@@ -911,6 +1049,8 @@ class WorkflowOrchestrator:
                 "sender_phone_id": settings.QUO_PHONE_TENANTS_ID,
                 "is_dry_run": is_dry_run,
                 "force_failed": force_failure,
+                "stage": stage_num,
+                "reminder_type": reminder_type,
                 "reminder_status": "REMINDER_NEEDED (SEND_SKIPPED)"
             },
             sms_sent=sms_sent,

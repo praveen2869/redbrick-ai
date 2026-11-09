@@ -282,7 +282,7 @@ class RentVineMCPClient:
                 balance=actual_balance,
                 monthly_rent=rent_val,
                 due_date=actual_due,
-                portal_link=f"{self._api_base}/portal/pay",
+                portal_link=settings.RENTVINE_PORTAL_PAYMENT_URL,
                 lease_status="ACTIVE" if l.get("primaryLeaseStatusID") == "2" else "COMPLETED"
             )
             db.upsert_rentvine_record(rv_record)
@@ -452,7 +452,7 @@ class RentVineMCPClient:
         static_fallbacks = {
             "second kukunoor tenant": {"phone": "+19802941035", "email": ""},
             "kukunoor tenant": {"phone": "+18622205006", "email": ""},
-            "stephany ikolo": {"phone": "+19803181566", "email": "fannyikolo65@gmail.com"}
+            "stephany ikolo": {"phone": "+17046743831", "email": "fannyikolo65@gmail.com"}
         }
         if clean_name in static_fallbacks:
             return static_fallbacks[clean_name]
@@ -877,10 +877,10 @@ class RentVineMCPClient:
                 co_email = co_contact.get("email") or f"{co_name.lower().replace(' ', '.')}@rentvine.demo"
                 # Co-tenant exclusion inherits the lease exclusion status
                 co_id = f"rv_lease_{lease_id}_co{idx + 1}"
-                # Check if tenant exists by phone first
+                # Check if this exact co-tenant already exists by phone (must not overwrite primary or different tenant)
                 if co_phone:
                     existing_co = db.get_tenant_by_phone(co_phone)
-                    if existing_co:
+                    if existing_co and existing_co.id != tenant_id and existing_co.full_name.strip().lower() == co_name.strip().lower():
                         co_id = existing_co.id
                 co_obj = Tenant(
                     id=co_id,

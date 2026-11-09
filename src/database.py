@@ -182,6 +182,13 @@ class Database:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_workflow_reminders_tenant ON workflow_reminders (tenant_id, reminder_type, sent_at DESC)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_workflow_reminders_msg_id ON workflow_reminders (message_id)")
 
+            # Migration: ensure stage column exists on workflow_reminders
+            cursor.execute("PRAGMA table_info(workflow_reminders)")
+            rem_cols = [c[1] for c in cursor.fetchall()]
+            if "stage" not in rem_cols:
+                cursor.execute("ALTER TABLE workflow_reminders ADD COLUMN stage INTEGER DEFAULT 1")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_workflow_reminders_stage ON workflow_reminders (tenant_id, stage, sent_at DESC)")
+
             conn.commit()
 
     def reset_database(self):
@@ -573,24 +580,30 @@ class Database:
         delivery_status: str,
         sent_at: str,
         workflow_id: Optional[str] = None,
-        reminder_type: str = "RENT_REMINDER"
+        reminder_type: str = "RENT_REMINDER",
+        stage: Optional[int] = None
     ):
         """
         Records a workflow-generated rent reminder delivery record in workflow_reminders.
         Associates each queued draft (reminder_id, workflow_id) with its actual Quo delivery record.
-        Tracks tenant_id, message_id, reminder_type, sending timestamp (sent_at), and delivery_status.
+        Tracks tenant_id, message_id, reminder_type, stage (1 or 2), sending timestamp (sent_at), and delivery_status.
         """
+        if stage is None:
+            stage = 2 if "STAGE_2" in (reminder_type or "").upper() or "ESCALATION" in (reminder_type or "").upper() else 1
+
         with self.get_connection() as conn:
             conn.execute("""
             INSERT INTO workflow_reminders (
                 id, reminder_id, workflow_id, tenant_id, reminder_type,
                 message_id, phone, content, sender_phone, delivery_status,
-                sent_at, created_at
+                sent_at, created_at, stage
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 delivery_status=excluded.delivery_status,
-                sent_at=excluded.sent_at
+                sent_at=excluded.sent_at,
+                stage=excluded.stage,
+                reminder_type=excluded.reminder_type
             """, (
                 reminder_id,
                 reminder_id,
@@ -603,7 +616,8 @@ class Database:
                 sender_phone,
                 delivery_status,
                 sent_at,
-                datetime.utcnow().isoformat()
+                datetime.utcnow().isoformat(),
+                stage
             ))
             conn.commit()
 
@@ -623,6 +637,126 @@ class Database:
                 ORDER BY sent_at DESC LIMIT ?
                 """, (limit,))
             return [dict(r) for r in cursor.fetchall()]
+
+    def has_received_stage_1_reminder(self, tenant_id: str, cycle_year: int, cycle_month: int) -> bool:
+        """
+        Checks whether the tenant or any co-tenant on the same lease received a confirmed Stage 1
+        rent reminder for the specified billing cycle (year, month).
+        Delivery status must be confirmed: SENT_HITL_APPROVED, DELIVERED, or SENT.
+        """
+        related_ids = [tenant_id]
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute("SELECT lease_id FROM tenants WHERE id = ?", (tenant_id,))
+                t_row = cursor.fetchone()
+                if t_row and t_row["lease_id"]:
+                    cursor.execute("SELECT id FROM tenants WHERE lease_id = ?", (t_row["lease_id"],))
+                    for r in cursor.fetchall():
+                        if r["id"] not in related_ids:
+                            related_ids.append(r["id"])
+            except Exception:
+                pass
+
+            placeholders = ",".join("?" for _ in related_ids)
+            month_prefix = f"{cycle_year:04d}-{cycle_month:02d}%"
+
+            # Check workflow_reminders for stage 1 (or any rent reminder sent in cycle)
+            cursor.execute(f"""
+            SELECT id FROM workflow_reminders
+            WHERE tenant_id IN ({placeholders})
+              AND (stage = 1 OR reminder_type IN ('RENT_REMINDER', 'RENT_REMINDER_STAGE_1'))
+              AND delivery_status IN ('SENT_HITL_APPROVED', 'DELIVERED', 'SENT')
+              AND sent_at LIKE ?
+            LIMIT 1
+            """, (*related_ids, month_prefix))
+            if cursor.fetchone():
+                return True
+
+            # Also check communication_messages
+            cursor.execute(f"""
+            SELECT id FROM communication_messages
+            WHERE tenant_id IN ({placeholders})
+              AND direction = 'OUTBOUND'
+              AND status IN ('SENT_HITL_APPROVED', 'DELIVERED', 'SENT')
+              AND timestamp LIKE ?
+              AND (
+                  metadata_json LIKE '%"is_workflow_reminder": true%'
+                  OR metadata_json LIKE '%"reminder_type": "RENT_REMINDER"%'
+                  OR metadata_json LIKE '%"reminder_type": "RENT_REMINDER_STAGE_1"%'
+                  OR content LIKE '%Friendly reminder from Red Bricks%'
+                  OR content LIKE '%was due on%'
+              )
+            LIMIT 1
+            """, (*related_ids, month_prefix))
+            if cursor.fetchone():
+                return True
+
+            # Also check workflow_decisions
+            cursor.execute(f"""
+            SELECT id FROM workflow_decisions
+            WHERE tenant_id IN ({placeholders})
+              AND sms_sent = 1
+              AND timestamp LIKE ?
+              AND (outcome = 'SEND_REMINDER' OR details_json LIKE '%"stage": 1%')
+            LIMIT 1
+            """, (*related_ids, month_prefix))
+            if cursor.fetchone():
+                return True
+
+            return False
+
+    def has_received_escalation_reminder(self, tenant_id: str, cycle_year: int, cycle_month: int) -> bool:
+        """
+        Checks whether the tenant or any co-tenant on the same lease already received a confirmed
+        Stage 2 Escalation reminder for the specified billing cycle (year, month).
+        Prevents duplicate escalation messages.
+        """
+        related_ids = [tenant_id]
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute("SELECT lease_id FROM tenants WHERE id = ?", (tenant_id,))
+                t_row = cursor.fetchone()
+                if t_row and t_row["lease_id"]:
+                    cursor.execute("SELECT id FROM tenants WHERE lease_id = ?", (t_row["lease_id"],))
+                    for r in cursor.fetchall():
+                        if r["id"] not in related_ids:
+                            related_ids.append(r["id"])
+            except Exception:
+                pass
+
+            placeholders = ",".join("?" for _ in related_ids)
+            month_prefix = f"{cycle_year:04d}-{cycle_month:02d}%"
+
+            cursor.execute(f"""
+            SELECT id FROM workflow_reminders
+            WHERE tenant_id IN ({placeholders})
+              AND (stage = 2 OR reminder_type = 'RENT_REMINDER_STAGE_2_ESCALATION')
+              AND delivery_status IN ('SENT_HITL_APPROVED', 'DELIVERED', 'SENT')
+              AND sent_at LIKE ?
+            LIMIT 1
+            """, (*related_ids, month_prefix))
+            if cursor.fetchone():
+                return True
+
+            cursor.execute(f"""
+            SELECT id FROM communication_messages
+            WHERE tenant_id IN ({placeholders})
+              AND direction = 'OUTBOUND'
+              AND status IN ('SENT_HITL_APPROVED', 'DELIVERED', 'SENT')
+              AND timestamp LIKE ?
+              AND (
+                  metadata_json LIKE '%"stage": 2%'
+                  OR metadata_json LIKE '%"reminder_type": "RENT_REMINDER_STAGE_2_ESCALATION"%'
+                  OR content LIKE '%10-day notice%'
+              )
+            LIMIT 1
+            """, (*related_ids, month_prefix))
+            if cursor.fetchone():
+                return True
+
+            return False
 
     def get_last_successful_reminder(self, tenant_id: str) -> Optional[WorkflowDecision]:
         """
@@ -652,7 +786,8 @@ class Database:
             cursor.execute(f"""
             SELECT * FROM workflow_reminders
             WHERE tenant_id IN ({placeholders})
-              AND reminder_type = 'RENT_REMINDER'
+              AND (reminder_type IN ('RENT_REMINDER', 'RENT_REMINDER_STAGE_1', 'RENT_REMINDER_STAGE_2_ESCALATION')
+                   OR reminder_type LIKE 'RENT_REMINDER%')
               AND delivery_status IN ('SENT_HITL_APPROVED', 'DELIVERED', 'SENT')
             ORDER BY sent_at DESC
             LIMIT 1
@@ -1040,11 +1175,11 @@ class Database:
                 p10 = phone_to_10digit(t.phone)
                 cname = t.full_name.strip().lower()
 
-                # If phone is already included for this lease, skip duplicate record
-                if p10 and p10 in seen_p10:
+                # If name is identical to an already included tenant on this lease, skip duplicate record
+                if cname and cname in seen_names:
                     continue
-                # If name is identical to an already included tenant on this lease, skip duplicate
-                if cname and cname in seen_names and (not p10 or p10 in seen_p10):
+                # If tenant has no name and phone is already included, skip duplicate
+                if not cname and p10 and p10 in seen_p10:
                     continue
 
                 if p10:

@@ -157,9 +157,39 @@ class PortfolioSyncManager:
                     lease_id=str(lid)
                 )
 
+                co_tenants_list = []
+                for idx, co_name in enumerate(tenants_list[1:]):
+                    co_name = (co_name or "").strip()
+                    if not co_name or co_name.lower() == primary_name.lower():
+                        continue
+                    co_parts = co_name.split(" ", 1)
+                    co_first = co_parts[0]
+                    co_last = co_parts[1] if len(co_parts) > 1 else ""
+                    co_lookup = co_name.lower()
+                    co_cached = contact_map.get(co_lookup)
+                    if co_cached and co_cached[0]:
+                        co_phone = co_cached[0]
+                        co_email = co_cached[1] or f"{co_first.lower()}@rentvine.demo"
+                    else:
+                        co_phone = ""
+                        co_email = f"{co_first.lower()}@rentvine.demo"
+                    co_id = f"rv_lease_{lid}_co{idx + 1}"
+                    co_tenant = Tenant(
+                        id=co_id,
+                        first_name=co_first,
+                        last_name=co_last,
+                        phone=co_phone,
+                        email=co_email,
+                        property_name=prop_name,
+                        unit_number=unit_num,
+                        lease_id=str(lid)
+                    )
+                    co_tenants_list.append(co_tenant)
+
                 entry = {
                     "lid": lid,
                     "tenant": tenant,
+                    "co_tenants": co_tenants_list,
                     "rent_val": rent_val,
                     "is_active": is_active,
                     "lease_data": l
@@ -209,11 +239,21 @@ class PortfolioSyncManager:
                     balance=bal,
                     monthly_rent=rent_val,
                     due_date=due,
-                    portal_link=f"{client._api_base}/portal/pay",
+                    portal_link=settings.RENTVINE_PORTAL_PAYMENT_URL,
                     lease_status="ACTIVE" if is_active else "COMPLETED"
                 )
                 tenants_batch.append(e["tenant"])
                 records_batch.append(rv_record)
+                for co_t in e.get("co_tenants", []):
+                    tenants_batch.append(co_t)
+                    records_batch.append(RentVineRecord(
+                        tenant_id=co_t.id,
+                        balance=0.0,
+                        monthly_rent=rent_val,
+                        due_date="",
+                        portal_link=settings.RENTVINE_PORTAL_PAYMENT_URL,
+                        lease_status="ACTIVE" if is_active else "COMPLETED"
+                    ))
 
             self.sync_status = "SAVING_DATABASE"
             # Purge demo seed tenants if live data is ready

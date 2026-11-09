@@ -7,6 +7,7 @@ and active payment promise windows.
 import logging
 import re
 from datetime import datetime, timedelta
+from enum import Enum
 from typing import Optional, Tuple, Dict, Any
 from src.config import settings
 from src.models import (
@@ -14,7 +15,49 @@ from src.models import (
 )
 from src.database import db
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    try:
+        from backports.zoneinfo import ZoneInfo
+    except ImportError:
+        ZoneInfo = None
+
 logger = logging.getLogger("RulesEngine")
+
+def get_pm_datetime(current_time: Optional[datetime] = None) -> datetime:
+    """
+    Returns datetime localized to the property management timezone (default America/New_York).
+    If current_time is None, returns current time in PM timezone.
+    If naive datetime is provided, returns it directly to honor reference test clocks.
+    """
+    tz_name = getattr(settings, "PROPERTY_TIMEZONE", "America/New_York")
+    tz = None
+    if ZoneInfo:
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = None
+    if not tz:
+        from datetime import timezone as _tz, timedelta as _td
+        tz = _tz(_td(hours=-5))
+
+    if current_time is None:
+        from datetime import timezone as _tz
+        return datetime.now(_tz.utc).astimezone(tz)
+
+    if current_time.tzinfo is not None:
+        return current_time.astimezone(tz)
+
+    return current_time
+
+
+class ReminderStage(str, Enum):
+    STAGE_PAUSE_GRACE = "GLOBAL_PAUSE_GRACE"                      # Days 1–4: Global SMS pause
+    STAGE_1_STANDARD = "RENT_REMINDER_STAGE_1"                    # Day 5: Standard reminder (grace period ends today)
+    STAGE_2_ESCALATION = "RENT_REMINDER_STAGE_2_ESCALATION"        # From Day 6 onward: Escalation reminder with 10-day notice
+    STAGE_STANDARD_ROLLING = "RENT_REMINDER_STAGE_2_ESCALATION"   # Backward compatibility: From Day 6 onward rolling escalation
+
 
 class BusinessRulesEngine:
     def __init__(
@@ -26,6 +69,96 @@ class BusinessRulesEngine:
         self.grace_period_days = grace_period_days or settings.GRACE_PERIOD_DAYS
         self.dedup_window_hours = dedup_window_hours or settings.DEDUPLICATION_WINDOW_HOURS
         self.promise_expiry_days = promise_expiry_days or settings.PROMISE_EXPIRY_DAYS
+
+    @staticmethod
+    def get_pm_datetime(current_time: Optional[datetime] = None) -> datetime:
+        return get_pm_datetime(current_time)
+
+    def get_reminder_stage(self, current_time: Optional[datetime] = None) -> str:
+        """
+        Determines the reminder stage based on the monthly schedule in the property management timezone:
+          - Days 1–4: GLOBAL_PAUSE_GRACE (Global SMS pause; no automated SMS sent; all data synced)
+          - Day 5: RENT_REMINDER_STAGE_1 (First-stage standard rent reminder)
+          - Day 6+: RENT_REMINDER_STAGE_2_ESCALATION (From Day 6 onward: Escalation reminder with 10-day notice)
+        """
+        pm_dt = get_pm_datetime(current_time)
+        day = pm_dt.day
+        if 1 <= day <= 4:
+            return ReminderStage.STAGE_PAUSE_GRACE.value
+        elif day == 5:
+            return ReminderStage.STAGE_1_STANDARD.value
+        else:
+            return ReminderStage.STAGE_2_ESCALATION.value
+
+    def check_escalation_eligibility(
+        self,
+        tenant: Tenant,
+        record: Optional[RentVineRecord],
+        current_time: Optional[datetime] = None,
+        raw_follow_up: Optional[str] = None
+    ) -> Tuple[bool, str]:
+        """
+        Strictly verifies all required conditions before generating or dispatching the Day 6 escalation message:
+          1. Latest RentVine balance is still outstanding (> $0.00).
+          2. Tenant has not already paid.
+          3. No active payment promise covering current date.
+          4. Tenant is not marked Manual Review or Dispute.
+          5. Balance is not below the $200 manual-review threshold (must be >= $200.00).
+          6. Applicable reminder cooldown has expired (at least 24h since previous dispatch).
+          7. Tenant received the first-stage reminder, and its dispatch was confirmed.
+          8. Tenant has not already received an escalation reminder this billing cycle.
+        If ANY condition is not satisfied, returns (False, reason).
+        """
+        if not record:
+            return False, "No RentVine record on file for tenant"
+
+        # 1 & 2: Balance outstanding and not paid
+        if record.balance <= 0.0:
+            return False, f"Rent balance is $0.00 — already paid in full"
+
+        is_paid, paid_msg = self.check_paid_status(record)
+        if is_paid:
+            return False, paid_msg
+
+        # 3: Low balance threshold ($0 < balance < $200 -> Manual Review)
+        is_low, low_reason = self.check_low_balance_threshold(record.balance)
+        if is_low:
+            return False, low_reason
+
+        # 4: Manual review / dispute check in exclusion list and follow-up notes
+        is_excl, excl_reason = self.check_exclusion_list(tenant)
+        if is_excl:
+            return False, f"Account flagged for manual review / dispute: {excl_reason}"
+
+        fu_text = raw_follow_up or record.follow_up_notes or ""
+        has_mr, mr_reason = self.check_manual_review_in_notes(record, raw_text=fu_text)
+        if has_mr:
+            return False, mr_reason
+
+        # 5: Active payment promise check
+        has_promise, pdate, preason = self.check_existing_promise_in_notes(
+            record, current_time=current_time, raw_follow_up=fu_text
+        )
+        if has_promise:
+            return False, f"Active payment promise on file until {pdate}"
+
+        # 6: Applicable reminder cooldown (24 hours)
+        is_cooldown, last_rem, cd_reason = self.check_recent_reminder_deduplication(tenant.id, current_time)
+        if is_cooldown:
+            return False, cd_reason
+
+        # 7 & 8: On Day 6 specifically, verify confirmed Stage 1 received and prevent duplicate on Day 6
+        pm_dt = get_pm_datetime(current_time)
+        if pm_dt.day == 6:
+            has_stage_1 = db.has_received_stage_1_reminder(tenant.id, pm_dt.year, pm_dt.month)
+            if not has_stage_1:
+                return False, f"Stage 1 reminder was not confirmed as dispatched for {pm_dt.strftime('%B %Y')} billing cycle"
+
+            has_escalated = db.has_received_escalation_reminder(tenant.id, pm_dt.year, pm_dt.month)
+            if has_escalated:
+                return False, f"Stage 2 escalation reminder already dispatched for {pm_dt.strftime('%B %Y')} billing cycle"
+
+        return True, "All escalation conditions satisfied"
 
     def check_paid_status(self, record: Optional[RentVineRecord]) -> Tuple[bool, str]:
         """
@@ -39,6 +172,23 @@ class BusinessRulesEngine:
             return True, f"Rent balance is $0.00 (Last payment: ${record.last_payment_amount:,.2f} on {record.last_payment_date})"
 
         return False, f"Outstanding balance: ${record.balance:,.2f}"
+
+    def check_low_balance_threshold(self, balance: float) -> Tuple[bool, Optional[str]]:
+        """
+        Rule: If total outstanding balance is > $0.00 but < $200.00, automatically flag for Manual Review / Disputes
+        rather than sending automated rent reminders.
+        """
+        try:
+            b_val = float(balance or 0.0)
+        except Exception:
+            b_val = 0.0
+
+        if 0.0 < b_val < 200.0:
+            return (
+                True,
+                f"Total outstanding balance (${b_val:,.2f}) is greater than $0 but less than $200 — automatically moved to Manual Review / Disputes for staff verification."
+            )
+        return False, None
 
     def check_exclusion_list(self, tenant: Tenant) -> Tuple[bool, Optional[str]]:
         """

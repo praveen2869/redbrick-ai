@@ -32,15 +32,17 @@ class AIIntentClassifier:
         reload_dotenv()
 
         # Keys
-        self.claude_key = (
-            api_key if (provider in ("claude", "anthropic") or (api_key and "sk-ant" in str(api_key)))
-            else (os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY") or settings.ANTHROPIC_API_KEY or "")
-        ).strip()
-        self.groq_key = (os.getenv("GROQ_API_KEY") or settings.GROQ_API_KEY or "").strip()
-        self.openai_key = (
-            api_key if (provider == "openai" or (api_key and "sk-" in str(api_key) and "sk-ant" not in str(api_key)))
-            else (os.getenv("OPENAI_API_KEY") or settings.OPENAI_API_KEY or "")
-        ).strip()
+        if api_key and (provider in ("claude", "anthropic") or "sk-ant" in str(api_key)):
+            self.claude_key = str(api_key).strip()
+        else:
+            self.claude_key = str(os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY") or settings.ANTHROPIC_API_KEY or "").strip()
+
+        self.groq_key = str(os.getenv("GROQ_API_KEY") or settings.GROQ_API_KEY or "").strip()
+
+        if api_key and (provider == "openai" or ("sk-" in str(api_key) and "sk-ant" not in str(api_key))):
+            self.openai_key = str(api_key).strip()
+        else:
+            self.openai_key = str(os.getenv("OPENAI_API_KEY") or settings.OPENAI_API_KEY or "").strip()
 
         # Provider resolution
         pref_provider = (provider or os.getenv("AI_PROVIDER") or settings.AI_PROVIDER or "").lower().strip()
@@ -59,7 +61,7 @@ class AIIntentClassifier:
 
         # Normalize model for provider (handles aliases like "sonnet 5.5", "claude-3-5-sonnet", etc.)
         default_model = (
-            "claude-3-5-sonnet-20241022" if self.provider == "claude"
+            "claude-sonnet-4-6" if self.provider == "claude"
             else ("llama-3.3-70b-versatile" if self.provider == "groq" else "gpt-4o-mini")
         )
         raw_model = model or os.getenv("AI_MODEL") or settings.AI_MODEL or default_model

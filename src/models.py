@@ -49,7 +49,7 @@ class RentVineRecord:
     last_payment_date: Optional[str] = None
     last_payment_amount: float = 0.0
     notes: List[RentVineNote] = field(default_factory=list)
-    portal_link: str = "https://redbrick.rentvine.com/portal/pay"
+    portal_link: str = "https://redbricksproperties.rentvine.com/portals/resident/make-payment"
     lease_status: str = "ACTIVE"
     follow_up_notes: Optional[str] = None
 

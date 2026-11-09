@@ -76,7 +76,11 @@ class TestWorkflow(unittest.TestCase):
             rentvine_client=rv_client,
             quo_client=QuoSMSClient(mock_mode=True)
         )
-        summary = orch.execute_daily_run(is_dry_run=True, use_report_source_of_truth=True)
+        summary = orch.execute_daily_run(
+            is_dry_run=True,
+            reference_time=datetime(2026, 11, 5, 10, 0, 0),
+            use_report_source_of_truth=True
+        )
 
         # Active tenants with overdue balance and no holds receive reminders
         eligible_records = [r for r in report["records"] if r.get("is_eligible")]
@@ -86,7 +90,9 @@ class TestWorkflow(unittest.TestCase):
         self.assertIn("Ke'Juana Ford", reminded_names)
         # Even small balance and current month tenants are included
         self.assertTrue(any("Frisco" in n for n in reminded_names))
-        self.assertIn("Yuliya Chernyshov", reminded_names)
+        # Tenants with balance between $0 and $200 (e.g. Yuliya Chernyshov $126.76) are automatically moved to Manual Review / Disputes
+        manual_review_names = [d.tenant_name for d in summary.decisions if d.outcome == DecisionOutcome.FLAG_MANUAL_REVIEW]
+        self.assertIn("Yuliya Chernyshov", manual_review_names)
 
     def test_quo_sender_number_routing(self):
         """Validates that Quo SMS integration routes to the exact sender phone number based on recipient type."""
@@ -144,14 +150,14 @@ class TestWorkflow(unittest.TestCase):
             property_name="8620 Fairgreen Avenue",
             unit_number="",
             due_date="2026-10-01",
-            portal_link="https://redbricksproperties.rentvine.com/portal/pay"
+            portal_link="https://redbricksproperties.rentvine.com/portals/resident/make-payment"
         )
 
         expected_kukunoor = (
             "Hi Kukunoor,\n\n"
             "Friendly reminder from Red Bricks Property Management:\n\n"
             "Your rent of $1,000.00 for 8620 Fairgreen Avenue was due on October 1. The grace period ends today, October 5. Please submit your payment by tonight to avoid late fees beginning tomorrow, October 6.\n\n"
-            "You can pay through your RentVine portal (https://redbricksproperties.rentvine.com/portal/pay). If you've already submitted your payment, please reply here so we can check its status.\n\n"
+            "You can pay through your RentVine portal (https://redbricksproperties.rentvine.com/portals/resident/make-payment). If you've already submitted your payment, please reply here so we can check its status.\n\n"
             "Thank you!\nRBPM bot"
         )
         self.assertEqual(sms_kukunoor, expected_kukunoor)
@@ -163,7 +169,7 @@ class TestWorkflow(unittest.TestCase):
             property_name="Brookdale Village_5601 Stafford Road",
             unit_number="Brookdale Village_5601 Stafford Road",
             due_date="2026-10-01",
-            portal_link="https://redbricksproperties.rentvine.com/portal/pay"
+            portal_link="https://redbricksproperties.rentvine.com/portals/resident/make-payment"
         )
         self.assertIn("Your rent of $2,209.00 for 5601 Stafford Road was due on October 1. The grace period ends today, October 5. Please submit your payment by tonight to avoid late fees beginning tomorrow, October 6.", sms_tao)
         self.assertNotIn("Brookdale Village_5601 Stafford Road Brookdale Village_5601 Stafford Road", sms_tao)
@@ -570,7 +576,7 @@ class TestWorkflow(unittest.TestCase):
             property_name="NONE_5100 @ Central_4124 Salient Street",
             unit_number="NONE_5100 @ Central_4124 Salient Street",
             due_date="November 1, 2026",
-            portal_link="https://redbricksproperties.rentvine.com/portal/pay"
+            portal_link="https://redbricksproperties.rentvine.com/portals/resident/make-payment"
         )
         self.assertIn("Your rent of $1,895.00 for 4124 Salient Street was due on November 1. The grace period ends today, November 5. Please submit your payment by tonight to avoid late fees beginning tomorrow, November 6.", sms_joshua)
         self.assertNotIn("NONE_5100 @ Central", sms_joshua)
@@ -620,7 +626,7 @@ class TestWorkflow(unittest.TestCase):
             property_name="5601 Stafford Road",
             unit_number="",
             due_date=details["due_date"],
-            portal_link="https://redbricksproperties.rentvine.com/portal/pay"
+            portal_link="https://redbricksproperties.rentvine.com/portals/resident/make-payment"
         )
         self.assertIn("Your rent of $4,200.00 for 5601 Stafford Road was due on October 9, 2026 (October 2026) and November 1, 2026 (November 2026).", sms)
 
@@ -643,13 +649,13 @@ class TestWorkflow(unittest.TestCase):
             due_date="November 1",
             grace_period_end_date="November 5",
             late_fee_start_date="November 6",
-            portal_link="https://redbricksproperties.rentvine.com/portal/pay"
+            portal_link="https://redbricksproperties.rentvine.com/portals/resident/make-payment"
         )
         expected = (
             "Hi Tamica,\n\n"
             "Friendly reminder from Red Bricks Property Management:\n\n"
             "Your rent of $2,795.00 for Winding Walk - 439 Sweet Shrub Court Northwest, Concord, NC 28027 was due on November 1. The grace period ends today, November 5. Please submit your payment by tonight to avoid late fees beginning tomorrow, November 6.\n\n"
-            "You can pay through your RentVine portal (https://redbricksproperties.rentvine.com/portal/pay). If you've already submitted your payment, please reply here so we can check its status.\n\n"
+            "You can pay through your RentVine portal (https://redbricksproperties.rentvine.com/portals/resident/make-payment). If you've already submitted your payment, please reply here so we can check its status.\n\n"
             "Thank you!\n"
             "RBPM bot"
         )
@@ -685,7 +691,7 @@ class TestWorkflow(unittest.TestCase):
             property_name="NONE_5100 @ Central_4124 Salient Street",
             unit_number="",
             due_date="November 1, 2026",
-            portal_link="https://redbricksproperties.rentvine.com/portal/pay"
+            portal_link="https://redbricksproperties.rentvine.com/portals/resident/make-payment"
         )
         self.assertTrue(sms_2.startswith("Hi Joshua and Tenant 2,"))
         self.assertIn("Your rent of $1,895.00 for 4124 Salient Street", sms_2)
@@ -700,7 +706,7 @@ class TestWorkflow(unittest.TestCase):
             property_name="4124 Salient Street",
             unit_number="",
             due_date="November 1",
-            portal_link="https://redbricksproperties.rentvine.com/portal/pay"
+            portal_link="https://redbricksproperties.rentvine.com/portals/resident/make-payment"
         )
         self.assertTrue(sms_3.startswith("Hi Joshua, Tenant 2, and Tenant 3,"))
         self.assertIn("Your rent of $1,895.00 for 4124 Salient Street", sms_3)
@@ -867,7 +873,7 @@ class TestWorkflow(unittest.TestCase):
             all_phones=[("Joshua", "+17045551200"), ("Tenant2", "+17045551201")]
         )
 
-        ref_time = datetime(2026, 11, 10, 10, 0)
+        ref_time = datetime(2026, 11, 5, 10, 0)
         decisions = self.orchestrator._process_lease_group(
             group=group,
             run_id="run_group_e2e",
@@ -971,7 +977,7 @@ class TestWorkflow(unittest.TestCase):
             all_phones=[("Marcus", "+17045551300"), ("Cotenent", "+17045551301")]
         )
 
-        ref_time = datetime(2026, 10, 20, 10, 0)
+        ref_time = datetime(2026, 10, 5, 10, 0)
         decisions = self.orchestrator._process_lease_group(
             group=group,
             run_id="run_mr_group",
@@ -1055,7 +1061,7 @@ class TestWorkflow(unittest.TestCase):
         self.assertIn("+19802941035", phone_numbers)
 
         # 4. Process lease group (dry run)
-        ref_time = datetime(2026, 10, 20, 10, 0)
+        ref_time = datetime(2026, 10, 5, 10, 0)
         decisions = self.orchestrator._process_lease_group(
             group=grp,
             run_id="run_kukunoor_group_test",

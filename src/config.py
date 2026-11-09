@@ -68,7 +68,7 @@ def _mock_mode(env_var: str, credential_var: str, default: str = "") -> bool:
     return True  # nothing set → simulation
 
 def normalize_ai_model(provider: str, model_name: Optional[str]) -> str:
-    """Normalizes model names and handles aliases like 'sonnet 5.5', 'claude-3-5-sonnet', etc."""
+    """Normalizes model names and handles available models for Claude, Groq, and OpenAI."""
     if not model_name:
         if provider in ("claude", "anthropic"):
             return "claude-3-5-sonnet-20241022"
@@ -78,12 +78,33 @@ def normalize_ai_model(provider: str, model_name: Optional[str]) -> str:
     
     cleaned = model_name.strip()
     low = cleaned.lower().replace("_", "-").replace(".", "-")
+
+    available_claude_models = [
+        "claude-sonnet-4-6",
+        "claude-sonnet-5",
+        "claude-haiku-5-5",
+        "claude-haiku-4-5-20251001",
+        "claude-opus-4-5-20251101",
+        "claude-opus-4-6",
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-opus-5",
+        "claude-opus-5-5",
+        "claude-fable-5",
+        "claude-fable-5-1"
+    ]
+
+    for avail in available_claude_models:
+        if low == avail:
+            return avail
+
     if provider in ("claude", "anthropic") or "sonnet" in low or "claude" in low:
         if "3-7" in low:
             return "claude-3-7-sonnet-20250219" if "2025" not in low else cleaned
         if "5-5" in low or "3-5" in low or "sonnet" in low:
             return "claude-3-5-sonnet-20241022" if "2024" not in low and "haiku" not in low and "opus" not in low else cleaned
         return cleaned
+
     return cleaned
 
 class ReminderTemplate(str):
@@ -95,7 +116,9 @@ class ReminderTemplate(str):
         # Accept tenant_names (group SMS) as alias for tenant_name
         if "tenant_names" in kwargs and "tenant_name" not in kwargs:
             kwargs["tenant_name"] = kwargs["tenant_names"]
-        prop = str(kwargs.get("property_name", "") or kwargs.get("property_unit", "")).strip()
+        if "tenant_name" in kwargs and "tenant_names" not in kwargs:
+            kwargs["tenant_names"] = kwargs["tenant_name"]
+        prop = str(kwargs.get("property_name", "") or kwargs.get("property_unit", "") or kwargs.get("property_address", "")).strip()
         unit = str(kwargs.get("unit_number", "")).strip()
 
         # Clean internal NONE_ or portfolio prefixes from property name if separated by _
@@ -172,8 +195,15 @@ class ReminderTemplate(str):
         kwargs["unit_number"] = unit_fmt
         kwargs["property_name"] = prop
         kwargs["property_unit"] = f"{prop}{unit_fmt}".strip()
+        kwargs["property_address"] = kwargs.get("property_address") or kwargs["property_unit"]
+
+        # Enforce the official resident payment link across all reminder templates
+        portal_val = kwargs.get("portal_link") or ""
+        if not portal_val or "portal/pay" in str(portal_val):
+            kwargs["portal_link"] = "https://redbricksproperties.rentvine.com/portals/resident/make-payment"
 
         res = super().format(*args, **kwargs)
+        res = re.sub(r'https://[^/\s]+/portal/pay', 'https://redbricksproperties.rentvine.com/portals/resident/make-payment', res)
         res = re.sub(r' for\s+', ' for ', res)
         res = re.sub(r'\s+was due on', ' was due on', res)
         return res
@@ -284,7 +314,7 @@ class Settings:
         AI_PROVIDER,
         os.getenv(
             "AI_MODEL",
-            "claude-3-5-sonnet-20241022" if AI_PROVIDER in ("claude", "anthropic")
+            "claude-sonnet-4-6" if AI_PROVIDER in ("claude", "anthropic")
             else ("llama-3.3-70b-versatile" if AI_PROVIDER == "groq" else "gpt-4o-mini")
         )
     )
@@ -299,6 +329,11 @@ class Settings:
         return k.strip() if k else None
 
     # ── Business Rules ────────────────────────────────────────────────────
+    PROPERTY_TIMEZONE: str = os.getenv("PROPERTY_TIMEZONE", "America/New_York")
+    RENTVINE_PORTAL_PAYMENT_URL: str = os.getenv(
+        "RENTVINE_PORTAL_PAYMENT_URL",
+        "https://redbricksproperties.rentvine.com/portals/resident/make-payment"
+    )
     GRACE_PERIOD_DAYS: int = int(os.getenv("GRACE_PERIOD_DAYS", "3"))
     DEDUPLICATION_WINDOW_HOURS: int = int(os.getenv("DEDUPLICATION_WINDOW_HOURS", "24"))
     PROMISE_EXPIRY_DAYS: int = int(os.getenv("PROMISE_EXPIRY_DAYS", "5"))
@@ -306,6 +341,7 @@ class Settings:
     RETRY_BACKOFF_SECONDS: int = int(os.getenv("RETRY_BACKOFF_SECONDS", "300"))
 
     # ── SMS Reminder Template ─────────────────────────────────────────────
+    # Stage 1: Standard rent reminder (Day 5 of month)
     REMINDER_TEMPLATE: ReminderTemplate = ReminderTemplate(
         "Hi {tenant_name},\n\n"
         "Friendly reminder from Red Bricks Property Management:\n\n"
@@ -315,7 +351,7 @@ class Settings:
         "RBPM bot"
     )
 
-    # Group SMS template used when a lease has multiple co-tenants.
+    # Group SMS template used when a lease has multiple co-tenants (Stage 1).
     # {tenant_names} receives a formatted list like "Joshua, Tenant 2, and Tenant 3"
     GROUP_REMINDER_TEMPLATE: ReminderTemplate = ReminderTemplate(
         "Hi {tenant_names},\n\n"
@@ -324,6 +360,31 @@ class Settings:
         "You can pay through your RentVine portal ({portal_link}). If you've already submitted your payment, please reply here so we can check its status.\n\n"
         "Thank you!\n"
         "RBPM BOT"
+    )
+
+    # Stage 2: Second-stage escalation reminder (Day 6 of month)
+    ESCALATION_REMINDER_TEMPLATE: ReminderTemplate = ReminderTemplate(
+        "Hi {tenant_name},\n\n"
+        "Friendly reminder from Red Bricks Property Management.\n\n"
+        "Your rent balance for {property_address} remains outstanding. Please reply today with a specific date when you can pay. We will review your proposed date and try to accommodate a reasonable payment timeline before taking further action. Any payment arrangement is subject to confirmation.\n\n"
+        "We will also be mailing a 10-day notice regarding the unpaid rent. The associated mailing fees will be added to your account along with applicable late fees.\n\n"
+        "You can pay through your RentVine portal at:\n"
+        "https://redbricksproperties.rentvine.com/portals/resident/make-payment\n\n"
+        "If you've already submitted payment, please reply so we can check its status.\n\n"
+        "Thank you!\n\n"
+        "RBPM Bot"
+    )
+
+    GROUP_ESCALATION_REMINDER_TEMPLATE: ReminderTemplate = ReminderTemplate(
+        "Hi {tenant_names},\n\n"
+        "Friendly reminder from Red Bricks Property Management.\n\n"
+        "Your rent balance for {property_address} remains outstanding. Please reply today with a specific date when you can pay. We will review your proposed date and try to accommodate a reasonable payment timeline before taking further action. Any payment arrangement is subject to confirmation.\n\n"
+        "We will also be mailing a 10-day notice regarding the unpaid rent. The associated mailing fees will be added to your account along with applicable late fees.\n\n"
+        "You can pay through your RentVine portal at:\n"
+        "https://redbricksproperties.rentvine.com/portals/resident/make-payment\n\n"
+        "If you've already submitted payment, please reply so we can check its status.\n\n"
+        "Thank you!\n\n"
+        "RBPM Bot"
     )
 
 settings = Settings()
