@@ -236,7 +236,7 @@ def run_pipeline_dispatch(
     if exclude_tenants:
         for item in str(exclude_tenants).split(","):
             cleaned = item.strip().lower()
-            if cleaned:
+            if cleaned and cleaned not in ("none", "null", "empty", "false", '""', "''"):
                 excluded_names.add(cleaned)
 
     # Load approved reminders
