@@ -560,19 +560,28 @@ function executeStage2() {{
 
   if (!confirm(confirmMsg)) return;
 
+  const approvedPayload = {{
+    approved_at: new Date().toISOString(),
+    total_approved: approvedList.length,
+    total_rejected: rejectedList.length,
+    approved_tenants: approvedList,
+    rejected_tenants: rejectedList,
+    exclude_filter_string: rejectedList.map(r => r.tenant_name).join(', ')
+  }};
+
   // Trigger dispatch API if server running
-  fetch('/api/pipeline-dispatch-approved', {
+  fetch('/api/pipeline-dispatch-approved', {{
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {{ 'Content-Type': 'application/json' }},
     body: JSON.stringify(approvedPayload)
-  })
+  }})
   .then(res => res.json())
-  .then(data => {
-    alert('🚀 Stage 2 Execution Triggered!\n\nDispatched ' + (data.successfully_sent || approvedList.length) + ' reminders via Quo API.');
-  })
-  .catch(err => {
+  .then(data => {{
+    alert('🚀 Stage 2 Execution Triggered!\\n\\nDispatched ' + (data.successfully_sent || approvedList.length) + ' reminders via Quo API.');
+  }})
+  .catch(err => {{
     alert('Stage 2 can be approved directly in Azure DevOps by clicking [Approve] on the pipeline run.');
-  });
+  }});
 }}
 
 function escapeHtml(text) {{
