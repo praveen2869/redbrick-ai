@@ -351,12 +351,12 @@
       <div class="content-header">
         <div>
           <h1 class="page-title">Tenant Decisions & AI Outcomes</h1>
-          <p class="page-subtitle">Real-time status of rent balances, due dates, AI outcomes, and 1-click reminder triggers.</p>
+          <p class="page-subtitle">Real-time status of rent balances, due dates, AI outcomes, and 1-click reminder triggers organized by property/lease.</p>
         </div>
         <div class="table-controls">
           <div class="search-box">
             <span class="search-icon">🔍</span>
-            <input type="text" id="tenant-search" placeholder="Search tenant, property, or unit...">
+            <input type="text" id="tenant-search" placeholder="Search tenant, property, unit, or lease #...">
           </div>
           <select id="filter-property" class="select-dropdown">
             <option value="ALL">All Properties (Live)</option>
@@ -366,7 +366,7 @@
 
       <!-- Filter Tabs -->
       <div class="filter-pills">
-        <button class="filter-pill active" data-filter="ALL" id="pill-filter-all">All Tenants</button>
+        <button class="filter-pill active" data-filter="ALL" id="pill-filter-all">All Active Leases</button>
         <button class="filter-pill" data-filter="SEND_REMINDER" id="pill-filter-reminded">📩 Reminders Needed</button>
         <button class="filter-pill" data-filter="HOLD_PROMISE" id="pill-filter-promised">🛡️ Promises on File</button>
         <button class="filter-pill" data-filter="SKIP_PAID" id="pill-filter-paid">✅ Paid / Cleared</button>
@@ -379,8 +379,8 @@
         <table class="data-table" id="tenants-table">
           <thead>
             <tr>
-              <th>Tenant & Contact</th>
-              <th>Property & Unit</th>
+              <th>Tenants & Contact</th>
+              <th>Property & Lease</th>
               <th>Rent Balance</th>
               <th>Due Date</th>
               <th>Latest Tenant Message</th>

@@ -86,7 +86,25 @@ class TenantDrawerController {
     
     const propEl = document.getElementById("drawer-property");
     if (propEl) {
-      propEl.textContent = `${t.property_name || "Property"} • ${t.unit_number || "Unit"}${t.phone ? ' • ' + t.phone : ''}`;
+      const leaseLabel = t.lease_id ? ` • Lease #${t.lease_id}` : '';
+      propEl.textContent = `${t.property_name || "Property"} • ${t.unit_number || "Unit"}${leaseLabel}`;
+    }
+
+    let coTenantsEl = document.getElementById("drawer-co-tenants-banner");
+    if (!coTenantsEl && propEl && propEl.parentNode) {
+      coTenantsEl = document.createElement("div");
+      coTenantsEl.id = "drawer-co-tenants-banner";
+      coTenantsEl.style.cssText = "margin-top:6px;padding:6px 10px;background:#1e293b;border-radius:6px;font-size:12px;border:1px solid #334155;";
+      propEl.parentNode.appendChild(coTenantsEl);
+    }
+    if (coTenantsEl) {
+      if (t.all_tenants && t.all_tenants.length > 1) {
+        coTenantsEl.style.display = "block";
+        coTenantsEl.innerHTML = `<span style="color:#38bdf8;font-weight:700;">Lease Group:</span> ` +
+          t.all_tenants.map(m => `<span style="display:inline-block;margin-right:12px;"><strong style="color:#f1f5f9;">${m.full_name}</strong> <span style="color:#38bdf8;">(${m.phone || 'No phone'})</span></span>`).join('');
+      } else {
+        coTenantsEl.style.display = "none";
+      }
     }
 
     // 1. RentVine Financials (Checking both potential DOM IDs)

@@ -462,10 +462,12 @@ class AppController {
       }
       // 3. Search Query
       if (this.searchQuery) {
-        const matchName = t.full_name.toLowerCase().includes(this.searchQuery);
-        const matchUnit = `${t.property_name} ${t.unit_number}`.toLowerCase().includes(this.searchQuery);
-        const matchPhone = t.phone.toLowerCase().includes(this.searchQuery);
-        if (!matchName && !matchUnit && !matchPhone) return false;
+        const q = this.searchQuery.toLowerCase();
+        const matchName = (t.full_name || "").toLowerCase().includes(q);
+        const matchUnit = `${t.property_name || ''} ${t.unit_number || ''}`.toLowerCase().includes(q);
+        const matchPhone = (t.phone || "").toLowerCase().includes(q);
+        const matchLease = (t.lease_id || "").toString().toLowerCase().includes(q) || `lease ${t.lease_id || ''}`.includes(q);
+        if (!matchName && !matchUnit && !matchPhone && !matchLease) return false;
       }
       return true;
     });
@@ -492,7 +494,7 @@ class AppController {
       if (totalFiltered === 0) {
         infoElem.textContent = "Showing 0 tenants";
       } else {
-        infoElem.textContent = `Showing ${startIndex + 1}–${endIndex} of ${totalFiltered} active units (Page ${this.tenantPage} of ${totalPages})`;
+        infoElem.textContent = `Showing ${startIndex + 1}–${endIndex} of ${totalFiltered} active properties (Page ${this.tenantPage} of ${totalPages})`;
       }
     }
     if (curElem) curElem.textContent = this.tenantPage;
@@ -522,17 +524,40 @@ class AppController {
         </div>
       ` : `<span class="text-muted" style="font-size:11px;">No messages</span>`;
 
-      tr.innerHTML = `
-        <td>
+      // Multi-tenant vs single tenant contact rendering
+      let tenantContactHtml = '';
+      if (t.is_multi_tenant && t.tenants && t.tenants.length > 1) {
+        tenantContactHtml = `
+          <div class="tenant-cell-name" style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+            <span style="font-weight:700;">${t.full_name}</span>
+            <span class="badge" style="font-size:9.5px;background:#38bdf822;color:#38bdf8;border:1px solid #38bdf844;padding:2px 6px;border-radius:4px;font-weight:700;">GROUP SMS (${t.tenants.length})</span>
+          </div>
+          <div class="tenant-cell-contact" style="margin-top:4px;line-height:1.45;">
+            ${t.tenants.map(m => `
+              <div style="font-size:11px;">
+                <span style="color:#cbd5e1;font-weight:600;">${m.first_name || m.full_name}:</span> 
+                <span style="color:#38bdf8;">${m.phone || 'No phone'}</span>
+                ${m.email ? `<span style="color:#64748b;margin-left:4px;">• ${m.email}</span>` : ''}
+              </div>
+            `).join('')}
+          </div>
+        `;
+      } else {
+        tenantContactHtml = `
           <div class="tenant-cell-name">
             <span>${t.full_name}</span>
             ${t.is_excluded ? '<span style="font-size:9px;background:#e11d4822;color:#fb7185;padding:2px 5px;border-radius:4px;border:1px solid #e11d4844;">EXCLUDED</span>' : ''}
           </div>
-          <div class="tenant-cell-contact">${t.phone} • ${t.email}</div>
-        </td>
+          <div class="tenant-cell-contact">${t.phone || 'No phone'} • ${t.email || 'No email'}</div>
+        `;
+      }
+
+      tr.innerHTML = `
+        <td>${tenantContactHtml}</td>
         <td>
           <div style="font-weight:600;color:#f8fafc;">${t.property_name}</div>
-          <div style="font-size:11.5px;color:var(--cyan-primary);">${t.unit_number}</div>
+          <div style="font-size:11.5px;color:var(--cyan-primary);">${t.unit_number || 'Unit ' + (t.lease_id || '')}</div>
+          ${t.lease_id ? `<div style="font-size:10px;color:#64748b;font-family:monospace;margin-top:2px;">Lease #${t.lease_id}</div>` : ''}
         </td>
         <td>
           <div class="balance-cell" style="${balColor}">$${t.balance.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</div>
@@ -543,7 +568,7 @@ class AppController {
         <td>${badge}</td>
         <td style="max-width:240px;font-size:12px;color:#cbd5e1;line-height:1.35;">${reason}</td>
         <td>
-          <button class="btn btn-secondary btn-sm btn-inspect" data-tenant-id="${t.id}" title="Inspect full profile, RentVine notes & SMS">
+          <button class="btn btn-secondary btn-sm btn-inspect" data-tenant-id="${t.id}" data-lease-id="${t.lease_id || ''}" title="Inspect property, all tenants, RentVine notes & SMS">
             Inspect
           </button>
         </td>

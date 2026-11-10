@@ -198,7 +198,11 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
         self._send_json(data)
 
     def _handle_get_tenants(self, query: Optional[Dict[str, list]] = None):
-        """Returns tenants joined with their current RentVine balance, lease status, and latest decision."""
+        """
+        Returns records organized by unique RentVine property/lease (One Property/Lease = One Row).
+        Combines all co-tenants living at the property, consolidates financial balances and due dates,
+        tracks all SMS communications, and reflects the property's collective AI outcome and reminder status.
+        """
         active_only = False
         if query and query.get("active_only", ["false"])[0].lower() in ("true", "1"):
             active_only = True
@@ -215,7 +219,7 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                     FROM tenants t
                     JOIN rentvine_records r ON t.id = r.tenant_id
                     WHERE r.lease_status = 'ACTIVE'
-                    ORDER BY t.property_name, t.unit_number
+                    ORDER BY t.property_name, t.unit_number, t.id
                 """)
             else:
                 cursor.execute("""
@@ -226,9 +230,13 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                         r.last_payment_amount, r.portal_link, r.lease_status, r.follow_up_notes
                     FROM tenants t
                     LEFT JOIN rentvine_records r ON t.id = r.tenant_id
-                    ORDER BY t.property_name, t.unit_number
+                    ORDER BY t.property_name, t.unit_number, t.id
                 """)
             tenant_rows = cursor.fetchall()
+
+            # Batch retrieve all communication messages for fast SMS tracking
+            cursor.execute("SELECT * FROM communication_messages ORDER BY timestamp DESC")
+            all_raw_messages = cursor.fetchall()
 
         decisions = db.get_latest_decisions(limit=2000)
         latest_decision_by_tenant = {}
@@ -240,149 +248,299 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                     "timestamp": d.timestamp,
                     "sms_sent": d.sms_sent,
                     "note_written": d.note_written
-                }        # Build lease balances and notes mapping so co-tenants accurately inherit lease state
-        lease_balances = {}
-        lease_notes = {}
-        for r in tenant_rows:
-            lid = r["lease_id"] if "lease_id" in r.keys() else None
-            bal = float(r["balance"] or 0.0)
-            notes = r["follow_up_notes"] or ""
-            if lid:
-                lease_balances[lid] = max(lease_balances.get(lid, 0.0), bal)
-                if notes:
-                    lease_notes[lid] = notes
+                }
+
+        messages_by_tenant: Dict[str, list] = {}
+        messages_by_phone: Dict[str, list] = {}
+        for m in all_raw_messages:
+            tid = m["tenant_id"]
+            if tid:
+                messages_by_tenant.setdefault(tid, []).append(m)
+            sender = m["sender"] or ""
+            clean_p = "".join(c for c in sender if c.isdigit())[-10:]
+            if clean_p:
+                messages_by_phone.setdefault(clean_p, []).append(m)
 
         now = datetime.utcnow()
         current_month_first = now.strftime("%Y-%m-01")
-        results = []
+
+        # Group records using the unique RentVine lease ID (or fallback to solo tenant ID)
+        grouped_leases: Dict[str, list] = {}
         for r in tenant_rows:
-            tid = r["id"]
-            lid = r["lease_id"] if "lease_id" in r.keys() else None
-            bal = float(r["balance"] or 0.0)
-            eff_bal = bal if bal > 0 else (lease_balances.get(lid, 0.0) if lid else bal)
-            notes = (r["follow_up_notes"] or (lease_notes.get(lid, "") if lid else "")) or ""
-            raw_due = r["due_date"]
-            if eff_bal <= 0.0 and raw_due and raw_due < current_month_first:
+            lid = str(r["lease_id"]).strip() if r["lease_id"] else f"__solo_{r['id']}"
+            grouped_leases.setdefault(lid, []).append(r)
+
+        results = []
+        for lid, group_rows in grouped_leases.items():
+            # Sort group rows so primary tenant (non-_co, or holding balance) leads
+            def _primary_sort_key(r):
+                tid = str(r["id"])
+                bal = float(r["balance"] or 0.0)
+                return (not "_co" in tid, bal > 0)
+            group_rows.sort(key=_primary_sort_key, reverse=True)
+            primary_row = group_rows[0]
+
+            # Combine all tenants on this lease (deduplicated by phone / name)
+            tenants_list = []
+            seen_tenants = set()
+            for r in group_rows:
+                clean_p = "".join(c for c in (r["phone"] or "") if c.isdigit())[-10:]
+                t_key = clean_p if clean_p else f"{r['first_name']} {r['last_name']}".strip().lower()
+                if t_key in seen_tenants:
+                    continue
+                seen_tenants.add(t_key)
+                tenants_list.append({
+                    "id": r["id"],
+                    "first_name": (r["first_name"] or "").strip(),
+                    "last_name": (r["last_name"] or "").strip(),
+                    "full_name": f"{(r['first_name'] or '').strip()} {(r['last_name'] or '').strip()}".strip(),
+                    "phone": (r["phone"] or "").strip(),
+                    "email": (r["email"] or "").strip(),
+                    "is_primary": (len(tenants_list) == 0)
+                })
+
+            all_names = [t["full_name"] for t in tenants_list if t["full_name"]]
+            all_phones = [t["phone"] for t in tenants_list if t["phone"]]
+            all_emails = [t["email"] for t in tenants_list if t["email"]]
+            tenant_ids = [t["id"] for t in tenants_list]
+            primary_tenant_id = primary_row["id"]
+            clean_lease_id = lid if not lid.startswith("__solo_") else None
+
+            # Consolidate financial data: display property's total balance & rent only once
+            lease_bal = max(float(r["balance"] or 0.0) for r in group_rows)
+            lease_rent = max(float(r["monthly_rent"] or 0.0) for r in group_rows)
+            raw_due = next((r["due_date"] for r in group_rows if r["due_date"]), None)
+            if lease_bal <= 0.0 and raw_due and raw_due < current_month_first:
                 effective_due = current_month_first
             else:
                 effective_due = raw_due or current_month_first
 
-            is_cool, last_rem, h_elapsed, h_rem, exp_at = db.get_cooldown_status(tid, current_time=now, cooldown_hours=24.0)
+            last_payment_date = next((r["last_payment_date"] for r in group_rows if r["last_payment_date"]), None)
+            last_payment_amount = max(float(r["last_payment_amount"] or 0.0) for r in group_rows)
+            portal_link = next((r["portal_link"] for r in group_rows if r["portal_link"]), settings.RENTVINE_PORTAL_PAYMENT_URL)
+            lease_status = next((r["lease_status"] for r in group_rows if r["lease_status"]), "ACTIVE")
+            
+            # Combine follow-up notes across all lease rows
+            all_notes_set = set(r["follow_up_notes"] for r in group_rows if r["follow_up_notes"])
+            combined_notes = " | ".join(filter(None, all_notes_set))
 
-            # Strict 5-state dynamic classification
-            if eff_bal <= 0.0:
+            # Cooldown check across all tenant IDs on this lease
+            is_cool, cool_last_rem, cool_h_elapsed, cool_h_rem, cool_exp_at = False, None, 0.0, 0.0, None
+            if lease_bal > 0:
+                for tid in tenant_ids:
+                    c_ok, c_rem, c_el, c_rm, c_exp = db.get_cooldown_status(tid, current_time=now, cooldown_hours=24.0)
+                    if c_ok:
+                        is_cool, cool_last_rem, cool_h_elapsed, cool_h_rem, cool_exp_at = c_ok, c_rem, c_el, c_rm, c_exp
+                        break
+
+            # Payment promise check across all tenant IDs on this lease
+            promise_dec = next((latest_decision_by_tenant[tid] for tid in tenant_ids if latest_decision_by_tenant.get(tid) and latest_decision_by_tenant[tid].get("outcome") == "HOLD_PROMISE"), None)
+            mr_dec = next((latest_decision_by_tenant[tid] for tid in tenant_ids if latest_decision_by_tenant.get(tid) and latest_decision_by_tenant[tid].get("outcome") == "FLAG_MANUAL_REVIEW"), None)
+            has_mr_note = any(k in combined_notes.lower() for k in ["manual review", "dispute", "attorney", "eviction"])
+
+            # Property-level combined AI status & outcome
+            if lease_bal <= 0.0:
                 t_dec = {
                     "outcome": "SKIP_PAID",
-                    "reason": "Tenant balance $0.00 — rent paid/cleared",
+                    "reason": "Property balance $0.00 — rent paid/cleared",
                     "timestamp": now.isoformat(),
                     "sms_sent": False,
                     "note_written": False
                 }
-            elif 0.0 < eff_bal < 200.0:
+            elif 0.0 < lease_bal < 200.0:
                 t_dec = {
                     "outcome": "FLAG_MANUAL_REVIEW",
-                    "reason": f"Total outstanding balance (${eff_bal:,.2f}) is greater than $0 but less than $200 — moved to Manual Review / Disputes for staff verification.",
+                    "reason": f"Total outstanding balance (${lease_bal:,.2f}) is greater than $0 but less than $200 — moved to Manual Review / Disputes for staff verification.",
                     "timestamp": now.isoformat(),
                     "sms_sent": False,
                     "note_written": False
                 }
-            elif is_cool and last_rem:
-                disp_exp = exp_at.strftime('%Y-%m-%d %I:%M %p') if exp_at else "in 24h"
+            elif is_cool and cool_last_rem:
+                disp_exp = cool_exp_at.strftime('%Y-%m-%d %I:%M %p') if cool_exp_at else "in 24h"
                 t_dec = {
                     "outcome": "SKIP_ALREADY_REMINDED",
-                    "reason": f"Workflow rent reminder sent {h_elapsed:.1f}h ago. Cooldown active for {h_rem:.1f}h remaining (expires {disp_exp}).",
-                    "timestamp": last_rem.timestamp,
+                    "reason": f"Workflow rent reminder sent {cool_h_elapsed:.1f}h ago. Cooldown active for {cool_h_rem:.1f}h remaining (expires {disp_exp}).",
+                    "timestamp": cool_last_rem.timestamp,
                     "sms_sent": True,
                     "note_written": False
                 }
-            elif any(k in notes.lower() for k in ["manual review", "dispute", "attorney", "eviction"]):
+            elif has_mr_note or mr_dec:
+                mr_reason = f"Flagged for manual review: {combined_notes}" if has_mr_note else (mr_dec.get("reason", "Flagged for manual review") if mr_dec else "Flagged for manual review")
                 t_dec = {
                     "outcome": "FLAG_MANUAL_REVIEW",
-                    "reason": f"Flagged for manual review: {notes}",
+                    "reason": mr_reason,
                     "timestamp": now.isoformat(),
                     "sms_sent": False,
                     "note_written": False
                 }
-            elif latest_decision_by_tenant.get(tid) and latest_decision_by_tenant[tid].get("outcome") == "HOLD_PROMISE":
+            elif promise_dec:
                 t_dec = {
                     "outcome": "HOLD_PROMISE",
-                    "reason": latest_decision_by_tenant[tid].get("reason", "Payment promise on file"),
-                    "timestamp": latest_decision_by_tenant[tid].get("timestamp", now.isoformat()),
+                    "reason": promise_dec.get("reason", "Payment promise on file"),
+                    "timestamp": promise_dec.get("timestamp", now.isoformat()),
                     "sms_sent": False,
                     "note_written": False
                 }
             else:
                 t_dec = {
                     "outcome": "SEND_REMINDER",
-                    "reason": f"Unpaid balance ${eff_bal:,.2f} past grace period — reminder needed",
+                    "reason": f"Unpaid balance ${lease_bal:,.2f} past grace period — reminder needed",
                     "timestamp": now.isoformat(),
                     "sms_sent": False,
                     "note_written": False
                 }
 
+            # Collect SMS messages across all tenants & phone numbers on this lease
+            lease_msgs = []
+            seen_mids = set()
+            for tid in tenant_ids:
+                for m in messages_by_tenant.get(tid, []):
+                    if m["id"] not in seen_mids:
+                        seen_mids.add(m["id"])
+                        lease_msgs.append(m)
+            for p in all_phones:
+                clean_p = "".join(c for c in p if c.isdigit())[-10:]
+                if clean_p:
+                    for m in messages_by_phone.get(clean_p, []):
+                        if m["id"] not in seen_mids:
+                            seen_mids.add(m["id"])
+                            lease_msgs.append(m)
+
+            latest_msg = None
+            if lease_msgs:
+                m = lease_msgs[0]
+                sender_name = next((t["first_name"] for t in tenants_list if t["phone"] and m["sender"] and t["phone"] in m["sender"]), None)
+                latest_msg = {
+                    "id": m["id"],
+                    "channel": m["channel"],
+                    "direction": m["direction"],
+                    "sender": m["sender"],
+                    "sender_name": sender_name,
+                    "content": m["content"],
+                    "timestamp": m["timestamp"]
+                }
+
             results.append({
-                "id": tid,
-                "lease_id": lid,
-                "first_name": r["first_name"],
-                "last_name": r["last_name"],
-                "full_name": f"{r['first_name']} {r['last_name']}".strip(),
-                "phone": r["phone"],
-                "email": r["email"],
-                "property_name": r["property_name"],
-                "unit_number": r["unit_number"],
-                "is_excluded": bool(r["is_excluded"]),
-                "exclusion_reason": r["exclusion_reason"],
-                "balance": eff_bal,
-                "monthly_rent": float(r["monthly_rent"] or 0.0),
+                "id": primary_tenant_id,
+                "lease_id": clean_lease_id,
+                "property_id": clean_lease_id,
+                "first_name": tenants_list[0]["first_name"],
+                "last_name": tenants_list[0]["last_name"],
+                "full_name": ", ".join(all_names),
+                "all_names": all_names,
+                "phone": ", ".join(filter(None, all_phones)),
+                "all_phones": all_phones,
+                "email": ", ".join(filter(None, all_emails)),
+                "all_emails": all_emails,
+                "property_name": primary_row["property_name"],
+                "unit_number": primary_row["unit_number"],
+                "is_excluded": any(bool(r["is_excluded"]) for r in group_rows),
+                "exclusion_reason": next((r["exclusion_reason"] for r in group_rows if r["exclusion_reason"]), None),
+                "balance": lease_bal,
+                "monthly_rent": lease_rent,
                 "due_date": effective_due,
-                "last_payment_date": r["last_payment_date"],
-                "last_payment_amount": float(r["last_payment_amount"] or 0.0),
-                "lease_status": r["lease_status"] or "ACTIVE",
-                "follow_up_notes": notes,
+                "last_payment_date": last_payment_date,
+                "last_payment_amount": last_payment_amount,
+                "portal_link": portal_link,
+                "lease_status": lease_status,
+                "follow_up_notes": combined_notes,
+                "is_multi_tenant": len(tenants_list) > 1,
+                "co_tenant_count": len(tenants_list) - 1,
+                "tenants": tenants_list,
+                "tenant_ids": tenant_ids,
                 "latest_decision": t_dec,
-                "latest_message": None,
-                "message_count": 0,
-                "notes_count": 0
+                "latest_message": latest_msg,
+                "message_count": len(lease_msgs),
+                "notes_count": len(all_notes_set)
             })
 
         self._send_json({"tenants": results, "total": len(results)})
 
     def _handle_get_tenant_detail(self, tenant_id: str):
-        """Returns full tenant dossier: RentVine record, notes, Quo SMS messages, Gmail emails, and audit log."""
+        """Returns full property/tenant dossier: RentVine record, notes, Quo SMS messages, Gmail emails, and audit log."""
         tenants = db.get_all_tenants()
         matched = [t for t in tenants if t.id == tenant_id]
         if not matched:
-            return self._send_json({"error": "Tenant not found"}, 404)
+            matched = [t for t in tenants if t.lease_id and str(t.lease_id) == str(tenant_id)]
+        if not matched:
+            return self._send_json({"error": "Tenant or Lease not found"}, 404)
 
         t = matched[0]
-        rv = db.get_rentvine_record(tenant_id)
-        messages = db.get_messages_for_tenant(tenant_id)
-        notes = db.get_rentvine_notes(tenant_id)
+        # Find all co-tenants on the same lease
+        lease_tenants = [ot for ot in tenants if ot.lease_id and ot.lease_id == t.lease_id] if t.lease_id else [t]
+        if not lease_tenants:
+            lease_tenants = [t]
 
-        # Get all prior decisions specifically for this tenant
-        tenant_decisions = [
-            {
-                "run_id": d.run_id,
-                "outcome": d.outcome.value,
-                "reason": d.reason,
-                "timestamp": d.timestamp,
-                "sms_sent": d.sms_sent,
-                "note_written": d.note_written,
-                "details": d.details
-            }
-            for d in db.get_decisions_for_tenant(tenant_id, limit=50)
-        ]
+        rv = db.get_rentvine_record(t.id)
+        if not rv and t.lease_id:
+            for lt in lease_tenants:
+                rv = db.get_rentvine_record(lt.id)
+                if rv and rv.balance > 0:
+                    break
+
+        # Consolidate messages across all lease tenants
+        all_messages = []
+        seen_mids = set()
+        for lt in lease_tenants:
+            for m in db.get_messages_for_tenant(lt.id):
+                if m.id not in seen_mids:
+                    seen_mids.add(m.id)
+                    all_messages.append(m)
+        all_messages.sort(key=lambda m: getattr(m, 'timestamp', ''), reverse=True)
+
+        # Consolidate notes across all lease tenants
+        all_notes = []
+        seen_nids = set()
+        for lt in lease_tenants:
+            for n in db.get_rentvine_notes(lt.id):
+                if n.id not in seen_nids:
+                    seen_nids.add(n.id)
+                    all_notes.append(n)
+        all_notes.sort(key=lambda n: getattr(n, 'created_at', ''), reverse=True)
+
+        # Consolidate decisions across all lease tenants
+        all_decisions = []
+        seen_dids = set()
+        for lt in lease_tenants:
+            for d in db.get_decisions_for_tenant(lt.id, limit=50):
+                d_key = f"{d.run_id}_{d.outcome.value}"
+                if d_key not in seen_dids:
+                    seen_dids.add(d_key)
+                    all_decisions.append({
+                        "run_id": d.run_id,
+                        "outcome": d.outcome.value,
+                        "reason": d.reason,
+                        "timestamp": d.timestamp,
+                        "sms_sent": d.sms_sent,
+                        "note_written": d.note_written,
+                        "details": d.details
+                    })
 
         data = {
             "tenant": {
                 "id": t.id,
-                "full_name": t.full_name,
-                "phone": t.phone,
-                "email": t.email,
+                "lease_id": t.lease_id,
+                "full_name": ", ".join(lt.full_name for lt in lease_tenants),
+                "primary_name": t.full_name,
+                "phone": ", ".join(filter(None, [lt.phone for lt in lease_tenants])),
+                "email": ", ".join(filter(None, [lt.email for lt in lease_tenants])),
                 "property_name": t.property_name,
                 "unit_number": t.unit_number,
-                "is_excluded": t.is_excluded,
-                "exclusion_reason": t.exclusion_reason
+                "is_excluded": any(lt.is_excluded for lt in lease_tenants),
+                "exclusion_reason": next((lt.exclusion_reason for lt in lease_tenants if lt.exclusion_reason), None),
+                "is_multi_tenant": len(lease_tenants) > 1,
+                "all_tenants": [
+                    {
+                        "id": lt.id,
+                        "full_name": lt.full_name,
+                        "first_name": lt.first_name,
+                        "last_name": lt.last_name,
+                        "phone": lt.phone,
+                        "email": lt.email,
+                        "is_primary": (lt.id == t.id)
+                    }
+                    for lt in lease_tenants
+                ]
             },
             "rentvine": {
                 "balance": rv.balance if rv else 0.0,
@@ -399,14 +557,14 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                         "text": n.text,
                         "is_automated": n.is_automated
                     }
-                    for n in notes
+                    for n in all_notes
                 ]
             },
             "communications": [
                 {
                     "id": m.id,
-                    "channel": m.channel.value,
-                    "direction": m.direction.value,
+                    "channel": m.channel.value if hasattr(m.channel, 'value') else str(m.channel),
+                    "direction": m.direction.value if hasattr(m.direction, 'value') else str(m.direction),
                     "sender": m.sender,
                     "recipient": m.recipient,
                     "content": m.content,
@@ -414,9 +572,9 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                     "status": m.status,
                     "metadata": m.metadata
                 }
-                for m in messages
+                for m in all_messages
             ],
-            "decisions": tenant_decisions
+            "decisions": all_decisions
         }
         self._send_json(data)
 
