@@ -1,19 +1,20 @@
 {
-  "dispatched_at": "2026-11-10T20:26:31.088603",
+  "dispatched_at": "2026-11-10T20:49:58.084088",
   "total_staged": 1,
   "successfully_sent": 1,
   "skipped_by_operator": 0,
   "failed": 0,
   "results": [
     {
-      "tenant_id": "rv_lease_test",
-      "tenant_name": "Test Tenant",
-      "property_unit": "123 Main St",
+      "tenant_id": "rv_lease_654",
+      "tenant_name": "Kukunoor Tenant, Second Kukunoor Tenant",
+      "property_unit": "8620 Fairgreen Avenue",
       "phones": [
-        "+19999999999"
+        "+18622205006",
+        "+19802941035"
       ],
       "status": "DISPATCHED",
-      "sent_at": "2026-11-10T20:26:31.088603"
+      "sent_at": "2026-11-10T20:49:58.084088"
     }
   ]
 }

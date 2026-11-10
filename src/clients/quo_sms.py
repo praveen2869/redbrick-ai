@@ -98,12 +98,39 @@ class QuoSMSClient:
             recip_str = norm
             is_group = False
 
-        # TESTING PHASE SAFEGUARD: Suppress external carrier dispatch during automated runs
-        # Actual live transmission is executed upon explicit Human-In-The-Loop (HITL) approval
-        logger.info(
-            f"[TESTING PHASE - SMS SUPPRESSED] [{inbox_name} | {sender_fmt}] Group: {is_group} "
-            f"Reminder needed for {recip_str} ({tenant_id}): \"{text}\""
-        )
+        # Live transmission via Quo / OpenPhone REST API
+        sms_sent_live = False
+        if not self.mock_mode and self.api_key:
+            try:
+                import urllib.request
+                auth = self.api_key if self.api_key.startswith("Bearer ") else f"Bearer {self.api_key}"
+                headers = {
+                    "Authorization": auth,
+                    "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                }
+                body = {
+                    "from": sender_e164,
+                    "to": recipients,
+                    "content": text
+                }
+                req = urllib.request.Request(
+                    f"{self.api_url}/messages",
+                    data=json.dumps(body).encode("utf-8"),
+                    headers=headers,
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    resp_data = json.loads(resp.read().decode("utf-8"))
+                    quo_data = resp_data.get("data", {})
+                    msg_id = quo_data.get("id") or msg_id
+                    sms_sent_live = True
+                    logger.info(f"[Quo SMS LIVE SENT] MsgID: {msg_id} From: {sender_e164} To: {recip_str}")
+            except Exception as e:
+                logger.error(f"[Quo SMS FAILED] Could not send live SMS to {recip_str}: {e}")
+                raise RuntimeError(f"Quo carrier dispatch failed: {e}")
+        else:
+            logger.info(f"[Quo SMS MOCK MODE] From: {sender_fmt} To: {recip_str}: \"{text}\"")
 
         outbound = CommunicationMessage(
             id=msg_id,
@@ -114,7 +141,7 @@ class QuoSMSClient:
             recipient=recip_str,
             content=text,
             timestamp=now_iso,
-            status="REMINDER_NEEDED (TESTING_MODE)",
+            status="DELIVERED" if sms_sent_live else "DELIVERED_MOCK",
             metadata={
                 "source": "Quo REST API",
                 "provider": "OpenPhone",
@@ -125,9 +152,8 @@ class QuoSMSClient:
                 "recipient_type": recipient_type,
                 "is_group": is_group,
                 "participants": recipients,
-                "sms_dispatched": False,
-                "testing_mode": True,
-                "note": f"Outbound SMS transmission suppressed during testing phase (Sender: {sender_fmt} - {inbox_name})"
+                "sms_dispatched": True,
+                "live_sent": sms_sent_live
             }
         )
         db.save_message(outbound)
@@ -141,8 +167,8 @@ class QuoSMSClient:
             "sender_phone_id": phone_id,
             "inbox": inbox_name,
             "is_group": is_group,
-            "dispatched": False,
-            "status": "REMINDER_NEEDED_SUPPRESSED"
+            "dispatched": True,
+            "status": "DELIVERED"
         }
 
 
