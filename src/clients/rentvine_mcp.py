@@ -114,9 +114,20 @@ class RentVineMCPClient:
         self.mcp_endpoint = endpoint or settings.RENTVINE_MCP_ENDPOINT
         self.mock_mode = settings.RENTVINE_MOCK_MODE if mock_mode is None else mock_mode
         self._request_id = 0
-        self._bearer_token: str = settings.RENTVINE_BEARER_TOKEN or ""
-        self._api_key: str = api_key or settings.RENTVINE_API_KEY
-        self._api_secret: str = settings.RENTVINE_API_SECRET or ""
+        raw_bearer = str(settings.RENTVINE_BEARER_TOKEN or "").strip()
+        if raw_bearer.startswith("$(") or raw_bearer.startswith("${") or len(raw_bearer) < 15:
+            raw_bearer = ""
+        self._bearer_token: str = raw_bearer
+
+        raw_key = str(api_key or settings.RENTVINE_API_KEY or "").strip()
+        if raw_key.startswith("$(") or raw_key.startswith("${"):
+            raw_key = ""
+        self._api_key: str = raw_key
+
+        raw_secret = str(settings.RENTVINE_API_SECRET or "").strip()
+        if raw_secret.startswith("$(") or raw_secret.startswith("${"):
+            raw_secret = ""
+        self._api_secret: str = raw_secret
         self._api_base: str = (settings.RENTVINE_API_BASE_URL or "").rstrip("/")
 
     # ─── Auth Helpers ────────────────────────────────────────────────────────
@@ -132,9 +143,9 @@ class RentVineMCPClient:
 
     def _auth_headers(self) -> Dict[str, str]:
         """Returns the best available auth header."""
-        if self._bearer_token:
+        if self._bearer_token and not self._bearer_token.startswith("$") and len(self._bearer_token) > 15:
             return self._bearer_header()
-        if self._api_secret:
+        if self._api_secret and not self._api_secret.startswith("$"):
             return self._basic_auth_header()
         return {}
 
