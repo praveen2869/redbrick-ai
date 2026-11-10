@@ -96,5 +96,54 @@ class TestAIIntentClassifier(unittest.TestCase):
             self.assertEqual(result.extracted_amount, 1500.0)
             self.assertIn("Claude Sonnet", result.reasoning)
 
+    def test_payment_unspecified_classification(self):
+        # Replies indicating intent/willingness to pay but without an explicit future date
+        phrases = [
+            "Yes, I will do",
+            "I will pay soon",
+            "I need more time",
+            "I will try to arrange payment",
+            "I will pay as soon as possible"
+        ]
+        for phrase in phrases:
+            msg = CommunicationMessage(
+                id="m_unspecified", tenant_id="t1", channel=Channel.SMS, direction=MessageDirection.INBOUND,
+                sender="+1", recipient="+2", content=phrase,
+                timestamp="2026-10-15T09:00:00"
+            )
+            res = self.classifier.classify_tenant_communications([msg], reference_date=self.ref_date)
+            self.assertEqual(res.intent, IntentType.PAYMENT_UNSPECIFIED, f"Failed for '{phrase}': got {res.intent}")
+            self.assertIsNone(res.extracted_date, f"Expected no extracted date for '{phrase}', got {res.extracted_date}")
+
+    def test_unable_to_pay_classification(self):
+        phrases = [
+            "I can't pay right now",
+            "I lost my job and cannot afford this",
+            "I don't have the money to pay rent"
+        ]
+        for phrase in phrases:
+            msg = CommunicationMessage(
+                id="m_unable", tenant_id="t1", channel=Channel.SMS, direction=MessageDirection.INBOUND,
+                sender="+1", recipient="+2", content=phrase,
+                timestamp="2026-10-15T09:00:00"
+            )
+            res = self.classifier.classify_tenant_communications([msg], reference_date=self.ref_date)
+            self.assertEqual(res.intent, IntentType.UNABLE_TO_PAY, f"Failed for '{phrase}': got {res.intent}")
+
+    def test_unrelated_message_classification(self):
+        phrases = [
+            "Who is this?",
+            "Wrong number please remove",
+            "Did someone fix the AC filter?"
+        ]
+        for phrase in phrases:
+            msg = CommunicationMessage(
+                id="m_unrelated", tenant_id="t1", channel=Channel.SMS, direction=MessageDirection.INBOUND,
+                sender="+1", recipient="+2", content=phrase,
+                timestamp="2026-10-15T09:00:00"
+            )
+            res = self.classifier.classify_tenant_communications([msg], reference_date=self.ref_date)
+            self.assertEqual(res.intent, IntentType.UNRELATED, f"Failed for '{phrase}': got {res.intent}")
+
 if __name__ == "__main__":
     unittest.main()

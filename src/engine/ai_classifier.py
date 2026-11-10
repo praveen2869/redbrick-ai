@@ -161,21 +161,24 @@ class AIIntentClassifier:
         system_prompt = (
             f"You are an AI assistant for Red Bricks Property Management. "
             f"Current reference date is {ref_date_str}. "
-            "Analyze the tenant's reply to an overdue rent notification and extract their intent.\n"
+            "Analyze the tenant's reply to an overdue rent notification and classify their intent.\n"
             "You MUST respond with ONLY a valid raw JSON object (no markdown fences, no preamble, no commentary) with the following structure:\n"
             "{\n"
-            '  "intent": "PROMISE_MADE" | "ALREADY_PAID" | "DISPUTE" | "GENERAL_INQUIRY" | "NO_REPLY",\n'
+            '  "intent": "PROMISE_MADE" | "PAYMENT_UNSPECIFIED" | "UNABLE_TO_PAY" | "DISPUTE" | "ALREADY_PAID" | "UNRELATED" | "NO_REPLY",\n'
             '  "confidence": 0.95,\n'
             '  "extracted_date": "YYYY-MM-DD" or null,\n'
             '  "extracted_amount": 1500.0 or null,\n'
             '  "reasoning": "Brief explanation of decision"\n'
             "}\n"
-            "Rules for classification:\n"
-            "- PROMISE_MADE: Tenant states they will pay by a certain date or tomorrow/Friday. Calculate extracted_date based on current reference date.\n"
-            "- ALREADY_PAID: Tenant claims they already paid or transferred funds.\n"
-            "- DISPUTE: Tenant disputes the balance, maintenance issues, withholding rent, or mentions lawyer/attorney.\n"
-            "- GENERAL_INQUIRY: General question without payment commitment or dispute.\n"
-            "- NO_REPLY: Empty or irrelevant message."
+            "Strict classification rules:\n"
+            "1. PROMISE_MADE: ONLY when tenant provides an EXPLICIT, SPECIFIC payment date (e.g. tomorrow, this Friday, Nov 15th, on the 20th). "
+            "You MUST populate 'extracted_date' (YYYY-MM-DD). If NO specific date is given, NEVER use PROMISE_MADE!\n"
+            "2. PAYMENT_UNSPECIFIED: Payment-related reply WITHOUT a specific date (e.g. 'Yes, I will do', 'I will pay soon', 'I need more time', 'I will try to arrange payment', 'Working on it', 'I will take care of it').\n"
+            "3. UNABLE_TO_PAY: Tenant states they cannot or will not pay (e.g. 'I can't pay right now', 'I don't have the money', 'I lost my job', 'Cannot afford this', 'I refuse to pay').\n"
+            "4. DISPUTE: Tenant disputes the balance amount, maintenance issues, withholding rent, or mentions legal action / attorney.\n"
+            "5. ALREADY_PAID: Tenant claims they already made the payment or transferred funds.\n"
+            "6. UNRELATED: Unrelated conversations, greetings, wrong numbers, or general questions not related to payment commitment.\n"
+            "7. NO_REPLY: Empty message."
         )
 
         payload = {
@@ -252,11 +255,12 @@ class AIIntentClassifier:
             f"Current date is {ref_date_str}. "
             "Analyze the tenant's reply to rent notification. "
             "Respond ONLY with a JSON object with fields: "
-            "intent (PROMISE_MADE, ALREADY_PAID, DISPUTE, GENERAL_INQUIRY, NO_REPLY), "
+            "intent (PROMISE_MADE, PAYMENT_UNSPECIFIED, UNABLE_TO_PAY, DISPUTE, ALREADY_PAID, UNRELATED, NO_REPLY), "
             "confidence (float 0.0-1.0), "
             "extracted_date (YYYY-MM-DD or null), "
             "extracted_amount (float or null), "
-            "reasoning (short explanation)."
+            "reasoning (short explanation). "
+            "Rules: PROMISE_MADE strictly requires an explicit identifiable date. If no date is given, use PAYMENT_UNSPECIFIED."
         )
 
         payload = {
@@ -305,9 +309,15 @@ class AIIntentClassifier:
     ) -> ClassificationResult:
         """
         High-precision semantic classifier that handles common tenant phrasing patterns,
-        intent recognition, dispute detection, and date extraction.
+        intent recognition, dispute detection, and date extraction according to strict business rules:
+          1. Specific payment date provided -> PROMISE_MADE (with extracted_date)
+          2. Payment-related reply without specific date -> PAYMENT_UNSPECIFIED
+          3. Unable or unwilling to pay -> UNABLE_TO_PAY
+          4. Dispute or balance contestation -> DISPUTE
+          5. Already paid claims -> ALREADY_PAID
+          6. Unrelated or general inquiry -> UNRELATED
         """
-        lower = text.lower()
+        lower = text.lower().strip()
 
         # 1. Dispute or manual review indicators
         dispute_patterns = [
@@ -326,12 +336,30 @@ class AIIntentClassifier:
                     reasoning=f"Detected dispute/maintenance condition matching '{pat}'"
                 )
 
-        # 2. Already Paid indicators
+        # 2. Unable or Unwilling to Pay indicators
+        unable_patterns = [
+            r"can['’]?t pay", r"cannot pay", r"unable to pay", r"don['’]?t have (?:the )?money",
+            r"no money", r"don['’]?t have enough", r"out of money", r"broke (?:right now|at the moment)?",
+            r"lost my job", r"lost job", r"unemployed", r"laid off", r"refuse to pay",
+            r"won['’]?t pay", r"not going to pay", r"not paying", r"hardship",
+            r"cannot afford", r"can['’]?t afford", r"impossible to pay"
+        ]
+        for pat in unable_patterns:
+            if re.search(pat, lower):
+                return ClassificationResult(
+                    intent=IntentType.UNABLE_TO_PAY,
+                    confidence=0.95,
+                    raw_text=text,
+                    source_channel=channel,
+                    reasoning=f"Tenant states unable or unwilling to pay: '{pat}'"
+                )
+
+        # 3. Already Paid indicators
         already_paid_patterns = [
             r"already paid", r"just paid", r"paid it this morning", r"paid yesterday",
             r"transferred", r"sent the money", r"check dropped off", r"receipt attached",
             r"submitted payment", r"went through", r"check was delivered", r"paid on the portal",
-            r"zelle sent", r"venmo sent"
+            r"paid online", r"zelle sent", r"venmo sent", r"payment was submitted"
         ]
         for pat in already_paid_patterns:
             if re.search(pat, lower):
@@ -343,40 +371,60 @@ class AIIntentClassifier:
                     reasoning=f"Tenant claims payment has already occurred ('{pat}')"
                 )
 
-        # 3. Payment Promise indicators
-        promise_patterns = [
-            r"will pay", r"i'll pay", r"ill pay", r"going to pay", r"gonna pay",
-            r"promise to pay", r"sending.*tomorrow", r"sending.*friday", r"sending.*tonight",
-            r"pay.*this friday", r"paycheck", r"pay.*on the", r"transfer.*on",
-            r"can pay by", r"will send on", r"will settle", r"pay next week",
-            r"pay when i get paid", r"clearing on"
+        # 4. Payment Promise or Payment-Related Reply indicators
+        payment_phrases = [
+            r"will pay", r"i['’]?ll pay", r"ill pay", r"going to pay", r"gonna pay",
+            r"promise to pay", r"can pay", r"sending payment", r"sending.*tomorrow",
+            r"sending.*friday", r"sending.*tonight", r"pay.*this friday", r"paycheck",
+            r"pay.*on the", r"transfer.*on", r"will send", r"will settle", r"clearing on",
+            r"will do", r"yes,? i will do", r"need more time", r"arrange payment",
+            r"trying to arrange", r"try to arrange", r"pay soon", r"work on payment",
+            r"working on it", r"take care of it", r"handle it", r"pay later"
         ]
-        is_promise = any(re.search(pat, lower) for pat in promise_patterns)
+        is_payment_related = any(re.search(pat, lower) for pat in payment_phrases)
 
-        if is_promise:
-            extracted_date = self._extract_date_from_text(lower, reference_date)
-            extracted_amount = self._extract_amount_from_text(text)
-            return ClassificationResult(
-                intent=IntentType.PROMISE_MADE,
-                confidence=0.94,
-                raw_text=text,
-                source_channel=channel,
-                extracted_date=extracted_date,
-                extracted_amount=extracted_amount,
-                reasoning=f"Tenant made explicit payment commitment for {extracted_date or 'unspecified date'}"
-            )
+        # Attempt to extract an explicitly identifiable future payment date
+        extracted_date = self._extract_date_from_text(lower, reference_date)
+        extracted_amount = self._extract_amount_from_text(text)
 
-        # 4. General inquiry / other
+        if is_payment_related:
+            if extracted_date is not None:
+                # Specific payment date confirmed -> Eligible for Payment Promised (On Hold)
+                return ClassificationResult(
+                    intent=IntentType.PROMISE_MADE,
+                    confidence=0.94,
+                    raw_text=text,
+                    source_channel=channel,
+                    extracted_date=extracted_date,
+                    extracted_amount=extracted_amount,
+                    reasoning=f"Tenant made confirmed payment commitment with specific date: {extracted_date}"
+                )
+            else:
+                # Payment-related reply WITHOUT a specific date -> Manual Review / Disputes
+                return ClassificationResult(
+                    intent=IntentType.PAYMENT_UNSPECIFIED,
+                    confidence=0.90,
+                    raw_text=text,
+                    source_channel=channel,
+                    extracted_date=None,
+                    extracted_amount=extracted_amount,
+                    reasoning="Payment-related reply without a specific payment date"
+                )
+
+        # 5. Unrelated conversation or general inquiry
         return ClassificationResult(
-            intent=IntentType.GENERAL_INQUIRY,
-            confidence=0.70,
+            intent=IntentType.UNRELATED,
+            confidence=0.75,
             raw_text=text,
             source_channel=channel,
-            reasoning="Message does not contain specific payment promise or dispute"
+            reasoning="Unrelated conversation or general message; does not affect reminder eligibility"
         )
 
     def _extract_date_from_text(self, text: str, ref_date: datetime) -> Optional[str]:
-        """Extracts relative or absolute dates from conversational text."""
+        """
+        Extracts relative or absolute dates from conversational text.
+        Returns None if NO specific, identifiable date is found. Never falls back to arbitrary dates.
+        """
         # Tomorrow
         if "tomorrow" in text:
             return (ref_date + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -385,25 +433,34 @@ class AIIntentClassifier:
         if "tonight" in text or "today" in text or "later today" in text:
             return ref_date.strftime("%Y-%m-%d")
 
+        # "in X days" e.g. "in 2 days", "in 3 days"
+        in_days_m = re.search(r"\bin\s+(\d+)\s+days?\b", text)
+        if in_days_m:
+            try:
+                days_cnt = int(in_days_m.group(1))
+                if 1 <= days_cnt <= 60:
+                    return (ref_date + timedelta(days=days_cnt)).strftime("%Y-%m-%d")
+            except Exception:
+                pass
+
         # Days of week: e.g. Friday, Monday, etc.
         weekdays = {
             "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
             "friday": 4, "saturday": 5, "sunday": 6
         }
         for day_name, target_idx in weekdays.items():
-            if day_name in text:
+            if re.search(rf"\b{day_name}\b", text):
                 current_idx = ref_date.weekday()
                 days_ahead = (target_idx - current_idx) % 7
                 if days_ahead == 0:
                     days_ahead = 7  # Next week's instance
                 return (ref_date + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
 
-        # "on the 5th", "on the 12th", etc.
+        # "on the 5th", "on the 12th", "by the 15th", etc.
         day_match = re.search(r"(?:on|by)\s+the\s+(\d{1,2})(?:st|nd|rd|th)?", text)
         if day_match:
             day_num = int(day_match.group(1))
             try:
-                # If target day is earlier in the month than today, assume next month
                 month = ref_date.month
                 year = ref_date.year
                 if day_num < ref_date.day:
@@ -413,13 +470,13 @@ class AIIntentClassifier:
             except Exception:
                 pass
 
-        # Explicit dates: YYYY-MM-DD or Oct 25 / October 25
+        # Explicit dates: Month Day e.g. "Nov 25", "October 25th", "December 1"
         months = ["january", "february", "march", "april", "may", "june",
                   "july", "august", "september", "october", "november", "december",
                   "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
         for m_idx, m_name in enumerate(months):
             m_num = (m_idx % 12) + 1
-            match = re.search(rf"{m_name}\s+(\d{{1,2}})", text)
+            match = re.search(rf"\b{m_name}\s+(\d{{1,2}})(?:st|nd|rd|th)?\b", text)
             if match:
                 day_num = int(match.group(1))
                 try:
@@ -427,8 +484,33 @@ class AIIntentClassifier:
                 except Exception:
                     pass
 
-        # Fallback default promise: 3 days from reference
-        return (ref_date + timedelta(days=3)).strftime("%Y-%m-%d")
+        # MM/DD or MM/DD/YYYY format e.g. "11/15" or "11/15/2026"
+        slash_match = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", text)
+        if slash_match:
+            try:
+                m_val = int(slash_match.group(1))
+                d_val = int(slash_match.group(2))
+                y_val = int(slash_match.group(3)) if slash_match.group(3) else ref_date.year
+                if y_val < 100:
+                    y_val += 2000
+                if 1 <= m_val <= 12 and 1 <= d_val <= 31:
+                    return datetime(y_val, m_val, d_val).strftime("%Y-%m-%d")
+            except Exception:
+                pass
+
+        # ISO format: YYYY-MM-DD
+        iso_m = re.search(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b", text)
+        if iso_m:
+            try:
+                y = int(iso_m.group(1))
+                m = int(iso_m.group(2))
+                d = int(iso_m.group(3))
+                return datetime(y, m, d).strftime("%Y-%m-%d")
+            except Exception:
+                pass
+
+        # Strict requirement: If no specific date was identifiable, return None!
+        return None
 
     def _extract_amount_from_text(self, text: str) -> Optional[float]:
         """Extracts dollar amounts like $1,400 or $500."""

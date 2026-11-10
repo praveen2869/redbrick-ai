@@ -1006,13 +1006,14 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                         "inbox": inbox_name
                     })
 
-                # Check tenant communications for payment promise
+                # Check tenant communications for payment reply, date-based promises, or disputes
                 if primary_t and comm_msgs:
                     ai_res = classifier.classify_tenant_communications(comm_msgs, reference_date=datetime.utcnow())
-                    if ai_res.intent == IntentType.PROMISE_MADE:
-                        from datetime import timedelta as _td
-                        p_date = ai_res.extracted_date or (datetime.utcnow().date() + _td(days=3)).strftime("%Y-%m-%d")
-                        today_str = datetime.utcnow().strftime("%Y-%m-%d")
+                    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+
+                    # Scenario 1: Specific payment date provided -> On Hold (Payment Promised)
+                    if ai_res.intent == IntentType.PROMISE_MADE and ai_res.extracted_date:
+                        p_date = ai_res.extracted_date
                         if p_date >= today_str:
                             rv_bal = db.get_rentvine_record(primary_t.id)
                             bal_val = float(rv_bal.balance) if rv_bal else 0.0
@@ -1036,6 +1037,103 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                                 )
                                 db.save_decision(hold_dec)
                             logger.info(f"[Quo Promise] Payment commitment recorded for {t_name}: pay by {p_date}")
+
+                    # Scenario 2: Payment-related reply WITHOUT specific date -> Manual Review / Disputes
+                    elif ai_res.intent == IntentType.PAYMENT_UNSPECIFIED:
+                        rv_bal = db.get_rentvine_record(primary_t.id)
+                        bal_val = float(rv_bal.balance) if rv_bal else 0.0
+                        for cur_t in ts:
+                            mr_dec = WorkflowDecision(
+                                tenant_id=cur_t.id,
+                                tenant_name=cur_t.full_name,
+                                property_unit=prop_unit,
+                                balance=bal_val,
+                                outcome=DecisionOutcome.FLAG_MANUAL_REVIEW,
+                                reason=f"Payment reply without specific date (\"{ai_res.raw_text}\") — moved to Manual Review / Disputes",
+                                details={
+                                    "intent": "PAYMENT_UNSPECIFIED",
+                                    "raw_text": ai_res.raw_text,
+                                    "channel": "SMS",
+                                    "classification_reason": "Payment reply without confirmed date"
+                                },
+                                timestamp=datetime.utcnow().isoformat(),
+                                run_id="quo_sync"
+                            )
+                            db.save_decision(mr_dec)
+                        logger.info(f"[Quo Manual Review] Payment reply without date for {t_name}: \"{ai_res.raw_text}\"")
+
+                    # Scenario 3: Unable or unwilling to pay -> Manual Review / Disputes for staff follow-up
+                    elif ai_res.intent == IntentType.UNABLE_TO_PAY:
+                        rv_bal = db.get_rentvine_record(primary_t.id)
+                        bal_val = float(rv_bal.balance) if rv_bal else 0.0
+                        for cur_t in ts:
+                            mr_dec = WorkflowDecision(
+                                tenant_id=cur_t.id,
+                                tenant_name=cur_t.full_name,
+                                property_unit=prop_unit,
+                                balance=bal_val,
+                                outcome=DecisionOutcome.FLAG_MANUAL_REVIEW,
+                                reason=f"Unable/unwilling to pay (\"{ai_res.raw_text}\") — moved to Manual Review / Disputes for staff follow-up",
+                                details={
+                                    "intent": "UNABLE_TO_PAY",
+                                    "raw_text": ai_res.raw_text,
+                                    "channel": "SMS",
+                                    "classification_reason": "Unable or unwilling to pay"
+                                },
+                                timestamp=datetime.utcnow().isoformat(),
+                                run_id="quo_sync"
+                            )
+                            db.save_decision(mr_dec)
+                        logger.info(f"[Quo Unable to Pay] Flagged for staff follow-up for {t_name}: \"{ai_res.raw_text}\"")
+
+                    # Scenario 4: Dispute or maintenance withholding
+                    elif ai_res.intent == IntentType.DISPUTE:
+                        rv_bal = db.get_rentvine_record(primary_t.id)
+                        bal_val = float(rv_bal.balance) if rv_bal else 0.0
+                        for cur_t in ts:
+                            mr_dec = WorkflowDecision(
+                                tenant_id=cur_t.id,
+                                tenant_name=cur_t.full_name,
+                                property_unit=prop_unit,
+                                balance=bal_val,
+                                outcome=DecisionOutcome.FLAG_MANUAL_REVIEW,
+                                reason=f"Dispute detected via Quo SMS: \"{ai_res.raw_text}\"",
+                                details={
+                                    "intent": "DISPUTE",
+                                    "raw_text": ai_res.raw_text,
+                                    "channel": "SMS",
+                                    "classification_reason": "Dispute / maintenance withholding"
+                                },
+                                timestamp=datetime.utcnow().isoformat(),
+                                run_id="quo_sync"
+                            )
+                            db.save_decision(mr_dec)
+                        logger.info(f"[Quo Dispute] Dispute detected for {t_name}: \"{ai_res.raw_text}\"")
+
+                    # Scenario 5: Already paid claim
+                    elif ai_res.intent == IntentType.ALREADY_PAID:
+                        rv_bal = db.get_rentvine_record(primary_t.id)
+                        bal_val = float(rv_bal.balance) if rv_bal else 0.0
+                        for cur_t in ts:
+                            paid_dec = WorkflowDecision(
+                                tenant_id=cur_t.id,
+                                tenant_name=cur_t.full_name,
+                                property_unit=prop_unit,
+                                balance=bal_val,
+                                outcome=DecisionOutcome.SKIP_PAID,
+                                reason=f"Tenant claims payment completed via Quo SMS (\"{ai_res.raw_text}\")",
+                                details={
+                                    "intent": "ALREADY_PAID",
+                                    "raw_text": ai_res.raw_text,
+                                    "channel": "SMS"
+                                },
+                                timestamp=datetime.utcnow().isoformat(),
+                                run_id="quo_sync"
+                            )
+                            db.save_decision(paid_dec)
+                        logger.info(f"[Quo Paid Claim] Tenant claims payment completed: {t_name}")
+
+                    # Scenario 6: Unrelated messages or general questions do not modify reminder status
 
         # ─── 2. Build reminders queue from REAL workflow decisions and live overdue accounts ───
         # Strictly associated with Tenants & Vendors line ((980) 300-7559)
@@ -1199,31 +1297,42 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
                     except Exception:
                         details = {}
                 promise_date = details.get("promise_date") or details.get("extracted_date") or details.get("note_pdate")
+
+                is_promise_active = True
                 if promise_date:
                     try:
                         from datetime import timedelta as _td
-                        pd_obj = datetime.strptime(str(promise_date)[:10], "%Y-%m-%d")
+                        pd_obj = datetime.strptime(str(promise_date)[:10], "%Y-%m-%d").date()
+                        today_date = rules.get_pm_datetime().date()
+                        if pd_obj < today_date:
+                            is_promise_active = False  # Promised date has expired; resume reminder eligibility!
                         next_eligible = (pd_obj + _td(days=1)).strftime("%Y-%m-%d")
                     except Exception:
                         next_eligible = promise_date
 
-                promises_on_hold.append({
-                    "tenant_id": d.tenant_id,
-                    "tenant_name": tenant_display_name,
-                    "property_unit": prop_display,
-                    "phone": phone_display,
-                    "phones": phones_list,
-                    "is_group": is_multi,
-                    "balance": effective_balance,
-                    "status": "ON_HOLD_PAYMENT_PROMISED",
-                    "hold_reason": d.reason,
-                    "promise_date": promise_date,
-                    "next_eligible_reminder_date": next_eligible,
-                    "timestamp": d.timestamp,
-                    "sender_phone": settings.QUO_PHONE_TENANTS_FORMATTED,
-                    "sender_inbox": "Tenants & Vendors",
-                })
-                continue  # Don't add to send queue
+                if is_promise_active:
+                    promises_on_hold.append({
+                        "tenant_id": d.tenant_id,
+                        "tenant_name": tenant_display_name,
+                        "property_unit": prop_display,
+                        "phone": phone_display,
+                        "phones": phones_list,
+                        "is_group": is_multi,
+                        "balance": effective_balance,
+                        "status": "ON_HOLD_PAYMENT_PROMISED",
+                        "hold_reason": d.reason,
+                        "promise_date": promise_date,
+                        "next_eligible_reminder_date": next_eligible,
+                        "timestamp": d.timestamp,
+                        "sender_phone": settings.QUO_PHONE_TENANTS_FORMATTED,
+                        "sender_inbox": "Tenants & Vendors",
+                    })
+                    continue  # Active promise: suppress reminder
+                else:
+                    logger.info(
+                        f"Payment promise for {d.tenant_id} expired on {promise_date}; "
+                        "resuming reminder eligibility."
+                    )
 
             # ── 3. 24-Hour Deduplication Cooldown Check ──
             # When a reminder was dispatched within the last 24 hours, tenant is in cooldown
@@ -1574,7 +1683,27 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
             decision_preview = {
                 "outcome": DecisionOutcome.HOLD_PROMISE.value,
                 "reason": f"Payment promise detected: will pay by {pdate}",
-                "action": "Hold SMS reminders and update RentVine notes"
+                "action": "Hold SMS reminders until promised date and update RentVine notes"
+            }
+            if apply_to_db:
+                RentVineMCPClient().write_tenant_note(tenant_id, rv_note_text, author="AI Rent Reminder Agent")
+
+        elif result.intent == IntentType.PAYMENT_UNSPECIFIED:
+            rv_note_text = f"[MANUAL REVIEW - NO PAYMENT DATE] Tenant replied: \"{text}\". Flagged for Manual Review / Disputes."
+            decision_preview = {
+                "outcome": DecisionOutcome.FLAG_MANUAL_REVIEW.value,
+                "reason": f"Payment reply without specific date (\"{text}\") — moved to Manual Review / Disputes",
+                "action": "Escalate to staff for manual review"
+            }
+            if apply_to_db:
+                RentVineMCPClient().write_tenant_note(tenant_id, rv_note_text, author="AI Rent Reminder Agent")
+
+        elif result.intent == IntentType.UNABLE_TO_PAY:
+            rv_note_text = f"[MANUAL REVIEW - UNABLE TO PAY] Tenant stated unable/unwilling to pay: \"{text}\". Flagged for staff follow-up."
+            decision_preview = {
+                "outcome": DecisionOutcome.FLAG_MANUAL_REVIEW.value,
+                "reason": f"Unable/unwilling to pay (\"{text}\") — moved to Manual Review / Disputes for staff follow-up",
+                "action": "Staff follow-up required"
             }
             if apply_to_db:
                 RentVineMCPClient().write_tenant_note(tenant_id, rv_note_text, author="AI Rent Reminder Agent")
@@ -1602,7 +1731,7 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
         else:
             decision_preview = {
                 "outcome": "CONTINUE_STANDARD_RULES",
-                "reason": "Standard reply or question; does not override reminder eligibility",
+                "reason": "Unrelated conversation or generic message; does not change reminder eligibility",
                 "action": "Evaluate standard balance and grace period"
             }
 

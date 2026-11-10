@@ -19,10 +19,13 @@ class MessageDirection(str, Enum):
 
 class IntentType(str, Enum):
     PROMISE_MADE = "PROMISE_MADE"
-    ALREADY_PAID = "ALREADY_PAID"
+    PAYMENT_UNSPECIFIED = "PAYMENT_UNSPECIFIED"
+    UNABLE_TO_PAY = "UNABLE_TO_PAY"
     DISPUTE = "DISPUTE"
-    NO_REPLY = "NO_REPLY"
+    ALREADY_PAID = "ALREADY_PAID"
     GENERAL_INQUIRY = "GENERAL_INQUIRY"
+    UNRELATED = "UNRELATED"
+    NO_REPLY = "NO_REPLY"
 
 class DecisionOutcome(str, Enum):
     SKIP_PAID = "SKIP_PAID"

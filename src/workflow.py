@@ -729,9 +729,9 @@ class WorkflowOrchestrator:
         # Step 3: Run AI NLU Intent Classifier on communications
         ai_result = self.ai.classify_tenant_communications(combined_messages, reference_date=current_time)
 
-        # AI Outcome A: PROMISE_MADE
-        if ai_result.intent == IntentType.PROMISE_MADE:
-            promise_date = ai_result.extracted_date or (current_time.date() + timedelta(days=3)).strftime("%Y-%m-%d")
+        # AI Outcome 1: PROMISE_MADE (Specific payment date provided)
+        if ai_result.intent == IntentType.PROMISE_MADE and ai_result.extracted_date:
+            promise_date = ai_result.extracted_date
             today_str = current_time.strftime("%Y-%m-%d")
 
             # Check if promise date is active (current or future date)
@@ -771,8 +771,66 @@ class WorkflowOrchestrator:
                     f"Balance is ${balance:,.2f}; proceeding to evaluate reminder eligibility."
                 )
 
-        # AI Outcome B: DISPUTE
-        if ai_result.intent == IntentType.DISPUTE:
+        # AI Outcome 2: PAYMENT_UNSPECIFIED (Payment-related reply without specific date -> Manual Review / Disputes)
+        elif ai_result.intent == IntentType.PAYMENT_UNSPECIFIED:
+            note_text = (
+                f"[MANUAL REVIEW - NO PAYMENT DATE] Tenant replied: \"{ai_result.raw_text}\". "
+                "Payment-related reply without confirmed date; flagged for Manual Review / Disputes."
+            )
+            if not is_dry_run:
+                self.rentvine.write_tenant_note(tenant.id, note_text, author="AI Rent Reminder Agent")
+
+            decision = WorkflowDecision(
+                tenant_id=tenant.id,
+                tenant_name=tenant.full_name,
+                property_unit=prop_unit,
+                balance=balance,
+                outcome=DecisionOutcome.FLAG_MANUAL_REVIEW,
+                reason=f"Payment-related reply without specific payment date (\"{ai_result.raw_text}\") — moved to Manual Review / Disputes",
+                details={
+                    "intent": ai_result.intent.value,
+                    "confidence": ai_result.confidence,
+                    "raw_text": ai_result.raw_text,
+                    "channel": ai_result.source_channel.value,
+                    "classification_reason": "Payment-related reply without specific date"
+                },
+                note_written=not is_dry_run,
+                run_id=run_id
+            )
+            db.save_decision(decision)
+            return decision
+
+        # AI Outcome 3: UNABLE_TO_PAY (Unable or unwilling to pay -> Manual Review / Disputes for staff follow-up)
+        elif ai_result.intent == IntentType.UNABLE_TO_PAY:
+            note_text = (
+                f"[MANUAL REVIEW - UNABLE TO PAY] Tenant stated unable/unwilling to pay: \"{ai_result.raw_text}\". "
+                "Flagged for staff follow-up."
+            )
+            if not is_dry_run:
+                self.rentvine.write_tenant_note(tenant.id, note_text, author="AI Rent Reminder Agent")
+
+            decision = WorkflowDecision(
+                tenant_id=tenant.id,
+                tenant_name=tenant.full_name,
+                property_unit=prop_unit,
+                balance=balance,
+                outcome=DecisionOutcome.FLAG_MANUAL_REVIEW,
+                reason=f"Unable/unwilling to pay (\"{ai_result.raw_text}\") — moved to Manual Review / Disputes for staff follow-up",
+                details={
+                    "intent": ai_result.intent.value,
+                    "confidence": ai_result.confidence,
+                    "raw_text": ai_result.raw_text,
+                    "channel": ai_result.source_channel.value,
+                    "classification_reason": "Unable or unwilling to pay"
+                },
+                note_written=not is_dry_run,
+                run_id=run_id
+            )
+            db.save_decision(decision)
+            return decision
+
+        # AI Outcome 4: DISPUTE
+        elif ai_result.intent == IntentType.DISPUTE:
             note_text = f"[DISPUTE DETECTED] Tenant response flagged: \"{ai_result.raw_text}\". Pausing auto-reminders."
             if not is_dry_run:
                 self.rentvine.write_tenant_note(tenant.id, note_text, author="AI Rent Reminder Agent")
@@ -795,8 +853,8 @@ class WorkflowOrchestrator:
             db.save_decision(decision)
             return decision
 
-        # AI Outcome C: ALREADY_PAID claim
-        if ai_result.intent == IntentType.ALREADY_PAID:
+        # AI Outcome 5: ALREADY_PAID claim
+        elif ai_result.intent == IntentType.ALREADY_PAID:
             note_text = f"[PAYMENT CLAIMED] Tenant states rent was already paid: \"{ai_result.raw_text}\". Awaiting bank sync."
             if not is_dry_run:
                 self.rentvine.write_tenant_note(tenant.id, note_text, author="AI Rent Reminder Agent")
@@ -818,6 +876,9 @@ class WorkflowOrchestrator:
             )
             db.save_decision(decision)
             return decision
+
+        # AI Outcome 6: UNRELATED / GENERAL_INQUIRY / NO_REPLY
+        # Unrelated messages do not alter reminder eligibility; proceed to evaluate standard business rules below.
 
         # Rule 4: Grace Period Check (1st–4th of current month for current-month rent)
         is_in_grace, grace_reason = self.rules.check_grace_period(rv_record, current_time)

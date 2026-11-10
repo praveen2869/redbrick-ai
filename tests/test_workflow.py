@@ -1091,5 +1091,145 @@ class TestWorkflow(unittest.TestCase):
         self.assertIn("+18622205006", sent_phones)
         self.assertIn("+19802941035", sent_phones)
 
+    def test_payment_reply_classification_and_reminder_eligibility(self):
+        """
+        Tests the 4-part payment reply classification & reminder eligibility rules:
+        1. Specific Payment Date -> HOLD_PROMISE (suppress until promised date, resume day after)
+        2. Payment Reply Without Specific Date -> FLAG_MANUAL_REVIEW
+        3. Unable/Unwilling to Pay -> FLAG_MANUAL_REVIEW
+        4. Unrelated Messages -> Ignored for classification, normal reminder rules apply
+        """
+        from unittest.mock import patch
+        from src.database import db
+        from src.models import Tenant, RentVineRecord, CommunicationMessage, MessageDirection, Channel
+
+        tenant_id = "t_reply_eligibility_test"
+        tenant = Tenant(
+            id=tenant_id,
+            first_name="Alice",
+            last_name="Tester",
+            email="alice@example.com",
+            phone="+15550001111",
+            property_name="100 Main St",
+            unit_number="A"
+        )
+        rv_rec = RentVineRecord(
+            tenant_id=tenant_id,
+            balance=1500.0,
+            monthly_rent=1500.0,
+            due_date="2026-10-01",
+            lease_status="Active"
+        )
+        db.upsert_tenant(tenant)
+        db.upsert_rentvine_record(rv_rec)
+
+        ref_oct15 = datetime(2026, 10, 15, 10, 0)
+        ref_oct16 = datetime(2026, 10, 16, 10, 0)
+        ref_oct17 = datetime(2026, 10, 17, 10, 0)
+
+        # 1. Specific Payment Date Provided (e.g. "tomorrow" on Oct 15 -> 2026-10-16)
+        msg_date = CommunicationMessage(
+            id="m_date", tenant_id=tenant_id, channel=Channel.SMS, direction=MessageDirection.INBOUND,
+            sender=tenant.phone, recipient="+19803007559",
+            content="I will pay tomorrow morning through the portal.",
+            timestamp="2026-10-15T09:00:00"
+        )
+        with patch.object(self.orchestrator.quo, "get_conversation_history", return_value=[msg_date]), \
+             patch.object(self.orchestrator.gmail, "get_recent_email_replies", return_value=[]):
+            # On Oct 15 (before promise date): HOLD_PROMISE
+            d_oct15 = self.orchestrator._process_tenant(
+                tenant=tenant,
+                run_id="run_spec_date_15",
+                is_dry_run=True,
+                current_time=ref_oct15
+            )
+            self.assertEqual(d_oct15.outcome, DecisionOutcome.HOLD_PROMISE)
+            self.assertIn("Payment promised", d_oct15.reason)
+
+            # On Oct 16 (promised date): HOLD_PROMISE still active
+            d_oct16 = self.orchestrator._process_tenant(
+                tenant=tenant,
+                run_id="run_spec_date_16",
+                is_dry_run=True,
+                current_time=ref_oct16
+            )
+            self.assertEqual(d_oct16.outcome, DecisionOutcome.HOLD_PROMISE)
+
+            # On Oct 17 (day after promised date): promise has expired -> resumes reminder
+            d_oct17 = self.orchestrator._process_tenant(
+                tenant=tenant,
+                run_id="run_spec_date_17",
+                is_dry_run=True,
+                current_time=ref_oct17
+            )
+            self.assertEqual(d_oct17.outcome, DecisionOutcome.SEND_REMINDER)
+
+        # 2. Payment-Related Reply Without a Specific Date ("Yes, I will do" / "I will pay soon")
+        unspecified_replies = [
+            "Yes, I will do",
+            "I will pay soon",
+            "I need more time",
+            "I will try to arrange payment"
+        ]
+        for phrase in unspecified_replies:
+            msg_unspec = CommunicationMessage(
+                id=f"m_{phrase[:5]}", tenant_id=tenant_id, channel=Channel.SMS, direction=MessageDirection.INBOUND,
+                sender=tenant.phone, recipient="+19803007559",
+                content=phrase,
+                timestamp="2026-10-15T09:00:00"
+            )
+            with patch.object(self.orchestrator.quo, "get_conversation_history", return_value=[msg_unspec]), \
+                 patch.object(self.orchestrator.gmail, "get_recent_email_replies", return_value=[]):
+                d_unspec = self.orchestrator._process_tenant(
+                    tenant=tenant,
+                    run_id="run_unspec",
+                    is_dry_run=True,
+                    current_time=ref_oct15
+                )
+                self.assertEqual(d_unspec.outcome, DecisionOutcome.FLAG_MANUAL_REVIEW, f"Failed for '{phrase}': got {d_unspec.outcome}")
+                self.assertIn("Payment-related reply without specific payment date", d_unspec.reason)
+
+        # 3. Unable or Unwilling to Pay
+        unable_replies = [
+            "I can't pay right now",
+            "I lost my job and cannot afford rent",
+            "I don't have the money"
+        ]
+        for phrase in unable_replies:
+            msg_unable = CommunicationMessage(
+                id=f"m_{phrase[:5]}", tenant_id=tenant_id, channel=Channel.SMS, direction=MessageDirection.INBOUND,
+                sender=tenant.phone, recipient="+19803007559",
+                content=phrase,
+                timestamp="2026-10-15T09:00:00"
+            )
+            with patch.object(self.orchestrator.quo, "get_conversation_history", return_value=[msg_unable]), \
+                 patch.object(self.orchestrator.gmail, "get_recent_email_replies", return_value=[]):
+                d_unable = self.orchestrator._process_tenant(
+                    tenant=tenant,
+                    run_id="run_unable",
+                    is_dry_run=True,
+                    current_time=ref_oct15
+                )
+                self.assertEqual(d_unable.outcome, DecisionOutcome.FLAG_MANUAL_REVIEW, f"Failed for '{phrase}': got {d_unable.outcome}")
+                self.assertIn("unable/unwilling to pay", d_unable.reason.lower())
+
+        # 4. Unrelated Messages -> Ignore for classification, apply normal reminder rules
+        msg_unrelated = CommunicationMessage(
+            id="m_unrelated", tenant_id=tenant_id, channel=Channel.SMS, direction=MessageDirection.INBOUND,
+            sender=tenant.phone, recipient="+19803007559",
+            content="Who is this? Is maintenance coming today?",
+            timestamp="2026-10-15T09:00:00"
+        )
+        with patch.object(self.orchestrator.quo, "get_conversation_history", return_value=[msg_unrelated]), \
+             patch.object(self.orchestrator.gmail, "get_recent_email_replies", return_value=[]):
+            d_unrelated = self.orchestrator._process_tenant(
+                tenant=tenant,
+                run_id="run_unrelated",
+                is_dry_run=True,
+                current_time=ref_oct15
+            )
+            # Past grace period, balance > $200, no manual review -> normal SEND_REMINDER
+            self.assertEqual(d_unrelated.outcome, DecisionOutcome.SEND_REMINDER)
+
 if __name__ == "__main__":
     unittest.main()
