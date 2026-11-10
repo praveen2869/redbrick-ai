@@ -344,25 +344,26 @@ def run_pipeline_dispatch(
                     text=sms_text,
                     recipient_type="tenant"
                 )
-                db.record_reminder(
-                    tenant_id=tid,
-                    reminder_type="SMS_WORKFLOW_REMINDER",
-                    recipient_phone=", ".join(phones),
-                    sender_phone=settings.QUO_PHONE_TENANTS_FORMATTED,
-                    delivery_status="DELIVERED",
-                    sent_at=now_iso,
-                    stage=1
-                )
-                db.log_audit_event(
-                    event_type="HITL_REMINDER_DISPATCHED",
-                    tenant_id=tid,
-                    details={
-                        "recipients": phones,
-                        "balance": bal,
-                        "sms_text": sms_text,
-                        "approved_by": "AZURE_HITL_OPERATOR"
-                    }
-                )
+                # Record delivery in database
+                sms_msg_id = getattr(send_res, "message_id", None) if send_res else f"msg_{now_iso}"
+                for p in phones:
+                    rem_id = f"rem_{tid}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{p[-4:]}"
+                    try:
+                        db.record_workflow_reminder(
+                            reminder_id=rem_id,
+                            tenant_id=tid,
+                            message_id=str(sms_msg_id or rem_id),
+                            phone=p,
+                            content=sms_text,
+                            sender_phone=settings.QUO_PHONE_TENANTS_FORMATTED,
+                            delivery_status="DELIVERED",
+                            sent_at=now_iso,
+                            workflow_id="HITL_DISPATCH",
+                            reminder_type="SMS_WORKFLOW_REMINDER",
+                            stage=1
+                        )
+                    except Exception as db_err:
+                        logger.warning(f"Could not record workflow reminder to db: {db_err}")
                 dispatch_results.append({
                     "tenant_id": tid,
                     "tenant_name": t_name,
