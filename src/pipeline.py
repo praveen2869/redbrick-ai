@@ -1,7 +1,7 @@
 """
 Red Bricks Property Management - Azure Pipeline Automation & HITL Staging
 Provides Stage 1 (Evaluation & HITL Draft Staging) and Stage 2 (Approved Dispatch)
-for Azure Scheduled Pipelines with comprehensive Markdown approval summaries.
+for Azure Scheduled Pipelines with interactive HITL portal and Markdown summaries.
 """
 
 import os
@@ -13,6 +13,7 @@ from typing import Dict, Any, List, Optional
 from src.workflow import WorkflowOrchestrator
 from src.reporting import ReportGenerator
 from src.engine.excel_exporter import build_daily_excel_workbook
+from src.engine.hitl_portal_generator import generate_hitl_portal_html
 from src.models import DecisionOutcome, DailyRunSummary
 from src.database import db
 from src.config import settings
@@ -26,10 +27,11 @@ def run_pipeline_evaluate(output_dir: str = "reports") -> Dict[str, Any]:
     Does NOT dispatch live SMS.
     Outputs:
       - RBPM_Daily_Rent_Report.xlsx
-      - daily_rent_report.html
-      - daily_rent_report.md
+      - hitl_portal.html (Interactive standalone UI for review & 1-click approve/reject)
       - hitl_pending_reminders.json
       - hitl_summary.md (Uploaded to Azure DevOps Run Summary)
+      - daily_rent_report.html
+      - daily_rent_report.md
       - summary.json
     """
     os.makedirs(output_dir, exist_ok=True)
@@ -45,21 +47,7 @@ def run_pipeline_evaluate(output_dir: str = "reports") -> Dict[str, Any]:
     excel_wb.save(excel_path)
     logger.info(f"Excel report saved: {excel_path}")
 
-    # 2. Generate Interactive HTML Report
-    html_content = ReportGenerator.generate_html(summary)
-    html_path = os.path.join(output_dir, "daily_rent_report.html")
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(html_content)
-    logger.info(f"HTML report saved: {html_path}")
-
-    # 3. Generate Markdown Report
-    md_content = ReportGenerator.generate_markdown(summary)
-    md_path = os.path.join(output_dir, "daily_rent_report.md")
-    with open(md_path, "w", encoding="utf-8") as f:
-        f.write(md_content)
-    logger.info(f"Markdown report saved: {md_path}")
-
-    # 4. Extract Pending Reminders for HITL Review (Grouped per Lease / Property)
+    # 2. Extract Pending Reminders for HITL Review (Grouped per Lease / Property)
     pending_reminders: List[Dict[str, Any]] = []
     seen_leases = set()
 
@@ -74,7 +62,6 @@ def run_pipeline_evaluate(output_dir: str = "reports") -> Dict[str, Any]:
             seen_leases.add(lid)
 
             sms_draft = details.get("group_sms_text") or details.get("sms_text") or d.sms_draft or ""
-            # Fallback: if template text not saved in details, format cleanly
             if not sms_draft:
                 rec_names = ", ".join(details.get("tenant_names_in_sms") or [d.tenant_name])
                 sms_draft = settings.GROUP_REMINDER_TEMPLATE.format(
@@ -107,12 +94,87 @@ def run_pipeline_evaluate(output_dir: str = "reports") -> Dict[str, Any]:
                 "staged_at": datetime.utcnow().isoformat()
             })
 
+    # Collect Promises on File (Hold)
+    promises_on_file = [
+        {
+            "tenant_name": d.tenant_name,
+            "property_unit": d.property_unit,
+            "balance": d.balance,
+            "due_date": (d.details or {}).get("due_date", "Promised"),
+            "reason": d.reason
+        }
+        for d in summary.decisions if d.outcome == DecisionOutcome.HOLD_PROMISE
+    ]
+
+    # Collect Manual Reviews & Disputes
+    manual_reviews = [
+        {
+            "tenant_name": d.tenant_name,
+            "property_unit": d.property_unit,
+            "balance": d.balance,
+            "reason": d.reason
+        }
+        for d in summary.decisions if d.outcome == DecisionOutcome.FLAG_MANUAL_REVIEW
+    ]
+
+    # Collect Paid & Cleared
+    paid_cleared = [
+        {
+            "tenant_name": d.tenant_name,
+            "property_unit": d.property_unit,
+            "balance": 0.0
+        }
+        for d in summary.decisions if d.outcome == DecisionOutcome.SKIP_PAID
+    ]
+
+    # 3. Save JSON files
     hitl_path = os.path.join(output_dir, "hitl_pending_reminders.json")
     with open(hitl_path, "w", encoding="utf-8") as f:
         json.dump(pending_reminders, f, indent=2, ensure_ascii=False)
     logger.info(f"HITL pending reminders staged: {hitl_path} ({len(pending_reminders)} items)")
 
-    # 5. Generate Rich Markdown Approval Summary for Azure DevOps Run Overview
+    # 4. Generate Interactive Standalone HITL Portal (UI with individual Approve/Reject toggles)
+    overdue_bal = getattr(summary, "total_balance_unpaid", 0.0)
+    summary_metrics = {
+        "run_id": summary.run_id,
+        "completed_at": summary.completed_at,
+        "total_active_leases": summary.total_tenants,
+        "reminders_awaiting_hitl": len(pending_reminders),
+        "promises_on_file": summary.count_promised,
+        "paid_cleared": summary.count_paid,
+        "manual_review_disputes": getattr(summary, "count_flagged", 0),
+        "in_cooldown_grace": summary.count_skipped,
+        "total_overdue_balance": overdue_bal
+    }
+
+    portal_html = generate_hitl_portal_html(
+        pending_reminders=pending_reminders,
+        promises_on_file=promises_on_file,
+        manual_reviews=manual_reviews,
+        paid_cleared=paid_cleared,
+        summary_metrics=summary_metrics
+    )
+    portal_path = os.path.join(output_dir, "hitl_portal.html")
+    with open(portal_path, "w", encoding="utf-8") as f:
+        f.write(portal_html)
+    logger.info(f"Interactive HITL Review Portal generated: {portal_path}")
+
+    # Also sync a copy to web assets directory so http://localhost:8000/hitl.html works
+    web_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
+    if os.path.exists(web_dir):
+        with open(os.path.join(web_dir, "hitl.html"), "w", encoding="utf-8") as f:
+            f.write(portal_html)
+
+    # 5. Generate Standard Reports (HTML & Markdown)
+    html_content = ReportGenerator.generate_html(summary)
+    with open(os.path.join(output_dir, "daily_rent_report.html"), "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+    md_content = ReportGenerator.generate_markdown(summary)
+    with open(os.path.join(output_dir, "daily_rent_report.md"), "w", encoding="utf-8") as f:
+        f.write(md_content)
+
+    # 6. Generate Rich Markdown Approval Summary for Azure DevOps Run Overview
     total_staged_balance = sum(r["balance"] for r in pending_reminders)
     summary_md_lines = [
         "# 🏢 Red Bricks Property Management — Daily HITL Reminders Approval",
@@ -139,7 +201,6 @@ def run_pipeline_evaluate(output_dir: str = "reports") -> Dict[str, Any]:
 
     for idx, r in enumerate(pending_reminders, start=1):
         phones_str = "<br>".join(r["recipient_phones"]) if r["recipient_phones"] else "No phone"
-        # Format message into single cell with markdown breaks
         escaped_sms = r["draft_sms_text"].replace("|", "\\|").replace("\n\n", "<br><br>").replace("\n", "<br>")
         summary_md_lines.append(
             f"| {idx} | **{r['tenant_name']}** | {r['property_unit']} | **${r['balance']:,.2f}** | `{phones_str}` | <span style=\"color:#ef4444;font-weight:bold;\">SEND REMINDER</span> | <pre>{escaped_sms}</pre> |"
@@ -151,17 +212,10 @@ def run_pipeline_evaluate(output_dir: str = "reports") -> Dict[str, Any]:
         "",
         "### 🎯 How to Approve or Exclude in Azure DevOps (Stage 2)",
         "",
-        "1. **To Approve and Send ALL Reminders:**",
-        "   - Click the **Review** button on the `Approve_And_Dispatch_HITL` stage.",
-        "   - Click **Approve**.",
-        "   - All above SMS messages will be immediately delivered through the Quo API.",
-        "",
-        "2. **To Exclude Specific Tenant(s):**",
-        "   - In the approval comments box, specify any tenant name or address to exclude (e.g., `Exclude: Gary Owens`).",
-        "   - Or set the pipeline variable `EXCLUDE_TENANTS` before triggering.",
-        "",
-        "3. **To Reject / Cancel Dispatch:**",
-        "   - Click **Reject**. No SMS messages will be sent.",
+        "1. **Interactive UI Review Portal:** Open `hitl_portal.html` from the **`RentReminderReports`** build artifact for a 1-click **[Approve] / [Reject]** toggle UI.",
+        "2. **To Approve and Send ALL Reminders:** Click the **Review** button on the `Approve_And_Dispatch_HITL` stage → Click **Approve**.",
+        "3. **To Exclude Specific Tenant(s):** Pass their name or address in the `exclude_tenants` parameter (e.g. `Gary Owens`).",
+        "4. **To Reject All:** Click **Reject**.",
         "",
         "*Report automatically compiled by Red Bricks AI Engine.*"
     ])
@@ -171,31 +225,12 @@ def run_pipeline_evaluate(output_dir: str = "reports") -> Dict[str, Any]:
         f.write("\n".join(summary_md_lines))
     logger.info(f"HITL summary markdown written: {hitl_summary_path}")
 
-    # 6. Summary metrics
-    overdue_bal = getattr(summary, "total_balance_unpaid", 0.0)
-    metrics = {
-        "run_id": summary.run_id,
-        "completed_at": summary.completed_at,
-        "total_active_leases": summary.total_tenants,
-        "reminders_awaiting_hitl": len(pending_reminders),
-        "promises_on_file": summary.count_promised,
-        "paid_cleared": summary.count_paid,
-        "manual_review_disputes": getattr(summary, "count_flagged", 0),
-        "in_cooldown_grace": summary.count_skipped,
-        "total_overdue_balance": overdue_bal,
-        "artifacts": {
-            "excel": excel_filename,
-            "html": "daily_rent_report.html",
-            "markdown": "daily_rent_report.md",
-            "hitl_pending_json": "hitl_pending_reminders.json",
-            "hitl_summary_md": "hitl_summary.md"
-        }
-    }
+    # 7. Write summary.json
     summary_path = os.path.join(output_dir, "summary.json")
     with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2)
+        json.dump(summary_metrics, f, indent=2)
 
-    # Print executive summary banner
+    # Print executive banner
     print("\n" + "=" * 70)
     print("  AZURE PIPELINE PART 1: EVALUATION & HITL STAGING COMPLETE")
     print("=" * 70)
@@ -209,14 +244,15 @@ def run_pipeline_evaluate(output_dir: str = "reports") -> Dict[str, Any]:
     print(f"  Total Overdue Balance:    ${total_staged_balance:,.2f}")
     print("-" * 70)
     print(f"  Artifacts saved to:       {os.path.abspath(output_dir)}")
+    print("  - hitl_portal.html            (Interactive Approve/Reject UI)")
     print("  - RBPM_Daily_Rent_Report.xlsx (7 Category Worksheets)")
     print("  - hitl_summary.md             (Uploaded to Azure DevOps Summary)")
     print("  - hitl_pending_reminders.json (Pending Reminders for HITL)")
     print("=" * 70)
-    print("  STATUS: Pausing at HITL Gate. Review table on Azure DevOps Run page to approve.")
+    print("  STATUS: Pausing at HITL Gate. Open hitl_portal.html or Review Table to approve.")
     print("=" * 70 + "\n")
 
-    return metrics
+    return summary_metrics
 
 
 def run_pipeline_dispatch(
@@ -256,6 +292,10 @@ def run_pipeline_dispatch(
             with open(receipts_path, "w", encoding="utf-8") as f:
                 json.dump({"run_id": summary.run_id, "sent": summary.count_reminded}, f, indent=2)
             return {"dispatched": summary.count_reminded}
+
+    # Handle input file containing {"approved_tenants": [...]} from hitl_portal
+    if isinstance(pending_items, dict) and "approved_tenants" in pending_items:
+        pending_items = pending_items["approved_tenants"]
 
     orchestrator = WorkflowOrchestrator()
     dispatch_results = []

@@ -121,6 +121,8 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
             return self._handle_post_send_sms(body)
         elif path == "/api/send-reminder":
             return self._handle_post_send_reminder(body)
+        elif path == "/api/pipeline-dispatch-approved":
+            return self._handle_post_pipeline_dispatch_approved(body)
         elif path == "/api/add-note":
             return self._handle_post_add_note(body)
         elif path == "/api/reset-seed":
@@ -1951,6 +1953,42 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
         res = client.send_sms(tenant_id, t.phone, text, recipient_type=recipient_type)
         self._send_json(res)
 
+    def _handle_post_pipeline_dispatch_approved(self, body: Dict[str, Any]):
+        try:
+            approved = body.get("approved_tenants", [])
+            from src.pipeline import run_pipeline_dispatch
+            import tempfile
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tf:
+                json.dump(approved, tf)
+                temp_path = tf.name
+            receipt = run_pipeline_dispatch(input_file=temp_path)
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+            self._send_json(receipt)
+        except Exception as e:
+            logger.error(f"Failed to dispatch approved: {e}", exc_info=True)
+            self._send_json({"error": str(e)}, 500)
+
+    def _handle_post_pipeline_dispatch_approved(self, body: Dict[str, Any]):
+        try:
+            approved = body.get("approved_tenants", [])
+            from src.pipeline import run_pipeline_dispatch
+            import tempfile
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tf:
+                json.dump(approved, tf)
+                temp_path = tf.name
+            receipt = run_pipeline_dispatch(input_file=temp_path)
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+            self._send_json(receipt)
+        except Exception as e:
+            logger.error(f"Failed to dispatch approved: {e}", exc_info=True)
+            self._send_json({"error": str(e)}, 500)
+
     def _handle_post_send_reminder(self, body: Dict[str, Any]):
         """
         HITL-approved SMS reminder dispatch.

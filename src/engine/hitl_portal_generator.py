@@ -1,0 +1,606 @@
+"""
+Red Bricks Property Management - Interactive HITL Review Portal Generator
+Generates a standalone, responsive, interactive single-file HTML portal (hitl_portal.html)
+allowing property managers to inspect every tenant, view promises & manual reviews,
+toggle Approve/Reject on each reminder, and execute Stage 2 dispatch.
+"""
+
+import os
+import json
+from datetime import datetime
+from typing import List, Dict, Any
+
+
+def generate_hitl_portal_html(
+    pending_reminders: List[Dict[str, Any]],
+    promises_on_file: List[Dict[str, Any]],
+    manual_reviews: List[Dict[str, Any]],
+    paid_cleared: List[Dict[str, Any]],
+    summary_metrics: Dict[str, Any]
+) -> str:
+    """Generates a complete, interactive, self-contained HTML review portal."""
+
+    payload_json = json.dumps({
+        "reminders": pending_reminders,
+        "promises": promises_on_file,
+        "manual_reviews": manual_reviews,
+        "paid": paid_cleared[:100],  # sample first 100 paid
+        "metrics": summary_metrics
+    }, ensure_ascii=False)
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Red Bricks PM — HITL Reminder Approval Portal</title>
+<style>
+  :root {{
+    --bg-base: #0b0f19;
+    --bg-card: #111827;
+    --bg-card-hover: #1e293b;
+    --border: #1e293b;
+    --border-light: #334155;
+    --text-primary: #f8fafc;
+    --text-muted: #94a3b8;
+    --cyan: #38bdf8;
+    --emerald: #10b981;
+    --emerald-bg: rgba(16, 185, 129, 0.15);
+    --rose: #f43f5e;
+    --rose-bg: rgba(244, 63, 94, 0.15);
+    --amber: #f59e0b;
+    --amber-bg: rgba(245, 158, 11, 0.15);
+    --purple: #a855f7;
+  }}
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg-base);
+    color: var(--text-primary);
+    padding: 24px;
+    padding-bottom: 120px;
+    line-height: 1.5;
+  }}
+  .container {{ max-width: 1400px; margin: 0 auto; }}
+
+  /* Header */
+  .header {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 20px 24px;
+    margin-bottom: 24px;
+    box-shadow: 0 10px 25px rgba(0,0,0,0.4);
+  }}
+  .title-group h1 {{ font-size: 22px; font-weight: 800; color: var(--cyan); display: flex; align-items: center; gap: 10px; }}
+  .title-group p {{ font-size: 13px; color: var(--text-muted); margin-top: 4px; }}
+  .run-badge {{
+    background: #0f172a;
+    border: 1px solid var(--border-light);
+    border-radius: 8px;
+    padding: 8px 14px;
+    font-size: 12px;
+    text-align: right;
+  }}
+
+  /* KPI Grid */
+  .kpi-grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+    gap: 14px;
+    margin-bottom: 24px;
+  }}
+  .kpi-card {{
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+  }}
+  .kpi-card:hover {{ border-color: var(--cyan); transform: translateY(-2px); }}
+  .kpi-card.active {{ border-color: var(--cyan); background: #132036; }}
+  .kpi-lbl {{ font-size: 11px; text-transform: uppercase; font-weight: 700; letter-spacing: 0.05em; color: var(--text-muted); }}
+  .kpi-val {{ font-size: 26px; font-weight: 800; margin-top: 6px; }}
+
+  /* Tabs Bar */
+  .tabs-bar {{
+    display: flex;
+    gap: 10px;
+    margin-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 12px;
+    flex-wrap: wrap;
+  }}
+  .tab-btn {{
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    padding: 8px 16px;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 700;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    transition: all 0.15s ease;
+  }}
+  .tab-btn:hover {{ background: var(--bg-card-hover); color: var(--text-primary); }}
+  .tab-btn.active {{ background: var(--cyan); color: #0b0f19; border-color: var(--cyan); }}
+
+  /* Table styling */
+  .table-card {{
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    overflow: hidden;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+  }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 13px; text-align: left; }}
+  thead {{ background: #0c1220; border-bottom: 2px solid var(--border); }}
+  th {{ padding: 14px 16px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; font-size: 11px; letter-spacing: 0.05em; }}
+  tbody tr {{ border-bottom: 1px solid var(--border); transition: background 0.15s ease; }}
+  tbody tr:hover {{ background: rgba(30, 41, 59, 0.5); }}
+  td {{ padding: 14px 16px; vertical-align: top; }}
+
+  /* Status Badges */
+  .badge {{
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 8px;
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 700;
+  }}
+  .badge-danger {{ background: var(--rose-bg); color: var(--rose); border: 1px solid rgba(244,63,94,0.3); }}
+  .badge-success {{ background: var(--emerald-bg); color: var(--emerald); border: 1px solid rgba(16,185,129,0.3); }}
+  .badge-warning {{ background: var(--amber-bg); color: var(--amber); border: 1px solid rgba(245,158,11,0.3); }}
+  .badge-purple {{ background: rgba(168,85,247,0.15); color: var(--purple); border: 1px solid rgba(168,85,247,0.3); }}
+
+  /* Action Switch Buttons */
+  .action-group {{
+    display: inline-flex;
+    background: #0f172a;
+    border: 1px solid var(--border-light);
+    border-radius: 8px;
+    padding: 3px;
+    gap: 3px;
+  }}
+  .action-toggle {{
+    padding: 6px 12px;
+    border-radius: 6px;
+    border: none;
+    font-size: 11.5px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }}
+  .action-toggle.btn-approve {{ background: transparent; color: var(--text-muted); }}
+  .action-toggle.btn-approve.selected {{ background: var(--emerald); color: #0b0f19; }}
+  .action-toggle.btn-reject {{ background: transparent; color: var(--text-muted); }}
+  .action-toggle.btn-reject.selected {{ background: var(--rose); color: #ffffff; }}
+
+  /* SMS Text Preview Card */
+  .sms-preview {{
+    background: #080d1a;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-family: monospace;
+    font-size: 11.5px;
+    color: #cbd5e1;
+    white-space: pre-wrap;
+    max-height: 120px;
+    overflow-y: auto;
+    margin-top: 6px;
+  }}
+
+  /* Floating Bottom Bar */
+  .floating-bar {{
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: rgba(17, 24, 39, 0.95);
+    backdrop-filter: blur(12px);
+    border-top: 1px solid var(--border-light);
+    padding: 16px 32px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    box-shadow: 0 -10px 30px rgba(0,0,0,0.6);
+    z-index: 1000;
+  }}
+  .bar-info {{ font-size: 14px; font-weight: 600; }}
+  .bar-info span {{ color: var(--cyan); }}
+  .btn-dispatch {{
+    background: linear-gradient(135deg, #0284c7 0%, #0369a1 100%);
+    color: #fff;
+    border: none;
+    padding: 12px 28px;
+    border-radius: 10px;
+    font-size: 15px;
+    font-weight: 800;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    box-shadow: 0 4px 15px rgba(2,132,199,0.4);
+    transition: all 0.2s ease;
+  }}
+  .btn-dispatch:hover {{
+    transform: translateY(-2px);
+    box-shadow: 0 6px 20px rgba(2,132,199,0.6);
+    background: linear-gradient(135deg, #0ea5e9 0%, #0284c7 100%);
+  }}
+</style>
+</head>
+<body>
+
+<div class="container">
+  <!-- Header -->
+  <div class="header">
+    <div class="title-group">
+      <h1>🏢 Red Bricks Property Management</h1>
+      <p>HITL Reminder Approval Portal — Review live drafts, toggle approve/reject, and trigger Stage 2 dispatch.</p>
+    </div>
+    <div class="run-badge">
+      <div>Run ID: <strong id="val-run-id">--</strong></div>
+      <div style="color:var(--text-muted);margin-top:2px;" id="val-timestamp">--</div>
+    </div>
+  </div>
+
+  <!-- KPI Grid -->
+  <div class="kpi-grid">
+    <div class="kpi-card active" onclick="switchTab('reminders')">
+      <div class="kpi-lbl">Awaiting Decision</div>
+      <div class="kpi-val" style="color:var(--cyan);" id="kpi-reminders">0</div>
+      <div style="font-size:11px;color:var(--text-muted);margin-top:4px;" id="kpi-reminders-bal">$0.00 overdue</div>
+    </div>
+    <div class="kpi-card" onclick="switchTab('promises')">
+      <div class="kpi-lbl">On Hold (Promises)</div>
+      <div class="kpi-val" style="color:var(--amber);" id="kpi-promises">0</div>
+      <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">Future payment date</div>
+    </div>
+    <div class="kpi-card" onclick="switchTab('manual')">
+      <div class="kpi-lbl">Manual Review / Disputes</div>
+      <div class="kpi-val" style="color:var(--rose);" id="kpi-manual">0</div>
+      <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">Staff follow-up needed</div>
+    </div>
+    <div class="kpi-card" onclick="switchTab('paid')">
+      <div class="kpi-lbl">Paid & Cleared</div>
+      <div class="kpi-val" style="color:var(--emerald);" id="kpi-paid">0</div>
+      <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">$0.00 balance</div>
+    </div>
+  </div>
+
+  <!-- Tabs Bar -->
+  <div class="tabs-bar">
+    <button class="tab-btn active" id="tab-btn-reminders" onclick="switchTab('reminders')">
+      📩 Reminders Needed (<span id="cnt-reminders">0</span>)
+    </button>
+    <button class="tab-btn" id="tab-btn-promises" onclick="switchTab('promises')">
+      🛡️ On Hold — Payment Promised (<span id="cnt-promises">0</span>)
+    </button>
+    <button class="tab-btn" id="tab-btn-manual" onclick="switchTab('manual')">
+      🔴 Manual Review / Disputes (<span id="cnt-manual">0</span>)
+    </button>
+    <button class="tab-btn" id="tab-btn-paid" onclick="switchTab('paid')">
+      ✅ Paid / Cleared (<span id="cnt-paid">0</span>)
+    </button>
+    <div style="margin-left:auto;display:flex;gap:8px;">
+      <button class="tab-btn" onclick="bulkApprove(true)">✅ Approve All</button>
+      <button class="tab-btn" onclick="bulkApprove(false)">❌ Reject All</button>
+    </div>
+  </div>
+
+  <!-- Main Table Container -->
+  <div class="table-card">
+    <table id="main-table">
+      <thead>
+        <tr id="table-head-row">
+          <!-- Dynamically set based on active tab -->
+        </tr>
+      </thead>
+      <tbody id="table-body">
+        <!-- Rendered via JS -->
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Floating Action Bar -->
+<div class="floating-bar">
+  <div class="bar-info">
+    HITL Decisions: 
+    <span id="summary-approved" style="color:var(--emerald);font-weight:800;">0 Approved</span> &bull; 
+    <span id="summary-rejected" style="color:var(--rose);font-weight:800;">0 Rejected</span> &bull; 
+    Total Dispatch Sum: <span id="summary-amount">$0.00</span>
+  </div>
+  <button class="btn-dispatch" onclick="executeStage2()">
+    <span>🚀 Execute Stage 2: Dispatch Approved Reminders</span>
+  </button>
+</div>
+
+<script>
+const DATA = {payload_json};
+
+let activeTab = 'reminders';
+let decisionsState = {{}}; // tenant_id -> 'APPROVE' | 'REJECT'
+
+function init() {{
+  document.getElementById('val-run-id').textContent = DATA.metrics.run_id || 'run_latest';
+  document.getElementById('val-timestamp').textContent = (DATA.metrics.completed_at || new Date().toISOString()).slice(0, 19) + ' UTC';
+
+  document.getElementById('kpi-reminders').textContent = DATA.reminders.length;
+  document.getElementById('cnt-reminders').textContent = DATA.reminders.length;
+  const remBal = DATA.reminders.reduce((s, r) => s + (r.balance || 0), 0);
+  document.getElementById('kpi-reminders-bal').textContent = '$' + remBal.toLocaleString(undefined, {{minimumFractionDigits:2, maximumFractionDigits:2}}) + ' overdue';
+
+  document.getElementById('kpi-promises').textContent = DATA.promises.length;
+  document.getElementById('cnt-promises').textContent = DATA.promises.length;
+
+  document.getElementById('kpi-manual').textContent = DATA.manual_reviews.length;
+  document.getElementById('cnt-manual').textContent = DATA.manual_reviews.length;
+
+  document.getElementById('kpi-paid').textContent = DATA.metrics.paid_cleared || (DATA.paid ? DATA.paid.length : 0);
+  document.getElementById('cnt-paid').textContent = DATA.metrics.paid_cleared || (DATA.paid ? DATA.paid.length : 0);
+
+  // Initialize decisions: default APPROVE for all reminders
+  DATA.reminders.forEach(r => {{
+    decisionsState[r.tenant_id] = 'APPROVE';
+  }});
+
+  updateFloatingBar();
+  render();
+}}
+
+function switchTab(tab) {{
+  activeTab = tab;
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.kpi-card').forEach(c => c.classList.remove('active'));
+
+  const btn = document.getElementById('tab-btn-' + tab);
+  if (btn) btn.classList.add('active');
+
+  const cardIdx = tab === 'reminders' ? 0 : (tab === 'promises' ? 1 : (tab === 'manual' ? 2 : 3));
+  const cards = document.querySelectorAll('.kpi-card');
+  if (cards[cardIdx]) cards[cardIdx].classList.add('active');
+
+  render();
+}}
+
+function toggleDecision(tid, choice) {{
+  decisionsState[tid] = choice;
+  const row = document.getElementById('row-' + tid);
+  if (row) {{
+    const btnApp = row.querySelector('.btn-approve');
+    const btnRej = row.querySelector('.btn-reject');
+    if (choice === 'APPROVE') {{
+      btnApp.classList.add('selected');
+      btnRej.classList.remove('selected');
+      row.style.opacity = '1';
+    }} else {{
+      btnApp.classList.remove('selected');
+      btnRej.classList.add('selected');
+      row.style.opacity = '0.55';
+    }}
+  }}
+  updateFloatingBar();
+}}
+
+function bulkApprove(isApprove) {{
+  DATA.reminders.forEach(r => {{
+    decisionsState[r.tenant_id] = isApprove ? 'APPROVE' : 'REJECT';
+  }});
+  render();
+  updateFloatingBar();
+}}
+
+function updateFloatingBar() {{
+  let approvedCount = 0;
+  let rejectedCount = 0;
+  let approvedSum = 0;
+
+  DATA.reminders.forEach(r => {{
+    if (decisionsState[r.tenant_id] === 'APPROVE') {{
+      approvedCount++;
+      approvedSum += (r.balance || 0);
+    }} else {{
+      rejectedCount++;
+    }}
+  }});
+
+  document.getElementById('summary-approved').textContent = approvedCount + ' Approved';
+  document.getElementById('summary-rejected').textContent = rejectedCount + ' Rejected';
+  document.getElementById('summary-amount').textContent = '$' + approvedSum.toLocaleString(undefined, {{minimumFractionDigits:2, maximumFractionDigits:2}});
+}}
+
+function render() {{
+  const thead = document.getElementById('table-head-row');
+  const tbody = document.getElementById('table-body');
+  tbody.innerHTML = '';
+
+  if (activeTab === 'reminders') {{
+    thead.innerHTML = `
+      <th style="width:50px;">#</th>
+      <th style="width:220px;">Tenant & Lease</th>
+      <th style="width:200px;">Property & Unit</th>
+      <th style="width:120px;text-align:right;">Balance</th>
+      <th style="width:160px;">Phone Number(s)</th>
+      <th style="width:160px;text-align:center;">HITL Decision</th>
+      <th>Drafted SMS Message</th>
+    `;
+
+    DATA.reminders.forEach((r, idx) => {{
+      const choice = decisionsState[r.tenant_id] || 'APPROVE';
+      const tr = document.createElement('tr');
+      tr.id = 'row-' + r.tenant_id;
+      if (choice === 'REJECT') tr.style.opacity = '0.55';
+
+      const phonesList = (Array.isArray(r.recipient_phones) ? r.recipient_phones : [r.recipient_phones]).join('<br>');
+
+      tr.innerHTML = `
+        <td style="color:var(--text-muted);font-weight:700;">${{idx + 1}}</td>
+        <td>
+          <div style="font-weight:700;color:var(--text-primary);">${{r.tenant_name}}</div>
+          <div style="font-size:11px;color:var(--cyan);font-family:monospace;margin-top:2px;">Lease #${{r.lease_id || r.tenant_id}}</div>
+        </td>
+        <td>
+          <div style="color:var(--text-primary);font-weight:600;">${{r.property_unit}}</div>
+          <div style="font-size:11px;color:var(--text-muted);margin-top:2px;">Due: ${{r.due_date || 'Past Due'}}</div>
+        </td>
+        <td style="text-align:right;">
+          <div style="font-weight:800;color:var(--rose);font-size:14px;">$${{(r.balance || 0).toLocaleString(undefined, {{minimumFractionDigits:2, maximumFractionDigits:2}})}}</div>
+        </td>
+        <td>
+          <div style="font-family:monospace;font-size:11.5px;color:var(--cyan);">${{phonesList}}</div>
+        </td>
+        <td style="text-align:center;">
+          <div class="action-group">
+            <button class="action-toggle btn-approve ${{choice === 'APPROVE' ? 'selected' : ''}}" onclick="toggleDecision('${{r.tenant_id}}', 'APPROVE')">
+              ✅ Send
+            </button>
+            <button class="action-toggle btn-reject ${{choice === 'REJECT' ? 'selected' : ''}}" onclick="toggleDecision('${{r.tenant_id}}', 'REJECT')">
+              ❌ Skip
+            </button>
+          </div>
+        </td>
+        <td>
+          <div class="sms-preview">${{escapeHtml(r.draft_sms_text || '')}}</div>
+        </td>
+      `;
+      tbody.appendChild(tr);
+    }});
+
+  }} else if (activeTab === 'promises') {{
+    thead.innerHTML = `
+      <th style="width:50px;">#</th>
+      <th style="width:220px;">Tenant Name</th>
+      <th style="width:220px;">Property & Unit</th>
+      <th style="width:120px;text-align:right;">Balance</th>
+      <th style="width:160px;">Promise Date</th>
+      <th>Classification & Status Notes</th>
+    `;
+    DATA.promises.forEach((p, idx) => {{
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td style="color:var(--text-muted);font-weight:700;">${{idx + 1}}</td>
+        <td><strong>${{p.tenant_name}}</strong></td>
+        <td>${{p.property_unit}}</td>
+        <td style="text-align:right;font-weight:700;color:var(--amber);">$${{(p.balance || 0).toLocaleString(undefined, {{minimumFractionDigits:2, maximumFractionDigits:2}})}}</td>
+        <td><span class="badge badge-warning">🛡️ ${{p.due_date || 'Promised'}}</span></td>
+        <td style="color:var(--text-muted);">${{p.reason || 'Payment commitment on file — reminders held until date'}}</td>
+      `;
+      tbody.appendChild(tr);
+    }});
+
+  }} else if (activeTab === 'manual') {{
+    thead.innerHTML = `
+      <th style="width:50px;">#</th>
+      <th style="width:220px;">Tenant Name</th>
+      <th style="width:220px;">Property & Unit</th>
+      <th style="width:120px;text-align:right;">Balance</th>
+      <th style="width:160px;">Flag Type</th>
+      <th>Dispute Details & Staff Notes</th>
+    `;
+    DATA.manual_reviews.forEach((m, idx) => {{
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td style="color:var(--text-muted);font-weight:700;">${{idx + 1}}</td>
+        <td><strong>${{m.tenant_name}}</strong></td>
+        <td>${{m.property_unit}}</td>
+        <td style="text-align:right;font-weight:700;color:var(--rose);">$${{(m.balance || 0).toLocaleString(undefined, {{minimumFractionDigits:2, maximumFractionDigits:2}})}}</td>
+        <td><span class="badge badge-danger">🔴 Manual Review</span></td>
+        <td style="color:#cbd5e1;">${{m.reason || 'Flagged for staff follow-up'}}</td>
+      `;
+      tbody.appendChild(tr);
+    }});
+
+  }} else if (activeTab === 'paid') {{
+    thead.innerHTML = `
+      <th style="width:50px;">#</th>
+      <th style="width:220px;">Tenant Name</th>
+      <th style="width:220px;">Property & Unit</th>
+      <th style="width:120px;text-align:right;">Balance</th>
+      <th>Status</th>
+    `;
+    DATA.paid.forEach((pd, idx) => {{
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td style="color:var(--text-muted);font-weight:700;">${{idx + 1}}</td>
+        <td>${{pd.tenant_name}}</td>
+        <td>${{pd.property_unit}}</td>
+        <td style="text-align:right;font-weight:700;color:var(--emerald);">$0.00</td>
+        <td><span class="badge badge-success">✅ Paid & Cleared</span></td>
+      `;
+      tbody.appendChild(tr);
+    }});
+  }}
+}}
+
+function executeStage2() {{
+  const approvedList = DATA.reminders.filter(r => decisionsState[r.tenant_id] === 'APPROVE');
+  const rejectedList = DATA.reminders.filter(r => decisionsState[r.tenant_id] === 'REJECT');
+
+  if (approvedList.length === 0) {{
+    alert('No tenants are selected for dispatch. Please select at least one tenant to approve.');
+    return;
+  }}
+
+  const confirmMsg = `Confirm Stage 2 Execution:\\n\\n` +
+    `• Dispatching to: ${{approvedList.length}} tenants\\n` +
+    `• Skipping: ${{rejectedList.length}} rejected tenants\\n\\n` +
+    `Do you want to proceed with executing the reminder dispatch?`;
+
+  if (!confirm(confirmMsg)) return;
+
+  // 1. Download approved JSON payload
+  const approvedPayload = {{
+    approved_at: new Date().toISOString(),
+    total_approved: approvedList.length,
+    total_rejected: rejectedList.length,
+    approved_tenants: approvedList,
+    rejected_tenants: rejectedList,
+    exclude_filter_string: rejectedList.map(r => r.tenant_name).join(', ')
+  }};
+
+  const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(approvedPayload, null, 2));
+  const downloadAnchor = document.createElement('a');
+  downloadAnchor.setAttribute("href", dataStr);
+  downloadAnchor.setAttribute("download", "hitl_approved_dispatch.json");
+  document.body.appendChild(downloadAnchor);
+  downloadAnchor.click();
+  downloadAnchor.remove();
+
+  // 2. Trigger dispatch API if server running
+  fetch('/api/pipeline-dispatch-approved', {{
+    method: 'POST',
+    headers: {{ 'Content-Type': 'application/json' }},
+    body: JSON.stringify(approvedPayload)
+  }})
+  .then(res => res.json())
+  .then(data => {{
+    alert('🚀 Stage 2 Execution Started!\\n\\nSuccessfully dispatched ' + (data.successfully_sent || approvedList.length) + ' reminders via Quo API.');
+  }})
+  .catch(err => {{
+    alert('Stage 2 Approved List Generated!\\n\\nSaved to hitl_approved_dispatch.json.\\nTo run via Azure CLI or Terminal:\\npython main.py pipeline-dispatch --input-file hitl_approved_dispatch.json');
+  }});
+}}
+
+function escapeHtml(text) {{
+  const map = {{ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }};
+  return text.replace(/[&<>"']/g, m => map[m]);
+}}
+
+window.addEventListener('DOMContentLoaded', init);
+</script>
+</body>
+</html>
+"""
+
