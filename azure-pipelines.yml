@@ -18,6 +18,12 @@ schedules:
 trigger: none
 pr: none
 
+parameters:
+  - name: exclude_tenants
+    displayName: "Exclusions: Names, Lease IDs, or Units to SKIP (comma-separated, leave empty to send all)"
+    type: string
+    default: ""
+
 variables:
   # Variable Group containing secrets configured in Azure DevOps:
   # Pipelines -> Library -> Variable Groups -> redbricks-secrets
@@ -53,6 +59,8 @@ stages:
 
           - script: |
               python main.py pipeline-evaluate --output-dir $(Build.ArtifactStagingDirectory)/reports
+              # Upload rich Markdown table directly to the Azure DevOps Pipeline Run Overview page
+              echo "##vso[task.uploadsummary]$(Build.ArtifactStagingDirectory)/reports/hitl_summary.md"
             workingDirectory: $(System.DefaultWorkingDirectory)
             displayName: "Run Daily Evaluation & Stage HITL Reminders"
             env:
@@ -121,7 +129,8 @@ stages:
                 - script: |
                     python main.py pipeline-dispatch \
                       --input-file $(Pipeline.Workspace)/RentReminderReports/hitl_pending_reminders.json \
-                      --output-dir $(Build.ArtifactStagingDirectory)/receipts
+                      --output-dir $(Build.ArtifactStagingDirectory)/receipts \
+                      --exclude-tenants "${{ parameters.exclude_tenants }}"
                   workingDirectory: $(System.DefaultWorkingDirectory)
                   displayName: "Dispatch Approved SMS via Quo API & Record Cooldowns"
                   env:
