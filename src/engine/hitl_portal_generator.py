@@ -6,9 +6,7 @@ toggle Approve/Reject on each reminder, and execute Stage 2 dispatch.
 """
 
 import os
-import re
 import json
-from datetime import datetime
 from typing import List, Dict, Any
 
 
@@ -49,11 +47,15 @@ def generate_hitl_portal_html(
                 pass
 
     if template_html:
-        # Safely inject the live payload JSON without f-string formatting bugs
-        data_statement = f"const DATA = {payload_json};"
-        if "const DATA =" in template_html:
-            return re.sub(r'const DATA = \{.*?\};\n', data_statement + "\n", template_html, count=1, flags=re.DOTALL)
-        return template_html.replace("</head>", f"<script>{data_statement}</script></head>")
+        # Use exact string replacement (NOT re.sub) to avoid Python re backslash mangling of \n in JSON
+        if "/*__PAYLOAD_PLACEHOLDER__*/" in template_html:
+            return template_html.replace("/*__PAYLOAD_PLACEHOLDER__*/", payload_json)
+        elif "const DATA =" in template_html:
+            idx1 = template_html.find("const DATA =")
+            idx2 = template_html.find("let activeTab =", idx1)
+            if idx2 != -1:
+                return template_html[:idx1] + "const DATA = " + payload_json + ";\n\n" + template_html[idx2:]
+        return template_html.replace("</head>", f"<script>const DATA = {payload_json};</script></head>")
 
     # Fallback minimal HTML if template is not found
     return f"""<!DOCTYPE html>
