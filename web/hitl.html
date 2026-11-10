@@ -523,14 +523,22 @@ function executeStage2() {
     return;
   }
 
-  const confirmMsg = `Confirm Stage 2 Execution:\n\n` +
-    `• Dispatching to: ${approvedList.length} tenants\n` +
-    `• Skipping: ${rejectedList.length} rejected tenants\n\n` +
-    `Do you want to proceed with executing the reminder dispatch?`;
+  const namesList = approvedList.map(r => '• ' + r.tenant_name + ' (' + r.property_unit + ')').join('\n');
+  const confirmMsg = 'Confirm Stage 2 Reminder Dispatch:\n\n' +
+    '• Sending reminders to (' + approvedList.length + ') approved tenant(s):\n' + namesList + '\n\n' +
+    '• Skipping (' + rejectedList.length + ') rejected tenant(s).\n\n' +
+    'Do you want to dispatch SMS via Quo now?';
 
   if (!confirm(confirmMsg)) return;
 
-  // 1. Download approved JSON payload
+  const btn = document.querySelector('.btn-dispatch');
+  const origBtnHtml = btn ? btn.innerHTML : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span>⏳ Dispatching Reminders via Quo API...</span>';
+    btn.style.opacity = '0.7';
+  }
+
   const approvedPayload = {
     approved_at: new Date().toISOString(),
     total_approved: approvedList.length,
@@ -540,26 +548,40 @@ function executeStage2() {
     exclude_filter_string: rejectedList.map(r => r.tenant_name).join(', ')
   };
 
-  const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(approvedPayload, null, 2));
-  const downloadAnchor = document.createElement('a');
-  downloadAnchor.setAttribute("href", dataStr);
-  downloadAnchor.setAttribute("download", "hitl_approved_dispatch.json");
-  document.body.appendChild(downloadAnchor);
-  // downloadAnchor.click();
-  downloadAnchor.remove();
+  const apiUrl = (window.location.origin.includes(':8000'))
+    ? '/api/pipeline-dispatch-approved'
+    : 'http://localhost:8000/api/pipeline-dispatch-approved';
 
-  // 2. Trigger dispatch API if server running
-  fetch('/api/pipeline-dispatch-approved', {
+  fetch(apiUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(approvedPayload)
   })
-  .then(res => res.json())
+  .then(res => {
+    if (!res.ok) throw new Error('HTTP error ' + res.status);
+    return res.json();
+  })
   .then(data => {
-    alert('🚀 Stage 2 Execution Started!\n\nSuccessfully dispatched ' + (data.successfully_sent || approvedList.length) + ' reminders via Quo API.');
+    const sentCount = (data.successfully_sent !== undefined) ? data.successfully_sent : approvedList.length;
+    alert('🚀 Stage 2 Reminders Dispatched!\n\n' +
+          '• Successfully sent: ' + sentCount + ' SMS reminders via Quo API\n' +
+          '• Skipped: ' + rejectedList.length + ' tenant(s)\n\n' +
+          'Cooldown history and audit logs have been recorded in the database.');
+    if (btn) {
+      btn.innerHTML = '<span>✅ Dispatched (' + sentCount + ') Reminders</span>';
+      btn.style.background = 'linear-gradient(135deg, #059669 0%, #10b981 100%)';
+    }
   })
   .catch(err => {
-    alert('Stage 2 Approved List Generated!\n\nSaved to hitl_approved_dispatch.json.\nTo run via Azure CLI or Terminal:\npython main.py pipeline-dispatch --input-file hitl_approved_dispatch.json');
+    alert('⚠️ Could not connect to Red Bricks backend server on port 8000.\n\n' +
+          'Details: ' + err.message + '\n\n' +
+          'Please ensure the server is running:\n' +
+          'python main.py serve');
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = origBtnHtml;
+      btn.style.opacity = '1';
+    }
   });
 }
 
