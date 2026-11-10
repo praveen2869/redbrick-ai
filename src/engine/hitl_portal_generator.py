@@ -560,37 +560,19 @@ function executeStage2() {{
 
   if (!confirm(confirmMsg)) return;
 
-  // 1. Download approved JSON payload
-  const approvedPayload = {{
-    approved_at: new Date().toISOString(),
-    total_approved: approvedList.length,
-    total_rejected: rejectedList.length,
-    approved_tenants: approvedList,
-    rejected_tenants: rejectedList,
-    exclude_filter_string: rejectedList.map(r => r.tenant_name).join(', ')
-  }};
-
-  const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(approvedPayload, null, 2));
-  const downloadAnchor = document.createElement('a');
-  downloadAnchor.setAttribute("href", dataStr);
-  downloadAnchor.setAttribute("download", "hitl_approved_dispatch.json");
-  document.body.appendChild(downloadAnchor);
-  downloadAnchor.click();
-  downloadAnchor.remove();
-
-  // 2. Trigger dispatch API if server running
-  fetch('/api/pipeline-dispatch-approved', {{
+  // Trigger dispatch API if server running
+  fetch('/api/pipeline-dispatch-approved', {
     method: 'POST',
-    headers: {{ 'Content-Type': 'application/json' }},
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(approvedPayload)
-  }})
+  })
   .then(res => res.json())
-  .then(data => {{
-    alert('🚀 Stage 2 Execution Started!\\n\\nSuccessfully dispatched ' + (data.successfully_sent || approvedList.length) + ' reminders via Quo API.');
-  }})
-  .catch(err => {{
-    alert('Stage 2 Approved List Generated!\\n\\nSaved to hitl_approved_dispatch.json.\\nTo run via Azure CLI or Terminal:\\npython main.py pipeline-dispatch --input-file hitl_approved_dispatch.json');
-  }});
+  .then(data => {
+    alert('🚀 Stage 2 Execution Triggered!\n\nDispatched ' + (data.successfully_sent || approvedList.length) + ' reminders via Quo API.');
+  })
+  .catch(err => {
+    alert('Stage 2 can be approved directly in Azure DevOps by clicking [Approve] on the pipeline run.');
+  });
 }}
 
 function escapeHtml(text) {{

@@ -545,7 +545,7 @@ function executeStage2() {
   downloadAnchor.setAttribute("href", dataStr);
   downloadAnchor.setAttribute("download", "hitl_approved_dispatch.json");
   document.body.appendChild(downloadAnchor);
-  downloadAnchor.click();
+  // downloadAnchor.click();
   downloadAnchor.remove();
 
   // 2. Trigger dispatch API if server running
