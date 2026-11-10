@@ -1,0 +1,148 @@
+# =============================================================================
+# Red Bricks Property Management - AI Rent Reminder Daily Scheduled Pipeline
+# Multi-Stage Azure Pipeline with Human-In-The-Loop (HITL) Approval Gate
+# =============================================================================
+
+name: $(Date:yyyyMMdd)$(Rev:.r)-Daily-Rent-Reminder
+
+# 1. Scheduled Trigger: 8:00 AM EST (13:00 UTC) every day
+schedules:
+  - cron: '0 13 * * *'
+    displayName: 'Daily 8:00 AM EST Rent Reminder Schedule'
+    branches:
+      include:
+        - main
+    always: true
+
+# 2. Allow manual execution from Azure DevOps UI ("Run pipeline" button)
+trigger: none
+pr: none
+
+variables:
+  # Variable Group containing secrets configured in Azure DevOps:
+  # Pipelines -> Library -> Variable Groups -> redbricks-secrets
+  - group: redbricks-secrets
+  - name: PYTHON_VERSION
+    value: '3.12'
+
+stages:
+  # ===========================================================================
+  # PART 1: EVALUATE & STAGE HITL DRAFTS (Runs automatically till HITL)
+  # ===========================================================================
+  - stage: Evaluate_And_Generate_HITL
+    displayName: "Part 1: Evaluate Portfolio & Stage HITL Drafts"
+    jobs:
+      - job: EvaluateJob
+        displayName: "Evaluate Eligibility & Generate Executive Reports"
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+            displayName: "Checkout Repository"
+
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: $(PYTHON_VERSION)
+            displayName: "Use Python $(PYTHON_VERSION)"
+
+          - script: |
+              python -m pip install --upgrade pip
+              pip install -r requirements.txt
+            workingDirectory: $(System.DefaultWorkingDirectory)
+            displayName: "Install Project Dependencies"
+
+          - script: |
+              python main.py pipeline-evaluate --output-dir $(Build.ArtifactStagingDirectory)/reports
+            workingDirectory: $(System.DefaultWorkingDirectory)
+            displayName: "Run Daily Evaluation & Stage HITL Reminders"
+            env:
+              ENVIRONMENT: "production"
+              RENTVINE_API_KEY: $(RENTVINE_API_KEY)
+              RENTVINE_API_SECRET: $(RENTVINE_API_SECRET)
+              RENTVINE_API_BASE_URL: $(RENTVINE_API_BASE_URL)
+              RENTVINE_BEARER_TOKEN: $(RENTVINE_BEARER_TOKEN)
+              RENTVINE_MOCK_MODE: $(RENTVINE_MOCK_MODE)
+              QUO_API_KEY: $(QUO_API_KEY)
+              QUO_DEFAULT_PHONE_NUMBER_ID: $(QUO_DEFAULT_PHONE_NUMBER_ID)
+              QUO_PHONE_NUMBER_TENANTS: $(QUO_PHONE_NUMBER_TENANTS)
+              QUO_PHONE_NUMBER_LANDLORDS: $(QUO_PHONE_NUMBER_LANDLORDS)
+              QUO_PHONE_NUMBER_PRIMARY: $(QUO_PHONE_NUMBER_PRIMARY)
+              QUO_MOCK_MODE: $(QUO_MOCK_MODE)
+              AI_PROVIDER: $(AI_PROVIDER)
+              AI_MODEL: $(AI_MODEL)
+              ANTHROPIC_API_KEY: $(ANTHROPIC_API_KEY)
+              GMAIL_MOCK_MODE: $(GMAIL_MOCK_MODE)
+
+          # Publish complete reports and staged drafts to Azure Pipeline Artifacts
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/reports'
+              artifact: 'RentReminderReports'
+              publishLocation: 'pipeline'
+            displayName: "Publish Reports & HITL Artifacts (.xlsx, .html, .json)"
+
+  # ===========================================================================
+  # PART 2: HUMAN-IN-THE-LOOP (HITL) APPROVAL & QUO DISPATCH
+  # ===========================================================================
+  - stage: Approve_And_Dispatch_HITL
+    displayName: "Part 2: HITL Approval & Quo SMS Dispatch"
+    dependsOn: Evaluate_And_Generate_HITL
+    condition: succeeded('Evaluate_And_Generate_HITL')
+    jobs:
+      - deployment: DispatchJob
+        displayName: "HITL Approval Gate & Send Reminders"
+        pool:
+          vmImage: 'ubuntu-latest'
+        # Targets Azure DevOps Environment 'Rent-Reminder-HITL'
+        # Configured in: Pipelines -> Environments -> Rent-Reminder-HITL -> Approvals and Checks -> Add Approver
+        environment: 'Rent-Reminder-HITL'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  displayName: "Checkout Repository"
+
+                - task: UsePythonVersion@0
+                  inputs:
+                    versionSpec: $(PYTHON_VERSION)
+                  displayName: "Use Python $(PYTHON_VERSION)"
+
+                - script: |
+                    python -m pip install --upgrade pip
+                    pip install -r requirements.txt
+                  workingDirectory: $(System.DefaultWorkingDirectory)
+                  displayName: "Install Project Dependencies"
+
+                # Download the staged drafts and reports from Part 1
+                - download: current
+                  artifact: 'RentReminderReports'
+                  displayName: "Download Staged HITL Drafts Artifact"
+
+                - script: |
+                    python main.py pipeline-dispatch \
+                      --input-file $(Pipeline.Workspace)/RentReminderReports/hitl_pending_reminders.json \
+                      --output-dir $(Build.ArtifactStagingDirectory)/receipts
+                  workingDirectory: $(System.DefaultWorkingDirectory)
+                  displayName: "Dispatch Approved SMS via Quo API & Record Cooldowns"
+                  env:
+                    ENVIRONMENT: "production"
+                    RENTVINE_API_KEY: $(RENTVINE_API_KEY)
+                    RENTVINE_API_SECRET: $(RENTVINE_API_SECRET)
+                    RENTVINE_API_BASE_URL: $(RENTVINE_API_BASE_URL)
+                    RENTVINE_BEARER_TOKEN: $(RENTVINE_BEARER_TOKEN)
+                    RENTVINE_MOCK_MODE: $(RENTVINE_MOCK_MODE)
+                    QUO_API_KEY: $(QUO_API_KEY)
+                    QUO_DEFAULT_PHONE_NUMBER_ID: $(QUO_DEFAULT_PHONE_NUMBER_ID)
+                    QUO_PHONE_NUMBER_TENANTS: $(QUO_PHONE_NUMBER_TENANTS)
+                    QUO_PHONE_NUMBER_LANDLORDS: $(QUO_PHONE_NUMBER_LANDLORDS)
+                    QUO_PHONE_NUMBER_PRIMARY: $(QUO_PHONE_NUMBER_PRIMARY)
+                    QUO_MOCK_MODE: $(QUO_MOCK_MODE)
+
+                # Publish final dispatch receipts
+                - task: PublishPipelineArtifact@1
+                  inputs:
+                    targetPath: '$(Build.ArtifactStagingDirectory)/receipts'
+                    artifact: 'DispatchReceipts'
+                    publishLocation: 'pipeline'
+                  displayName: "Publish Dispatch Delivery Receipts"

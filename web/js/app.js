@@ -1556,9 +1556,18 @@ class AppController {
   }
 
   async openReportModal() {
+    // 1. Automatically trigger executive Excel report download
+    const downloadLink = document.createElement("a");
+    downloadLink.href = "/api/export-excel";
+    downloadLink.setAttribute("download", "");
+    document.body.appendChild(downloadLink);
+    downloadLink.click();
+    document.body.removeChild(downloadLink);
+
+    // 2. Open report modal to display preview
     this.reportModal.classList.add("open");
     const body = document.getElementById("report-modal-body");
-    body.innerHTML = `<div style="text-align:center;padding:40px;color:var(--text-muted);">Generating executive report...</div>`;
+    body.innerHTML = `<div style="text-align:center;padding:40px;color:var(--text-muted);">Downloading executive Excel report (.xlsx) and generating summary...</div>`;
 
     try {
       const res = await fetch("/api/latest-report?format=html");

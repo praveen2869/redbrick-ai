@@ -52,6 +52,15 @@ def main():
     # Command: report (prints latest daily report)
     subparsers.add_parser("report", help="Generate and print daily markdown report")
 
+    # Command: pipeline-evaluate (Azure Pipeline Part 1: Evaluates portfolio, generates reports & stages HITL drafts)
+    pipe_eval_parser = subparsers.add_parser("pipeline-evaluate", help="Azure Pipeline Part 1: Evaluate & Stage HITL Drafts")
+    pipe_eval_parser.add_argument("--output-dir", default="reports", help="Directory where reports & artifacts are written")
+
+    # Command: pipeline-dispatch (Azure Pipeline Part 2: Dispatches approved reminders)
+    pipe_disp_parser = subparsers.add_parser("pipeline-dispatch", help="Azure Pipeline Part 2: Dispatch Approved Reminders via Quo")
+    pipe_disp_parser.add_argument("--input-file", default=None, help="Path to hitl_pending_reminders.json file")
+    pipe_disp_parser.add_argument("--output-dir", default="receipts", help="Directory where dispatch receipts are written")
+
     args = parser.parse_args()
 
     if args.command == "serve" or args.command is None:
@@ -80,6 +89,14 @@ def main():
         orchestrator = WorkflowOrchestrator()
         summary = orchestrator.execute_daily_run(is_dry_run=True)
         print(ReportGenerator.generate_markdown(summary))
+
+    elif args.command == "pipeline-evaluate":
+        from src.pipeline import run_pipeline_evaluate
+        run_pipeline_evaluate(output_dir=args.output_dir)
+
+    elif args.command == "pipeline-dispatch":
+        from src.pipeline import run_pipeline_dispatch
+        run_pipeline_dispatch(input_file=args.input_file, output_dir=args.output_dir)
 
 
 if __name__ == "__main__":

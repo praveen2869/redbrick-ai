@@ -114,6 +114,9 @@ class ReportGenerator:
     <div style="text-align:right;">
       {mode_badge}
       <div style="color:#64748b;font-size:12px;margin-top:6px;">{summary.completed_at[:19]} UTC</div>
+      <div style="margin-top:8px;">
+        <a href="/api/export-excel" style="display:inline-block;padding:6px 14px;background:#38bdf8;color:#0f172a;text-decoration:none;font-weight:700;font-size:12px;border-radius:6px;box-shadow:0 2px 6px rgba(56,189,248,0.3);">📥 Download Excel (.xlsx)</a>
+      </div>
     </div>
   </div>
 

@@ -84,6 +84,8 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
             return self._handle_get_tenant_detail(tenant_id)
         elif path == "/api/runs":
             return self._handle_get_runs()
+        elif path in ("/api/export-excel", "/api/daily-report-excel"):
+            return self._handle_get_export_excel()
         elif path == "/api/latest-report":
             return self._handle_get_latest_report(query)
         elif path == "/api/settings":
@@ -582,6 +584,29 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
         runs = db.get_recent_runs(limit=20)
         self._send_json({"runs": runs})
 
+    def _handle_get_export_excel(self):
+        """
+        Generates and serves the complete multi-tab executive Excel (.xlsx) report
+        matching the 6 dashboard categories + Summary sheet.
+        """
+        try:
+            from src.engine.excel_exporter import export_daily_report_to_bytes
+            excel_bytes = export_daily_report_to_bytes()
+            now_str = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            filename = f"RBPM_Daily_Rent_Report_{now_str}.xlsx"
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Content-Length", str(len(excel_bytes)))
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self._send_cors_headers()
+            self.end_headers()
+            self.wfile.write(excel_bytes)
+        except Exception as e:
+            logger.error(f"Error generating daily Excel report: {e}", exc_info=True)
+            self._send_json({"error": f"Failed to generate Excel report: {str(e)}"}, 500)
+
     def _handle_get_latest_report(self, query: Dict[str, Any]):
         runs = db.get_recent_runs(limit=1)
         if not runs:
@@ -591,7 +616,9 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
         # Reconstruct DailyRunSummary for HTML or markdown output
         format_type = query.get("format", ["json"])[0]
 
-        if format_type == "html":
+        if format_type in ("excel", "xlsx"):
+            return self._handle_get_export_excel()
+        elif format_type == "html":
             # Return raw HTML
             summary = self.orchestrator.execute_daily_run(is_dry_run=True)
             html_content = ReportGenerator.generate_html(summary)
