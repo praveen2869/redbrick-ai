@@ -19,8 +19,12 @@ trigger: none
 pr: none
 
 parameters:
+  - name: approved_tenants
+    displayName: "Approved Tenants ONLY: Names, Lease IDs, or Units to SEND (comma-separated, leave empty to approve all pending except exclusions)"
+    type: string
+    default: ""
   - name: exclude_tenants
-    displayName: "Exclusions: Names, Lease IDs, or Units to SKIP (comma-separated, leave empty to send all)"
+    displayName: "Exclusions: Names, Lease IDs, or Units to SKIP (comma-separated, leave empty to send all approved)"
     type: string
     default: ""
 
@@ -33,7 +37,7 @@ variables:
 
 stages:
   # ===========================================================================
-  # PART 1: EVALUATE & STAGE HITL DRAFTS (Runs automatically till HITL)
+  # PART 1: EVALUATE & STAGE HITL DRAFTS (Runs automatically till HITL pause)
   # ===========================================================================
   - stage: Evaluate_And_Generate_HITL
     displayName: "Part 1: Evaluate Portfolio & Stage HITL Drafts"
@@ -58,13 +62,15 @@ stages:
             displayName: "Install Project Dependencies"
 
           - script: |
-              python main.py pipeline-evaluate --output-dir $(Build.ArtifactStagingDirectory)/reports
+              mkdir -p "$(Build.ArtifactStagingDirectory)/reports"
+              python main.py pipeline-evaluate --output-dir "$(Build.ArtifactStagingDirectory)/reports"
               # Upload rich Markdown table directly to the Azure DevOps Pipeline Run Overview page
               echo "##vso[task.uploadsummary]$(Build.ArtifactStagingDirectory)/reports/hitl_summary.md"
             workingDirectory: $(System.DefaultWorkingDirectory)
             displayName: "Run Daily Evaluation & Stage HITL Reminders"
             env:
               ENVIRONMENT: "production"
+              DATABASE_PATH: "$(Build.ArtifactStagingDirectory)/reports/redbrick_records.db"
               RENTVINE_API_KEY: $(RENTVINE_API_KEY)
               RENTVINE_API_SECRET: $(RENTVINE_API_SECRET)
               RENTVINE_API_BASE_URL: $(RENTVINE_API_BASE_URL)
@@ -80,11 +86,85 @@ stages:
               ANTHROPIC_API_KEY: $(ANTHROPIC_API_KEY)
               GMAIL_MOCK_MODE: $(GMAIL_MOCK_MODE)
 
-          # Publish complete reports and staged drafts to Azure Pipeline Artifacts
+          # Publish complete reports, staged drafts, and execution DB context to Azure Pipeline Artifacts
           - task: PublishPipelineArtifact@1
             inputs:
               targetPath: '$(Build.ArtifactStagingDirectory)/reports'
               artifact: 'RentReminderReports'
               publishLocation: 'pipeline'
-            displayName: "Publish Reports & HITL Artifacts (.xlsx, .html, .json)"
+            displayName: "Publish Reports & HITL Artifacts (.xlsx, .html, .json, .db)"
+
+  # ===========================================================================
+  # PART 2: HITL APPROVAL GATE, DISPATCH, RECONCILIATION & FINAL EXCEL REPORT
+  # ===========================================================================
+  - stage: Approve_And_Dispatch_HITL
+    displayName: "Part 2: HITL Dispatch, Verification & Final Excel Report"
+    dependsOn: Evaluate_And_Generate_HITL
+    condition: succeeded('Evaluate_And_Generate_HITL')
+    jobs:
+      - deployment: DispatchAndReportJob
+        displayName: "Resume After HITL Approval -> Dispatch, Reconcile & Final Report"
+        pool:
+          vmImage: 'ubuntu-latest'
+        # Pauses here in Azure DevOps until operator approves in Environment 'Rent-Reminder-HITL'
+        environment: 'Rent-Reminder-HITL'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  displayName: "Checkout Repository"
+
+                - task: UsePythonVersion@0
+                  inputs:
+                    versionSpec: $(PYTHON_VERSION)
+                  displayName: "Use Python $(PYTHON_VERSION)"
+
+                - script: |
+                    python -m pip install --upgrade pip
+                    pip install -r requirements.txt
+                  workingDirectory: $(System.DefaultWorkingDirectory)
+                  displayName: "Install Project Dependencies"
+
+                # Resume with Part 1 context (hitl_pending_reminders.json + redbrick_records.db)
+                - download: current
+                  artifact: 'RentReminderReports'
+                  displayName: "Download Part 1 Execution Context & HITL Drafts"
+
+                - script: |
+                    mkdir -p "$(Build.ArtifactStagingDirectory)/final_reports"
+                    python main.py pipeline-dispatch \
+                      --input-file "$(Pipeline.Workspace)/RentReminderReports/hitl_pending_reminders.json" \
+                      --output-dir "$(Build.ArtifactStagingDirectory)/final_reports" \
+                      --approve-tenants "${{ parameters.approved_tenants }}" \
+                      --exclude-tenants "${{ parameters.exclude_tenants }}"
+                    if [ -f "$(Build.ArtifactStagingDirectory)/final_reports/final_summary.md" ]; then
+                      echo "##vso[task.uploadsummary]$(Build.ArtifactStagingDirectory)/final_reports/final_summary.md"
+                    fi
+                  workingDirectory: $(System.DefaultWorkingDirectory)
+                  displayName: "Dispatch Approved SMS, Verify, Reconcile & Generate Final Excel Report"
+                  env:
+                    ENVIRONMENT: "production"
+                    DATABASE_PATH: "$(Pipeline.Workspace)/RentReminderReports/redbrick_records.db"
+                    RENTVINE_API_KEY: $(RENTVINE_API_KEY)
+                    RENTVINE_API_SECRET: $(RENTVINE_API_SECRET)
+                    RENTVINE_API_BASE_URL: $(RENTVINE_API_BASE_URL)
+                    RENTVINE_MOCK_MODE: $(RENTVINE_MOCK_MODE)
+                    QUO_API_KEY: $(QUO_API_KEY)
+                    QUO_DEFAULT_PHONE_NUMBER_ID: $(QUO_DEFAULT_PHONE_NUMBER_ID)
+                    QUO_PHONE_NUMBER_TENANTS: $(QUO_PHONE_NUMBER_TENANTS)
+                    QUO_PHONE_NUMBER_LANDLORDS: $(QUO_PHONE_NUMBER_LANDLORDS)
+                    QUO_PHONE_NUMBER_PRIMARY: $(QUO_PHONE_NUMBER_PRIMARY)
+                    QUO_MOCK_MODE: $(QUO_MOCK_MODE)
+                    AI_PROVIDER: $(AI_PROVIDER)
+                    AI_MODEL: $(AI_MODEL)
+                    ANTHROPIC_API_KEY: $(ANTHROPIC_API_KEY)
+                    GMAIL_MOCK_MODE: $(GMAIL_MOCK_MODE)
+
+                - task: PublishPipelineArtifact@1
+                  inputs:
+                    targetPath: '$(Build.ArtifactStagingDirectory)/final_reports'
+                    artifact: 'FinalRentReport'
+                    publishLocation: 'pipeline'
+                  displayName: "Publish Final Post-HITL Excel Report & Receipts"
 

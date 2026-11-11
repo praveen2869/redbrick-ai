@@ -60,7 +60,9 @@ class QuoSMSClient:
         text: str,
         recipient_type: str = "tenant",
         sender_phone_number_id: Optional[str] = None,
-        force_failure: bool = False
+        force_failure: bool = False,
+        is_workflow_reminder: bool = False,
+        reminder_type: str = "RENT_REMINDER"
     ) -> Dict[str, Any]:
         """
         Dispatches an outbound SMS reminder via Quo using the appropriate sender phone line:
@@ -72,6 +74,8 @@ class QuoSMSClient:
         """
         msg_id = f"quo_msg_{int(datetime.utcnow().timestamp() * 1000)}"
         now_iso = datetime.utcnow().isoformat()
+        sent_ts = now_iso
+        quo_status = "DELIVERED_MOCK"
 
         if force_failure:
             logger.error(f"Quo SMS simulated API failure sending to {to_number}")
@@ -124,13 +128,33 @@ class QuoSMSClient:
                     resp_data = json.loads(resp.read().decode("utf-8"))
                     quo_data = resp_data.get("data", {})
                     msg_id = quo_data.get("id") or msg_id
+                    sent_ts = quo_data.get("createdAt") or now_iso
+                    quo_status = (quo_data.get("status") or "SENT").upper()
                     sms_sent_live = True
-                    logger.info(f"[Quo SMS LIVE SENT] MsgID: {msg_id} From: {sender_e164} To: {recip_str}")
+                    logger.info(f"[Quo SMS LIVE SENT] MsgID: {msg_id} Status: {quo_status} From: {sender_e164} To: {recip_str}")
             except Exception as e:
                 logger.error(f"[Quo SMS FAILED] Could not send live SMS to {recip_str}: {e}")
                 raise RuntimeError(f"Quo carrier dispatch failed: {e}")
         else:
             logger.info(f"[Quo SMS MOCK MODE] From: {sender_fmt} To: {recip_str}: \"{text}\"")
+
+        meta = {
+            "source": "Quo REST API",
+            "provider": "OpenPhone",
+            "inbox": inbox_name,
+            "sender_number": sender_fmt,
+            "sender_e164": sender_e164,
+            "sender_phone_id": phone_id,
+            "recipient_type": recipient_type,
+            "is_group": is_group,
+            "participants": recipients,
+            "sms_dispatched": True,
+            "live_sent": sms_sent_live,
+            "quo_status": quo_status,
+        }
+        if is_workflow_reminder:
+            meta["is_workflow_reminder"] = True
+            meta["reminder_type"] = reminder_type
 
         outbound = CommunicationMessage(
             id=msg_id,
@@ -140,36 +164,73 @@ class QuoSMSClient:
             sender=sender_fmt,
             recipient=recip_str,
             content=text,
-            timestamp=now_iso,
+            timestamp=sent_ts,
             status="DELIVERED" if sms_sent_live else "DELIVERED_MOCK",
-            metadata={
-                "source": "Quo REST API",
-                "provider": "OpenPhone",
-                "inbox": inbox_name,
-                "sender_number": sender_fmt,
-                "sender_e164": sender_e164,
-                "sender_phone_id": phone_id,
-                "recipient_type": recipient_type,
-                "is_group": is_group,
-                "participants": recipients,
-                "sms_dispatched": True,
-                "live_sent": sms_sent_live
-            }
+            metadata=meta,
         )
         db.save_message(outbound)
 
         return {
             "success": True,
             "message_id": msg_id,
-            "timestamp": now_iso,
+            "timestamp": sent_ts,
             "recipient": recip_str,
             "sender": sender_fmt,
             "sender_phone_id": phone_id,
             "inbox": inbox_name,
             "is_group": is_group,
             "dispatched": True,
-            "status": "DELIVERED"
+            "live_sent": sms_sent_live,
+            "status": quo_status if sms_sent_live else "DELIVERED",
         }
+
+    def verify_message_delivery(self, message_id: str) -> Dict[str, Any]:
+        """
+        Verifies SMS dispatch status via Quo REST API (GET /messages/{id}).
+        Confirms whether delivery failed/undelivered vs accepted/sent/delivered,
+        and returns the authoritative sent timestamp from Quo when available.
+        """
+        if not message_id:
+            return {"verified": False, "status": "MISSING_MESSAGE_ID", "sent_at": None}
+
+        if self.mock_mode or not self.api_key:
+            return {"verified": True, "status": "DELIVERED_MOCK", "sent_at": None}
+
+        import urllib.request
+        import urllib.error
+
+        auth = self.api_key if self.api_key.startswith("Bearer ") else f"Bearer {self.api_key}"
+        headers = {
+            "Authorization": auth,
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        }
+        try:
+            req = urllib.request.Request(f"{self.api_url}/messages/{message_id}", headers=headers, method="GET")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp_data = json.loads(resp.read().decode("utf-8"))
+                quo_data = resp_data.get("data", {}) or {}
+                raw_status = (quo_data.get("status") or "sent").lower()
+                sent_at = quo_data.get("createdAt") or quo_data.get("updatedAt")
+                if raw_status in ("failed", "undelivered", "rejected", "error", "canceled"):
+                    return {
+                        "verified": False,
+                        "status": raw_status.upper(),
+                        "sent_at": sent_at,
+                        "error": f"Quo reported delivery failure status: {raw_status}",
+                    }
+                return {
+                    "verified": True,
+                    "status": raw_status.upper(),
+                    "sent_at": sent_at,
+                }
+        except urllib.error.HTTPError as he:
+            # OpenPhone POST /messages returns 202 Accepted asynchronously; GET may transiently return 404 right after
+            logger.warning(f"[Quo Verify] HTTP {he.code} verifying message {message_id}; keeping POST acceptance status.")
+            return {"verified": True, "status": "ACCEPTED", "sent_at": None, "warning": f"HTTP {he.code}"}
+        except Exception as e:
+            logger.warning(f"[Quo Verify] Transient error verifying message {message_id}: {e}; keeping POST acceptance status.")
+            return {"verified": True, "status": "ACCEPTED", "sent_at": None, "warning": str(e)}
 
 
     def get_conversation_history(

@@ -138,7 +138,15 @@ def fetch_live_report_records() -> List[Dict[str, Any]]:
 
         promise_dec = next((latest_decision_by_tenant[tid] for tid in tenant_ids if latest_decision_by_tenant.get(tid) and latest_decision_by_tenant[tid].get("outcome") == "HOLD_PROMISE"), None)
         mr_dec = next((latest_decision_by_tenant[tid] for tid in tenant_ids if latest_decision_by_tenant.get(tid) and latest_decision_by_tenant[tid].get("outcome") == "FLAG_MANUAL_REVIEW"), None)
+        grace_dec = next((latest_decision_by_tenant[tid] for tid in tenant_ids if latest_decision_by_tenant.get(tid) and latest_decision_by_tenant[tid].get("outcome") == "SKIP_GRACE_PERIOD"), None)
+        is_group_excluded = any(bool(r["is_excluded"]) for r in group_rows)
+        excl_reason = next((r["exclusion_reason"] for r in group_rows if r["exclusion_reason"]), "Excluded from automated reminders")
         has_mr_note = any(k in combined_notes.lower() for k in ["manual review", "dispute", "attorney", "eviction"])
+
+        # Check monthly Days 1-4 global pause or grace period
+        from src.engine.rules import BusinessRulesEngine, ReminderStage
+        rules_eng = BusinessRulesEngine()
+        cur_stage = rules_eng.get_reminder_stage(now)
 
         promise_date_str = ""
         reminder_sent_str = ""
@@ -156,13 +164,21 @@ def fetch_live_report_records() -> List[Dict[str, Any]]:
             reason = f"Workflow rent reminder sent {cool_h_elapsed:.1f}h ago. Cooldown active for {cool_h_rem:.1f}h remaining (expires {disp_exp})."
             reminder_sent_str = cool_last_rem.timestamp
             cooldown_exp_str = disp_exp
-        elif has_mr_note or mr_dec:
+        elif is_group_excluded or has_mr_note or mr_dec:
             outcome = "FLAG_MANUAL_REVIEW"
-            reason = f"Flagged for manual review: {combined_notes}" if has_mr_note else (mr_dec.get("reason", "Flagged for manual review") if mr_dec else "Flagged for manual review")
+            if is_group_excluded:
+                reason = f"Excluded / Manual Review: {excl_reason}"
+            elif has_mr_note:
+                reason = f"Flagged for manual review: {combined_notes}"
+            else:
+                reason = mr_dec.get("reason", "Flagged for manual review") if mr_dec else "Flagged for manual review"
         elif promise_dec:
             outcome = "HOLD_PROMISE"
             reason = promise_dec.get("reason", "Payment promise on file")
             promise_date_str = promise_dec.get("details", {}).get("promise_date", "") or ""
+        elif grace_dec or cur_stage == ReminderStage.STAGE_PAUSE_GRACE.value:
+            outcome = "SKIP_GRACE_PERIOD"
+            reason = grace_dec.get("reason") if grace_dec else "Monthly Grace Period / Global Pause (Days 1-4) — no automated reminders"
         else:
             outcome = "SEND_REMINDER"
             reason = f"Unpaid balance ${lease_bal:,.2f} past grace period — reminder needed"
@@ -200,6 +216,7 @@ def fetch_live_report_records() -> List[Dict[str, Any]]:
 
         all_records.append({
             "lease_id": clean_lease_id,
+            "tenant_ids": tenant_ids,
             "property_address": primary_row["property_name"] or "",
             "unit_number": primary_row["unit_number"] or "",
             "tenant_names": ", ".join(all_names),
@@ -215,19 +232,74 @@ def fetch_live_report_records() -> List[Dict[str, Any]]:
             "ai_outcome": outcome,
             "eligibility_reason": reason,
             "follow_up_notes": combined_notes or "None",
-            "lease_status": lease_status
+            "lease_status": lease_status,
+            "is_in_cooldown": bool(is_cool),
         })
 
     return all_records
 
 
-def build_daily_excel_workbook(data_records: Optional[List[Dict[str, Any]]] = None) -> openpyxl.Workbook:
+def build_daily_excel_workbook(
+    data_records: Optional[List[Dict[str, Any]]] = None,
+    dispatch_results: Optional[List[Dict[str, Any]]] = None,
+    is_final_report: bool = False,
+) -> openpyxl.Workbook:
     """
-    Builds a professional, multi-tab Excel (.xlsx) workbook for the executive Daily Report.
-    Includes Summary tab and 6 categorized detail worksheets.
+    Builds a professional, multi-tab Excel (.xlsx) workbook for the executive Daily/Final Report.
+    Includes Summary tab and 6 categorized detail worksheets:
+      - All Active
+      - 📩 Reminders Needed
+      - 🛡️ Promises on File
+      - ✅ Paid & Cleared
+      - 🔴 Manual Review & Disputes
+      - 🚫 In Cooldown & Grace
+    When `dispatch_results` is supplied (post-HITL Final Report), records reflect actual
+    dispatch status, sent timestamps, cooldown activation, rejections, and failures.
     """
     if data_records is None:
         data_records = fetch_live_report_records()
+
+    # Build lookup index from dispatch_results (by lease_id and tenant_id)
+    dispatch_lookup: Dict[str, Dict[str, Any]] = {}
+    for dr in (dispatch_results or []):
+        for key in (dr.get("lease_id"), dr.get("tenant_id")):
+            if key:
+                skey = str(key).strip()
+                dispatch_lookup[skey] = dr
+                if skey.startswith("rv_lease_"):
+                    dispatch_lookup[skey.replace("rv_lease_", "", 1)] = dr
+                else:
+                    dispatch_lookup[f"rv_lease_{skey}"] = dr
+
+    for rec in data_records:
+        dr = None
+        candidates = [rec.get("lease_id")] + list(rec.get("tenant_ids") or [])
+        for cand in candidates:
+            if cand and str(cand).strip() in dispatch_lookup:
+                dr = dispatch_lookup[str(cand).strip()]
+                break
+        if dr:
+            st = dr.get("status", "")
+            if st == "DISPATCHED":
+                rec.setdefault("this_run_dispatch_status", "✅ SENT THIS RUN")
+                rec.setdefault("this_run_sent_at", dr.get("sent_at") or rec.get("reminder_sent_timestamp") or "—")
+                rec.setdefault("this_run_cooldown", "Yes (24h)" if dr.get("cooldown_applied", True) else "No")
+                rec.setdefault("this_run_note", f"Msg ID: {dr.get('message_id', '—')} | Verified: {dr.get('delivery_status', 'SENT')}")
+            elif st in ("SKIPPED_BY_OPERATOR", "REJECTED_IN_HITL"):
+                rec.setdefault("this_run_dispatch_status", "⛔ REJECTED / SKIPPED (HITL)")
+                rec.setdefault("this_run_sent_at", "—")
+                rec.setdefault("this_run_cooldown", "No (Rejected)")
+                rec.setdefault("this_run_note", dr.get("reason", "Rejected by operator during HITL review"))
+            elif st == "FAILED":
+                rec.setdefault("this_run_dispatch_status", "❌ DISPATCH FAILED")
+                rec.setdefault("this_run_sent_at", "—")
+                rec.setdefault("this_run_cooldown", "No (Failed)")
+                rec.setdefault("this_run_note", dr.get("error", "Quo SMS dispatch failed"))
+        else:
+            rec.setdefault("this_run_dispatch_status", "—")
+            rec.setdefault("this_run_sent_at", "—")
+            rec.setdefault("this_run_cooldown", "Yes (Prior 24h)" if rec.get("is_in_cooldown") else "No")
+            rec.setdefault("this_run_note", "")
 
     now_utc = datetime.utcnow()
     gen_time_str = now_utc.strftime("%Y-%m-%d %I:%M:%S %p UTC")
@@ -307,7 +379,12 @@ def build_daily_excel_workbook(data_records: Optional[List[Dict[str, Any]]] = No
 
     # Header Banner
     ws_sum.cell(row=2, column=2, value="Red Bricks Property Management").font = title_font
-    ws_sum.cell(row=3, column=2, value="Daily Rent Reminder Executive Report & AI Outcomes").font = subtitle_font
+    subtitle_txt = (
+        "Final Post-HITL Rent Reminder Executive Report & Reconciliation"
+        if (is_final_report or dispatch_results is not None)
+        else "Daily Rent Reminder Executive Report & AI Outcomes"
+    )
+    ws_sum.cell(row=3, column=2, value=subtitle_txt).font = subtitle_font
     ws_sum.cell(row=4, column=2, value=f"Generated: {gen_time_str} | Authoritative Source: RentVine Report #72 & Quo Live SMS").font = meta_font
 
     # Summary table header
@@ -320,13 +397,20 @@ def build_daily_excel_workbook(data_records: Optional[List[Dict[str, Any]]] = No
         c.border = cell_border
     ws_sum.row_dimensions[6].height = 26
 
+    tab_all = "All Active"
+    tab_reminders = "📩 Reminders Needed"
+    tab_promises = "🛡️ Promises on File"
+    tab_paid = "✅ Paid & Cleared"
+    tab_flagged = "🔴 Manual Review & Disputes"
+    tab_cooldown = "🚫 In Cooldown & Grace"
+
     summary_rows = [
-        (1, "All Active", "All Active", len(cat_all_active), sum(r.get("outstanding_balance", 0.0) for r in cat_all_active), "Total active property leases in RentVine portfolio"),
-        (2, "Reminders Needed", "Reminders Needed", len(cat_reminders), sum(r.get("outstanding_balance", 0.0) for r in cat_reminders), "Eligible for rent reminder SMS dispatch past grace period"),
-        (3, "Promises on File", "Promises on File", len(cat_promises), sum(r.get("outstanding_balance", 0.0) for r in cat_promises), "Confirmed payment commitment on file with future payment date — reminders held"),
-        (4, "Paid / Cleared", "Paid & Cleared", len(cat_paid), sum(r.get("outstanding_balance", 0.0) for r in cat_paid), "Tenant balance $0.00 — rent paid and cleared in RentVine"),
-        (5, "Manual Review / Disputes", "Manual Review & Disputes", len(cat_flagged), sum(r.get("outstanding_balance", 0.0) for r in cat_flagged), "Outstanding balance < $200, dispute, or follow-up note requiring staff review"),
-        (6, "In Cooldown / Grace", "In Cooldown & Grace", len(cat_cooldown), sum(r.get("outstanding_balance", 0.0) for r in cat_cooldown), "Reminder sent within last 24 hours (active cooldown) or in grace period"),
+        (1, "All Active", tab_all, len(cat_all_active), sum(r.get("outstanding_balance", 0.0) for r in cat_all_active), "Total active property leases in RentVine portfolio"),
+        (2, "📩 Reminders Needed", tab_reminders, len(cat_reminders), sum(r.get("outstanding_balance", 0.0) for r in cat_reminders), "Eligible for rent reminder SMS dispatch past grace period"),
+        (3, "🛡️ Promises on File", tab_promises, len(cat_promises), sum(r.get("outstanding_balance", 0.0) for r in cat_promises), "Confirmed payment commitment on file with future payment date — reminders held"),
+        (4, "✅ Paid / Cleared", tab_paid, len(cat_paid), sum(r.get("outstanding_balance", 0.0) for r in cat_paid), "Tenant balance $0.00 — rent paid and cleared in RentVine"),
+        (5, "🔴 Manual Review / Disputes", tab_flagged, len(cat_flagged), sum(r.get("outstanding_balance", 0.0) for r in cat_flagged), "Outstanding balance < $200, dispute, exclusion, or follow-up note requiring staff review"),
+        (6, "🚫 In Cooldown / Grace", tab_cooldown, len(cat_cooldown), sum(r.get("outstanding_balance", 0.0) for r in cat_cooldown), "HITL-approved reminder dispatched within last 24h (active cooldown) or in monthly grace pause"),
     ]
 
     total_overdue = sum(r.get("outstanding_balance", 0.0) for r in active_records if r.get("outstanding_balance", 0.0) > 0)
@@ -372,10 +456,48 @@ def build_daily_excel_workbook(data_records: Optional[List[Dict[str, Any]]] = No
         c.border = cell_border
     ws_sum.row_dimensions[tot_row].height = 24
 
+    # Post-HITL Execution Summary block on Summary tab (when dispatch_results supplied)
+    if dispatch_results is not None:
+        sent_cnt = len([d for d in dispatch_results if d.get("status") == "DISPATCHED"])
+        rej_cnt = len([d for d in dispatch_results if d.get("status") in ("SKIPPED_BY_OPERATOR", "REJECTED_IN_HITL")])
+        fail_cnt = len([d for d in dispatch_results if d.get("status") == "FAILED"])
+        cool_cnt = len([d for d in dispatch_results if d.get("status") == "DISPATCHED" and d.get("cooldown_applied", True)])
+
+        ws_sum.cell(row=15, column=2, value="HITL Dispatch & Reconciliation Execution Summary").font = Font(name=font_family, size=12, bold=True, color="0F172A")
+        exec_headers = ["#", "Execution Metric", "Count", "Notes"]
+        for ci, h_txt in enumerate(exec_headers, start=2):
+            c = ws_sum.cell(row=16, column=ci, value=h_txt)
+            c.font = header_font
+            c.fill = header_fill
+            c.border = cell_border
+            c.alignment = Alignment(horizontal="center" if ci in (2, 4) else "left", vertical="center")
+        ws_sum.row_dimensions[16].height = 22
+
+        exec_rows = [
+            (1, "✅ Approved & Successfully Dispatched (Quo Verified)", sent_cnt, "SMS dispatched and confirmed via Quo API; actual sent timestamp recorded"),
+            (2, "🚫 Leases Entered 24h Cooldown (This Run)", cool_cnt, "Cooldown applied across entire lease & co-tenants only upon confirmed send"),
+            (3, "⛔ Rejected / Skipped during HITL", rej_cnt, "Manually deselected/excluded — no SMS sent and NO cooldown applied"),
+            (4, "❌ Dispatch Failures", fail_cnt, "Quo dispatch failed — accurately reported as failed and NO cooldown applied"),
+        ]
+        for idx, (n, label, val, note) in enumerate(exec_rows, start=17):
+            c1 = ws_sum.cell(row=idx, column=2, value=n)
+            c2 = ws_sum.cell(row=idx, column=3, value=label)
+            c3 = ws_sum.cell(row=idx, column=4, value=val)
+            c4 = ws_sum.cell(row=idx, column=5, value=note)
+            c1.alignment = Alignment(horizontal="center", vertical="center")
+            c2.font = bold_data_font
+            c3.font = bold_data_font
+            c3.alignment = Alignment(horizontal="center", vertical="center")
+            c4.font = muted_data_font
+            for c in (c1, c2, c3, c4):
+                c.border = cell_border
+                c.fill = zebra_fill if idx % 2 == 0 else white_fill
+            ws_sum.row_dimensions[idx].height = 20
+
     ws_sum.column_dimensions["B"].width = 6
-    ws_sum.column_dimensions["C"].width = 28
-    ws_sum.column_dimensions["D"].width = 26
-    ws_sum.column_dimensions["E"].width = 22
+    ws_sum.column_dimensions["C"].width = 34
+    ws_sum.column_dimensions["D"].width = 28
+    ws_sum.column_dimensions["E"].width = 24
     ws_sum.column_dimensions["F"].width = 26
     ws_sum.column_dimensions["G"].width = 65
 
@@ -398,16 +520,20 @@ def build_daily_excel_workbook(data_records: Optional[List[Dict[str, Any]]] = No
         ("Cooldown Expiry", 22, "center"),
         ("AI Decision Outcome", 22, "center"),
         ("Eligibility Status & Reason", 48, "left"),
-        ("Follow-Up Notes / Manual Review Details", 48, "left")
+        ("Follow-Up Notes / Manual Review Details", 48, "left"),
+        ("HITL Dispatch Status (This Run)", 26, "center"),
+        ("Actual Sent Timestamp (This Run)", 26, "center"),
+        ("Cooldown Entered (24h)", 20, "center"),
+        ("Dispatch / Verification Note", 42, "left"),
     ]
 
     detail_sheets_meta = [
-        ("All Active", cat_all_active),
-        ("Reminders Needed", cat_reminders),
-        ("Promises on File", cat_promises),
-        ("Paid & Cleared", cat_paid),
-        ("Manual Review & Disputes", cat_flagged),
-        ("In Cooldown & Grace", cat_cooldown)
+        (tab_all, cat_all_active),
+        (tab_reminders, cat_reminders),
+        (tab_promises, cat_promises),
+        (tab_paid, cat_paid),
+        (tab_flagged, cat_flagged),
+        (tab_cooldown, cat_cooldown),
     ]
 
     for title, records in detail_sheets_meta:
@@ -457,7 +583,11 @@ def build_daily_excel_workbook(data_records: Optional[List[Dict[str, Any]]] = No
                 r.get("cooldown_expiry") or "—",
                 ostyle.get("label", outcome),
                 r.get("eligibility_reason") or "",
-                r.get("follow_up_notes") or "None"
+                r.get("follow_up_notes") or "None",
+                r.get("this_run_dispatch_status") or "—",
+                r.get("this_run_sent_at") or "—",
+                r.get("this_run_cooldown") or "No",
+                r.get("this_run_note") or "",
             ]
 
             for c_idx, val in enumerate(row_values, start=1):
@@ -483,7 +613,21 @@ def build_daily_excel_workbook(data_records: Optional[List[Dict[str, Any]]] = No
                     else:
                         cell.font = bold_data_font
                     cell.alignment = Alignment(horizontal="center", vertical="center")
-                elif c_idx in (10, 15, 16):
+                elif c_idx == 17:
+                    s_val = str(val)
+                    if "SENT THIS RUN" in s_val:
+                        cell.fill = PatternFill(start_color="D1FAE5", end_color="D1FAE5", fill_type="solid")
+                        cell.font = Font(name=font_family, size=10, bold=True, color="065F46")
+                    elif "FAILED" in s_val:
+                        cell.fill = PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid")
+                        cell.font = Font(name=font_family, size=10, bold=True, color="991B1B")
+                    elif "REJECTED" in s_val or "SKIPPED" in s_val:
+                        cell.fill = PatternFill(start_color="FEF3C7", end_color="FEF3C7", fill_type="solid")
+                        cell.font = Font(name=font_family, size=10, bold=True, color="92400E")
+                    else:
+                        cell.font = muted_data_font
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                elif c_idx in (10, 15, 16, 20):
                     cell.font = muted_data_font
                     cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
                 else:

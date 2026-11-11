@@ -41,6 +41,7 @@ _API_CACHE: Dict[str, tuple] = {}
 
 class RedBrickAPIHandler(BaseHTTPRequestHandler):
     orchestrator = WorkflowOrchestrator()
+    _last_final_report_path: str = ""
 
     def do_OPTIONS(self):
         """Handle CORS pre-flight requests."""
@@ -100,6 +101,8 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
             return self._handle_get_quo_live(query)
         elif path == "/api/rentvine-report":
             return self._handle_get_rentvine_report(query)
+        elif path == "/api/final-report":
+            return self._handle_get_final_report()
 
         # Serve static web frontend
         self._serve_static_file(path)
@@ -585,6 +588,42 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
     def _handle_get_runs(self):
         runs = db.get_recent_runs(limit=20)
         self._send_json({"runs": runs})
+
+    def _handle_get_final_report(self):
+        """
+        Downloads the most recently generated Final Post-Dispatch Excel report.
+        Generated automatically after HITL dispatch completes.
+        """
+        final_path = getattr(RedBrickAPIHandler, "_last_final_report_path", "")
+        if not final_path:
+            # Try to find latest in receipts/ directory
+            receipts_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "receipts")
+            if os.path.isdir(receipts_dir):
+                candidates = sorted(
+                    [f for f in os.listdir(receipts_dir) if f.startswith("RBPM_Final_Report_") and f.endswith(".xlsx")],
+                    reverse=True
+                )
+                if candidates:
+                    final_path = os.path.join(receipts_dir, candidates[0])
+
+        if not final_path or not os.path.exists(final_path):
+            return self._send_json({"error": "No final report available yet. Run a pipeline dispatch first."}, 404)
+
+        try:
+            with open(final_path, "rb") as f:
+                data = f.read()
+            filename = os.path.basename(final_path)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self._send_cors_headers()
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as e:
+            logger.error(f"Error serving final report: {e}", exc_info=True)
+            self._send_json({"error": f"Failed to serve final report: {str(e)}"}, 500)
 
     def _handle_get_export_excel(self):
         """
@@ -1955,40 +1994,26 @@ class RedBrickAPIHandler(BaseHTTPRequestHandler):
 
     def _handle_post_pipeline_dispatch_approved(self, body: Dict[str, Any]):
         try:
-            approved = body.get("approved_tenants", [])
+            approved = {"approved_tenants": body.get("approved_tenants", []), "rejected_tenants": body.get("rejected_tenants", [])}
             from src.pipeline import run_pipeline_dispatch
             import tempfile
             with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tf:
                 json.dump(approved, tf)
                 temp_path = tf.name
-            receipt = run_pipeline_dispatch(input_file=temp_path)
+            receipt = run_pipeline_dispatch(input_file=temp_path, output_dir="receipts")
             try:
                 os.remove(temp_path)
             except Exception:
                 pass
+            # Cache final report path for download endpoint
+            final_path = receipt.get("final_report_path")
+            if final_path and os.path.exists(final_path):
+                RedBrickAPIHandler._last_final_report_path = final_path
             self._send_json(receipt)
         except Exception as e:
             logger.error(f"Failed to dispatch approved: {e}", exc_info=True)
             self._send_json({"error": str(e)}, 500)
 
-    def _handle_post_pipeline_dispatch_approved(self, body: Dict[str, Any]):
-        try:
-            approved = body.get("approved_tenants", [])
-            from src.pipeline import run_pipeline_dispatch
-            import tempfile
-            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tf:
-                json.dump(approved, tf)
-                temp_path = tf.name
-            receipt = run_pipeline_dispatch(input_file=temp_path)
-            try:
-                os.remove(temp_path)
-            except Exception:
-                pass
-            self._send_json(receipt)
-        except Exception as e:
-            logger.error(f"Failed to dispatch approved: {e}", exc_info=True)
-            self._send_json({"error": str(e)}, 500)
-
     def _handle_post_send_reminder(self, body: Dict[str, Any]):
         """
         HITL-approved SMS reminder dispatch.
